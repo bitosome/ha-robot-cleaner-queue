@@ -34,11 +34,23 @@ Installation and restart send no robot command. Afterwards, `sensor.robot_cleane
 
 ## Requirements
 
-- Home Assistant **2026.9.0** or later.
-- The native Roborock integration with a V1-protocol robot.
-- Room routines created in the Roborock app, one per room, each representing the whole room.
+**Required**
 
-One robot and one queue per Home Assistant instance. Other robot platforms and Roborock protocols are not implicitly supported.
+- **Home Assistant 2026.9.0 or later**, verified against Core 2026.9.4 with python-roborock 7.4.2.
+- **The native Roborock integration** connected to a **V1-protocol** robot. The integration reads that coordinator's cached state only: no credentials, no cloud client, no extra polling and no modification of the native integration. An unfamiliar coordinator shape fails closed instead of guessing.
+- **One routine per room, created in the Roborock app.** Preset queues press those routine buttons, so the app keeps ownership of suction, mopping and repetition, and the integration never rewrites them. Each routine must represent the whole room named on its tile; a routine that internally ends one job and starts another cannot be chained safely and must be simplified in the app.
+- **Mapped Home Assistant areas for manual queues.** Manual cleaning calls `vacuum.clean_area`, so Home Assistant's own area mapping connects areas to robot rooms, and an area is offered only when every Roborock room it maps to exists on the robot's current map. Map areas to rooms in the vacuum entity's settings; `get_capabilities` reports what is mapped, which robot rooms no area covers, and which mapped areas the robot no longer reports.
+- **Home Assistant permissions** to control the vacuum and every selected preset. The initiating user is checked at acceptance, before every later dispatch and before any dock or settings change.
+
+**Optional but recommended**
+
+- The [Robot Vacuum Cleaner Card](https://github.com/bitosome/robot-vacuum-cleaner-card) supplies the tiles, saved presets and manual setup. Every capability is also reachable through the services below, so the card is not required.
+
+**Limits**
+
+- One robot and one queue per Home Assistant instance.
+- Other robot platforms and Roborock protocols are not implicitly supported.
+- The robot must be idle and docked with no unfinished job before a sequence starts, and an `attention` queue must be cleared before another one can begin.
 
 ## Services
 
