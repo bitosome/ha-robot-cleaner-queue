@@ -33,7 +33,8 @@ class QueueSensor(SensorEntity):
             "mode": queue.mode,
             "targets": list(queue.targets),
             "setup": dict(queue.setup),
-            "stages": [{k: stage[k] for k in ("target", "mode", "room_index", "pass_index", "repeat_index")} for stage in queue.stages],
+            "stages": [{k: stage.get(k) for k in ("target", "mode", "room_index", "pass_index", "repeat_index")}
+                       for stage in queue.stages if isinstance(stage, dict)],
             "current_index": queue.current_index,
             "completed": queue.completed,
             "error": queue.error,

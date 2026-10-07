@@ -14,7 +14,8 @@ Native Roborock area cleaning accepts several areas in one command but does not 
 
 1. HACS → **Custom repositories**.
 2. Repository: `https://github.com/bitosome/ha-robot-cleaner-queue`, category: **Integration**.
-3. Download it, then restart Home Assistant.
+3. Download it, then add the package include from [Manual](#manual) step 2 to your `configuration.yaml`. Home Assistant only loads a YAML integration that appears in its configuration, so without this step the download alone installs nothing and raises no error.
+4. Restart Home Assistant.
 
 ### Manual
 

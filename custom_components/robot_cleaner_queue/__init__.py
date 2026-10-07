@@ -63,7 +63,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         schema=vol.Schema({vol.Required("vacuum"): cv.entity_id,
                            vol.Required("control"): vol.In([*CONTROLS, "locate"]),
                            vol.Optional("value", default=""): vol.Any(str, int, float)}))
-    hass.async_create_task(async_load_platform(hass, "sensor", DOMAIN, {}, config))
+    await async_load_platform(hass, "sensor", DOMAIN, {}, config)
     return True
 
 
@@ -84,8 +84,19 @@ class Manager:
         self.last_published = None
 
     async def setup(self) -> None:
-        self.saved_presets = await self.preset_store.async_load() or {}
-        self.queue = Queue.restore(await self.store.async_load())
+        try:
+            loaded_presets = await self.preset_store.async_load()
+            self.saved_presets = loaded_presets if isinstance(loaded_presets, dict) else {}
+        except Exception:  # noqa: BLE001 - a damaged store must never block setup
+            _LOGGER.exception("Saved presets could not be read; starting without them")
+            self.saved_presets = {}
+        try:
+            loaded_queue = await self.store.async_load()
+            self.queue = Queue.restore(loaded_queue if isinstance(loaded_queue, dict) else None)
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("The stored queue could not be read; starting from an empty queue")
+            self.queue = Queue()
+            self.queue.attention("The stored sequence could not be read. Check the robot before starting a new one.")
         await self.store.async_save(self.queue.dump())
         self.unsubs.extend([
             async_track_time_interval(self.hass, self.tick, timedelta(seconds=5)),
@@ -103,7 +114,15 @@ class Manager:
         if data == self.last_published:
             return
         # Persist before sending a new physical command or exposing the transition.
-        await self.store.async_save(data)
+        try:
+            await self.store.async_save(data)
+        except Exception:  # noqa: BLE001 - never leave an undispatched command looking active
+            _LOGGER.exception("Queue state could not be saved; stopping the queue for review")
+            self.queue.attention("The queue state could not be saved. Check the robot before starting a new sequence.")
+            self.last_published = self.queue.dump()
+            for listener in list(self.listeners):
+                listener()
+            return
         self.last_published = data
         for listener in list(self.listeners):
             listener()
@@ -332,8 +351,14 @@ class Manager:
                 # Decide under the same lock as starts and stage advancement.
                 if self.queue.vacuum and vacuum != self.queue.vacuum and (self.queue.phase in ACTIVE or self.queue.pending_command):
                     raise ServiceValidationError("Another vacuum has an active command.")
-                command = "finish" if self.queue.should_finish(self.current_snapshot(vacuum)) else "start"
+                try:
+                    finished = self.queue.should_finish(self.current_snapshot(vacuum))
+                except (ValueError, TypeError, AttributeError) as err:
+                    raise ServiceValidationError(str(err)) from err
+                command = "finish" if finished else "start"
                 if command == "start" and use_saved:
+                    if not isinstance(self.saved_presets, dict):
+                        raise ServiceValidationError("The saved presets could not be read. Save the preset again.")
                     saved_plan = self.saved_presets.get(vacuum)
                     if saved_plan:
                         missing = [key for key in ("source", "presets", "rooms", "setup")
@@ -537,10 +562,11 @@ class Manager:
 
     async def shutdown(self, _event) -> None:
         self.closing = True
-        for unsub in self.unsubs:
-            unsub()
-        if self.coordinator_unsub:
-            self.coordinator_unsub()
-        if self.queue.phase in ACTIVE or self.queue.pending_command:
-            self.queue.attention("Home Assistant stopped. The queue will not restart automatically.")
-        await self.publish()
+        async with self.lock:
+            for unsub in self.unsubs:
+                unsub()
+            if self.coordinator_unsub:
+                self.coordinator_unsub()
+            if self.queue.phase in ACTIVE or self.queue.pending_command:
+                self.queue.attention("Home Assistant stopped. The queue will not restart automatically.")
+            await self.publish()

@@ -8,11 +8,11 @@ This first version supports **one robot and one queue per Home Assistant instanc
 
 ### HACS
 
-Add `https://github.com/bitosome/ha-robot-cleaner-queue` as a **Custom repository** of category **Integration**, download it, and restart Home Assistant. HACS then tracks updates, which still need a restart because integrations load at startup.
+Add `https://github.com/bitosome/ha-robot-cleaner-queue` as a **Custom repository** of category **Integration**, download it, and restart Home Assistant. HACS tracks updates, which still need a restart because integrations load at startup. HACS installs the Python files only: Home Assistant will not load them until `robot_cleaner_queue:` exists in your configuration, which the package include below supplies. Without it nothing appears and no error is raised.
 
 ### Manual
 
-1. Copy the `custom_components/robot_cleaner_queue` directory into Home Assistant's `/config/custom_components/` directory.
+1. Copy the `custom_components/robot_cleaner_queue` directory into Home Assistant's `/config/custom_components/` directory. Home Assistant only loads a YAML integration that appears in `configuration.yaml`, so this step is required by both install paths below: the package in step 2 supplies the `robot_cleaner_queue:` key.
 2. Copy `packages/robot_cleaner_queue.yaml` to your HA packages directory. Include it through your existing `homeassistant.packages` configuration. For example, installations without existing packages can add:
 
    ```yaml
@@ -53,7 +53,7 @@ Other commands:
 | `cancel` | Clear the remaining queue only. The current robot operation continues. |
 | `return_to_dock` | Clear the remaining queue first, then request docking when the robot's state permits it. Mop servicing and uncertain states are not interrupted. |
 
-Version 0.2.2 can pause/resume/dock an app-started job with an explicit vacuum. It stores `mode: external` without presets or stages; acknowledgement returns it to idle and cannot advance an old plan. Resume requires a paused, unfinished job. Active, attention and uncertain commands cannot be bypassed by controlling a different robot.
+The card contract is `control_version: 4`. Version 0.2.2 can pause/resume/dock an app-started job with an explicit vacuum. It stores `mode: external` without presets or stages; acknowledgement returns it to idle and cannot advance an old plan. Resume requires a paused, unfinished job. Active, attention and uncertain commands cannot be bypassed by controlling a different robot.
 
 For non-start commands, pass the same `vacuum` to protect against a card configured for another robot. An `attention` queue must be cleared with `cancel` before a new queue can start. Clearing an unacknowledged start/resume preserves a safety barrier: another start requires that command's acknowledgement window to expire (15 minutes for a start or resume, 60 seconds for a control command) and a new native poll after that window confirming idle/job-off. The barrier lasts as long as the start it guards, because a late routine can still arrive. It is released as soon as the robot is observed confirming that command, so a stop the robot has already acknowledged never delays docking. Cancelling cannot reuse a stale docked state to send duplicate routines. Only an idle/docked robot with no unfinished job can start a new sequence. Starts cannot replace an existing queue or unfinished job.
 

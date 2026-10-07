@@ -1,7 +1,7 @@
 {
   "domain": "robot_cleaner_queue",
   "name": "Robot Cleaner Queue",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "documentation": "https://github.com/bitosome/ha-robot-cleaner-queue/blob/main/docs/queue-backend.md",
   "issue_tracker": "https://github.com/bitosome/ha-robot-cleaner-queue/issues",
   "codeowners": [
@@ -11,5 +11,8 @@
     "roborock"
   ],
   "iot_class": "calculated",
-  "requirements": []
+  "requirements": [],
+  "dependencies": [
+    "sensor"
+  ]
 }
