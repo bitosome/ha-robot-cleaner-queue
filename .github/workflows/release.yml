@@ -1,0 +1,32 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python3 -B test/backend_queue_test.py
+      - run: python3 -B test/backend_manual_test.py
+      - run: python3 -B test/backend_controls_test.py
+      - run: python3 -B test/backend_device_test.py
+      - name: Verify release version
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib
+          version = json.loads(pathlib.Path('custom_components/robot_cleaner_queue/manifest.json').read_text())['version']
+          assert os.environ['GITHUB_REF_NAME'] == f'v{version}', (os.environ['GITHUB_REF_NAME'], version)
+          print('release version ok:', version)
+          PY
+      - name: Build manual-install archive
+        run: zip -r robot-cleaner-queue.zip custom_components/robot_cleaner_queue packages/robot_cleaner_queue.yaml -x '*.pyc' '*/__pycache__/*'
+      - name: Publish tested artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" robot-cleaner-queue.zip --generate-notes --verify-tag

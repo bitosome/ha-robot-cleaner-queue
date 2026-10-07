@@ -1,0 +1,29 @@
+name: Check
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python3 -B test/backend_queue_test.py
+      - run: python3 -B test/backend_manual_test.py
+      - run: python3 -B test/backend_controls_test.py
+      - run: python3 -B test/backend_device_test.py
+      - name: Validate integration manifest
+        run: |
+          python3 - <<'PY'
+          import json, pathlib
+          manifest = json.loads(pathlib.Path('custom_components/robot_cleaner_queue/manifest.json').read_text())
+          for key in ('domain', 'name', 'version', 'documentation', 'issue_tracker', 'codeowners'):
+              assert manifest.get(key), f'manifest.json is missing {key}'
+          assert manifest['domain'] == 'robot_cleaner_queue'
+          assert pathlib.Path('custom_components/robot_cleaner_queue/services.yaml').is_file()
+          print('manifest ok:', manifest['domain'], manifest['version'])
+          PY

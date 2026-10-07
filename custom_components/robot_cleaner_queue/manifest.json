@@ -1,0 +1,15 @@
+{
+  "domain": "robot_cleaner_queue",
+  "name": "Robot Cleaner Queue",
+  "version": "0.5.0",
+  "documentation": "https://github.com/bitosome/robot-vacuum-cleaner-card/blob/main/docs/queue-backend.md",
+  "issue_tracker": "https://github.com/bitosome/robot-vacuum-cleaner-card/issues",
+  "codeowners": [
+    "@bitosome"
+  ],
+  "after_dependencies": [
+    "roborock"
+  ],
+  "iot_class": "calculated",
+  "requirements": []
+}
