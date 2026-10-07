@@ -281,7 +281,8 @@ class Manager:
         updated = getattr(state, "last_updated", None)
         if (state and updated and updated.timestamp() >= queue.command_at and
                 self.device_value_matches(state.state, queue.setup.get("value"), queue.setup.get("domain"))):
-            queue.phase, queue.pending_command = "idle", ""
+            queue.phase = "idle"
+            queue.confirmed()
         elif time.time() - queue.command_at >= ACK_SECONDS:
             queue.attention("The device did not confirm this setting within 60 seconds. No retry was sent.")
 

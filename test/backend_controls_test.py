@@ -96,6 +96,26 @@ class StandaloneEngineTests(unittest.TestCase):
                 queue.external_control("pause", "vacuum.robot", state(observed_at=159), 165, "new")
             self.assertEqual(queue.external_control("pause", "vacuum.robot", state(observed_at=166), 166, "new"), ("vacuum", "pause"))
 
+    def test_confirmed_command_releases_its_barrier(self):
+        """A stop the robot has confirmed must not lock docking behind a window."""
+        queue = Queue(phase="running", vacuum="vacuum.robot", presets=["button.kitchen"], started_at=100)
+        self.assertEqual(queue.command("stop", state(), 100), ("vacuum", "stop"))
+        # The robot reports the stop: idle with no active job.
+        queue.observe(state("idle", "idle", "off", observed_at=104), 104)
+        self.assertEqual((queue.phase, queue.pending_command, queue.not_before), ("cancelled", "", 0))
+        self.assertEqual(queue.external_control("return_to_dock", "vacuum.robot",
+                                                state("idle", "idle", "off", observed_at=105), 105, "dock"),
+                         ("vacuum", "return_to_base"))
+
+    def test_unconfirmed_command_still_keeps_its_barrier(self):
+        queue = Queue(phase="running", vacuum="vacuum.robot", presets=["button.kitchen"], started_at=100)
+        queue.command("stop", state(), 100)
+        queue.observe(state("cleaning", "segment_cleaning", "on", observed_at=101), 101)
+        self.assertEqual(queue.pending_command, "stop")
+        self.assertEqual(queue.not_before, 0)
+        with self.assertRaises(ValueError):
+            queue.external_control("return_to_dock", "vacuum.robot", state(observed_at=150), 150, "dock")
+
     def test_uncertain_resume_blocks_new_preset_until_fresh_idle(self):
         queue = Queue()
         queue.external_control("resume", "vacuum.robot", state("paused", "paused"), 100, "request")

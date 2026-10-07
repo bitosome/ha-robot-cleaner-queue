@@ -113,6 +113,11 @@ class Queue:
         self.pending_command = ""
         self.next_pending = False
 
+    def confirmed(self) -> None:
+        """The outstanding command was observed, so nothing about it is uncertain."""
+        self.pending_command = ""
+        self.not_before = 0
+
     def ack_window(self) -> float:
         """How long a dispatched command may take to become observable."""
         return START_SECONDS if self.pending_command in {"start", "resume"} else ACK_SECONDS
@@ -179,7 +184,7 @@ class Queue:
                 self.pending_command == "stop" and snapshot.job == "off" or
                 self.pending_command == "return_to_dock" and snapshot.vacuum in {"returning", "docked"})
             if confirmed:
-                self.pending_command = ""
+                self.confirmed()
             elif now - self.command_at >= ACK_SECONDS:
                 self.attention("Cleaning sequence cancelled, but the robot did not confirm finishing. Check it; no retry was sent.")
             return None
@@ -263,7 +268,8 @@ class Queue:
             (self.pending_command == "stop" and snapshot.job == "off" and snapshot.vacuum in {"docked", "idle"})
         )
         if confirmed:
-            self.phase, self.pending_command, self.error = "idle", "", ""
+            self.phase, self.error = "idle", ""
+            self.confirmed()
         elif now - self.command_at >= ACK_SECONDS:
             self.attention("The robot did not acknowledge the command within 60 seconds. No retry was sent.")
 
@@ -399,7 +405,7 @@ class Queue:
             return None
         if self.pending_command == "return_to_dock":
             if snapshot.vacuum in {"docked", "returning"}:
-                self.pending_command = ""
+                self.confirmed()
             elif not snapshot.robot_healthy or now - self.command_at >= ACK_SECONDS:
                 self.attention("Return to dock was not confirmed. The remaining queue has been cleared; check the robot.")
             return None
@@ -426,7 +432,7 @@ class Queue:
                 if self.pending_command != "pause":
                     self.phase = "running"
                     self.seen_job = self.seen_job or snapshot.job == "on"
-                self.pending_command = ""
+                self.confirmed()
             elif now - self.command_at >= self.ack_window():
                 self.attention(self.ack_timeout_message())
             return None
