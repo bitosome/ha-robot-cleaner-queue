@@ -7,8 +7,11 @@ from __future__ import annotations
 from typing import Any
 
 MODES = {"vacuum": "vacuum", "vacuum_mop": "vac_and_mop", "mop": "mop"}
+MODE_KEYS = {native: key for key, native in MODES.items()}
 LABELS = {"vacuum": "Vacuum", "vacuum_mop": "Vacuum & mop", "mop": "Mop", "vacuum_then_mop": "Vacuum then mop"}
 SELECT_KEYS = {"mode": "cleaning_mode", "water": "water_box_mode", "route": "mop_mode"}
+# homeassistant.components.vacuum.VacuumEntityFeature.CLEAN_AREA
+AREA_FEATURE = 16384
 EXCLUDE = {"off", "off_raise_main_brush", "gentle", "smart_mode", "custom", "custom_water_flow"}
 
 
@@ -44,7 +47,9 @@ def current_map(coordinator) -> tuple[int | None, set[str]]:
 
 def area_mapping(vacuum_entry) -> dict:
     """Home Assistant stores the vacuum's area mapping in the entity registry options."""
-    mapping = getattr(vacuum_entry, "options", {}).get("vacuum", {}).get("area_mapping", {})
+    options = getattr(vacuum_entry, "options", None)
+    vacuum_options = options.get("vacuum") if isinstance(options, dict) else None
+    mapping = vacuum_options.get("area_mapping") if isinstance(vacuum_options, dict) else None
     return mapping if isinstance(mapping, dict) else {}
 
 
@@ -78,7 +83,7 @@ def home_maps(coordinator) -> tuple[list[dict], bool]:
             label = getattr(map_info, "name", None)
             maps.append({"flag": flag, "name": label.strip() if isinstance(label, str) and label.strip() else None,
                          "rooms": _rooms(map_info, flag)})
-        return maps, True
+        return maps, bool(maps)
     info = getattr(home, "current_map_data", None)
     flag = getattr(info, "map_flag", None)
     if not isinstance(flag, int) or isinstance(flag, bool):
@@ -96,6 +101,8 @@ def room_report(vacuum_entry, coordinator, area_registry) -> dict:
     """
     maps, complete = home_maps(coordinator)
     known = {room["id"] for entry in maps for room in entry["rooms"]}
+    # Areas that are selectable right now must never be called stale.
+    known |= current_map(coordinator)[1]
     mapping = area_mapping(vacuum_entry)
     owners: dict[str, str] = {}
     for area_id, segments in mapping.items():
@@ -117,9 +124,9 @@ def room_report(vacuum_entry, coordinator, area_registry) -> dict:
         if not complete or not isinstance(segments, list) or not segments:
             continue
         area = area_registry.async_get_area(area_id)
-        if area is not None and not set(segments) <= known:
-            areas.append({"id": area_id, "name": area.name,
-                          "segments": [s for s in segments if isinstance(s, str)]})
+        listed = [segment for segment in segments if isinstance(segment, str)]
+        if area is not None and listed and not set(listed) <= known:
+            areas.append({"id": area_id, "name": area.name, "segments": listed})
     return {"maps": [{"flag": e["flag"], "name": e["name"]} for e in maps], "rooms": rooms,
             "unmapped_areas": areas, "complete": complete}
 
@@ -144,25 +151,47 @@ def capabilities(vacuum_entry, coordinator, entries, states, area_registry) -> t
     selected = controls(entries, vacuum_entry, coordinator, states)
     current = cached_settings(coordinator)
     status = getattr(getattr(coordinator, "properties_api", None), "status", None)
-    def native_options(prop, display=False):
-        return {getattr(v, "display_name" if display else "value", v) for v in (getattr(status, prop, None) or [])}
-    def options(key, native_prop, display=False):
+    def native_options(prop):
+        # Only the select entity's own options are accepted by select_option, and the
+        # native trait may label a setting by value or by display name. Accept both
+        # rather than assuming one family, so a model that names them differently still
+        # offers every setting it really exposes.
+        names = set()
+        for item in (getattr(status, prop, None) or []):
+            for candidate in (getattr(item, "value", item), getattr(item, "display_name", None)):
+                if isinstance(candidate, str):
+                    names.add(candidate)
+        return names
+    def options(key, native_prop):
         state = states.get(selected.get(key, ""))
         exposed = state.attributes.get("options", []) if state else []
-        native = native_options(native_prop, display)
+        native = native_options(native_prop)
         return [v for v in exposed if isinstance(v, str) and v in native and v not in EXCLUDE]
     water = options("water", "water_mode_options")
-    routes = options("route", "mop_route_options", True)
+    routes = options("route", "mop_route_options")
     mode_state = states.get(selected.get("mode", ""))
-    native_modes = native_options("cleaning_mode_options")
-    modes = set(mode_state.attributes.get("options", []) if mode_state else []) & native_modes
+    # The select may expose a native value or a display name, so map each exposed
+    # option back to the mode it means instead of comparing literals.
+    mode_keys = {}
+    for item in (getattr(status, "cleaning_mode_options", None) or []):
+        value = getattr(item, "value", item)
+        key = MODE_KEYS.get(value) if isinstance(value, str) else None
+        if key is None:
+            continue
+        for candidate in (value, getattr(item, "display_name", None)):
+            if isinstance(candidate, str):
+                mode_keys.setdefault(candidate, key)
+    exposed_modes = [v for v in (mode_state.attributes.get("options", []) if mode_state else []) if isinstance(v, str)]
+    modes = {mode_keys[option] for option in exposed_modes if option in mode_keys}
     vac_state = states.get(vacuum_entry.entity_id)
     native_fan = native_options("fan_speed_options")
     suction = [v for v in (vac_state.attributes.get("fan_speed_list", []) if vac_state else []) if isinstance(v, str) and v in native_fan and v not in EXCLUDE]
-    offered = [key for key, native in MODES.items() if native in modes and (key == "mop" or suction) and (key == "vacuum" or water)]
+    offered = [key for key in MODES if key in modes and (key == "mop" or suction) and (key == "vacuum" or water)]
     if "vacuum" in offered and "mop" in offered:
         offered.append("vacuum_then_mop")
-    targets = room_targets(vacuum_entry, coordinator, area_registry)
+    features = int(getattr(vac_state, "attributes", {}).get("supported_features", 0) or 0) if vac_state is not None else 0
+    area_cleaning = bool(features & AREA_FEATURE)
+    targets = room_targets(vacuum_entry, coordinator, area_registry) if area_cleaning else {}
     flag, _ = current_map(coordinator)
     healthy = bool(getattr(coordinator, "last_update_success", False)) and vac_state is not None and vac_state.state not in {"unknown", "unavailable"}
     supported = bool(offered and healthy and flag is not None)
@@ -173,15 +202,18 @@ def capabilities(vacuum_entry, coordinator, entries, states, area_registry) -> t
     for key, vals, preferred in [("suction", suction, "balanced"), ("water", water, "medium"), ("route", routes, "standard")]:
         if (value := default(key, vals, preferred)) is not None:
             defaults[key] = value
-    routes_by_mode = {"vacuum": [], "vacuum_mop": [r for r in routes if r in {"standard", "fast"}], "mop": routes, "vacuum_then_mop": routes}
+    def is_fast_route(value):
+        return value.strip().lower() in {"standard", "fast"}
+    routes_by_mode = {"vacuum": [], "vacuum_mop": [r for r in routes if is_fast_route(r)], "mop": routes, "vacuum_then_mop": routes}
     valid_routes = routes_by_mode.get(defaults["mode"], [])
     if defaults.get("route") not in valid_routes:
         defaults.pop("route", None)
         if valid_routes:
-            defaults["route"] = "standard" if "standard" in valid_routes else valid_routes[0]
+            standard = next((r for r in valid_routes if r.strip().lower() == "standard"), None)
+            defaults["route"] = standard if standard is not None else valid_routes[0]
     result = {"supported": supported, "modes": [{"value": v, "label": LABELS[v]} for v in offered],
               "suction": suction, "water": water, "routes": routes, "routes_by_mode": routes_by_mode,
-              "repeats": [1, 2], "room_targets": [{k: t[k] for k in ("id", "name", "icon") if k in t} for t in targets.values()], "defaults": defaults}
+              "repeats": [1, 2], "area_cleaning": area_cleaning, "room_targets": [{k: t[k] for k in ("id", "name", "icon") if k in t} for t in targets.values()], "defaults": defaults}
     report = room_report(vacuum_entry, coordinator, area_registry)
     result["robot_maps"] = report["maps"]
     result["robot_rooms"] = report["rooms"]

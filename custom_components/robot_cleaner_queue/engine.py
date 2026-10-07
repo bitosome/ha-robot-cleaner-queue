@@ -94,6 +94,7 @@ class Queue:
     next_pending: bool = False
     run_id: str = ""
     not_before: float = 0
+    barrier_window: float = 0
     owner_user_id: str | None = None
 
     def dump(self) -> dict[str, Any]:
@@ -117,6 +118,7 @@ class Queue:
         """The outstanding command was observed, so nothing about it is uncertain."""
         self.pending_command = ""
         self.not_before = 0
+        self.barrier_window = 0
 
     def ack_window(self) -> float:
         """How long a dispatched command may take to become observable."""
@@ -133,7 +135,9 @@ class Queue:
             # A cloud command may have been accepted before telemetry catches up.
             # Clearing the UI must not permit another start on that stale state, so the
             # barrier lasts as long as that command may still be acknowledged.
-            self.not_before = max(self.not_before, self.command_at + self.ack_window())
+            window = self.ack_window()
+            if self.command_at + window > self.not_before:
+                self.not_before, self.barrier_window = self.command_at + window, window
 
     def _validate_start(self, snapshot: Snapshot, now: float, mode: str = "preset") -> None:
         if self.phase in ACTIVE or self.phase == "attention" or self.pending_command:
@@ -144,7 +148,9 @@ class Queue:
 
     def _validate_command_barrier(self, snapshot: Snapshot, now: float) -> None:
         if self.not_before and (now < self.not_before or snapshot.observed_at < self.not_before):
-            raise ValueError("A previous command is still uncertain. Wait for a fresh robot update after its 60-second acknowledgement window, then check the robot.")
+            window = self.barrier_window or ACK_SECONDS
+            wait = ("%d minutes" % (window // 60)) if window >= 120 else ("%d seconds" % window)
+            raise ValueError("A previous command is still uncertain. Wait %s for a fresh robot update after its acknowledgement window, then check the robot." % wait)
 
     def should_finish(self, snapshot: Snapshot) -> bool:
         return (self.phase in ACTIVE or bool(self.pending_command) or
@@ -155,6 +161,11 @@ class Queue:
         """Cancel all stages, then let native docking perform post-clean care."""
         if self.mode == "finish" and self.phase == "controlling":
             return None  # Repeated holds cannot restart cleaning or duplicate docking.
+        # A pending start/pause/stop keeps its own barrier, which defers the home
+        # command below. A device reservation is different: finishing throws away the
+        # readback it is waiting for, so refuse instead of losing that uncertainty.
+        if self.mode == "device" and self.phase == "controlling":
+            raise ValueError("A dock or settings command is still being confirmed. Wait for it before finishing.")
         self._preserve_command_barrier()
         self.mode, self.phase = "finish", "controlling"
         self.vacuum, self.run_id = vacuum, run_id
@@ -163,6 +174,7 @@ class Queue:
         self.current_index = self.completed = 0
         self.next_pending = self.seen_job = False
         self.pending_command, self.error = "", ""
+        self.barrier_window = 0
         self.started_at = now
         return self._observe_finish(snapshot, now)
 
@@ -228,7 +240,7 @@ class Queue:
         self.current_index = self.completed = 0
         self.started_at = self.baseline_end = self.finish_wait_at = 0
         self.seen_job = self.next_pending = False
-        self.not_before = 0
+        self.not_before = self.barrier_window = 0
         self.error = ""
         self.pending_command, self.command_at = command, now
         return "vacuum", {"pause": "pause", "resume": "start", "return_to_dock": "return_to_base", "stop": "stop"}[command]
@@ -282,7 +294,7 @@ class Queue:
         self.vacuum, self.presets, self.run_id = vacuum, list(presets), run_id
         self.current_index = self.completed = 0
         self.error = ""
-        self.not_before = 0
+        self.not_before = self.barrier_window = 0
         return self._dispatch(snapshot, now)
 
     def start_manual(self, vacuum: str, targets: list[str], setup: dict, stages: list[dict],
@@ -297,7 +309,7 @@ class Queue:
         self.control_entities = dict(control_entities)
         self.current_index = self.completed = 0
         self.error = ""
-        self.not_before = 0
+        self.not_before = self.barrier_window = 0
         return self._dispatch(snapshot, now)
 
     @property
@@ -404,7 +416,8 @@ class Queue:
                 self.phase = "cancelled"
             return None
         if self.pending_command == "return_to_dock":
-            if snapshot.vacuum in {"docked", "returning"}:
+            fresh = snapshot.observed_at == 0 or snapshot.observed_at >= self.command_at
+            if fresh and snapshot.vacuum in {"docked", "returning"}:
                 self.confirmed()
             elif not snapshot.robot_healthy or now - self.command_at >= ACK_SECONDS:
                 self.attention("Return to dock was not confirmed. The remaining queue has been cleared; check the robot.")
@@ -425,8 +438,15 @@ class Queue:
                 self.attention("The robot did not confirm the manual settings within 60 seconds. No cleaning was started.")
             return None
         if self.pending_command:
-            ack = (self.pending_command == "pause" and snapshot.vacuum == snapshot.status == "paused") or (
-                self.pending_command in {"start", "resume"} and snapshot.status in START_STATUS
+            # Confirming against telemetry older than the command would let a state the
+            # robot already had before we asked stand in for our command landing. A zero
+            # observation time means the adapter could not date it; connectivity and
+            # freshness are enforced separately in that case.
+            fresh = snapshot.observed_at == 0 or snapshot.observed_at >= self.command_at
+            ack = fresh and (
+                (self.pending_command == "pause" and snapshot.vacuum == snapshot.status == "paused") or (
+                    self.pending_command in {"start", "resume"} and snapshot.status in START_STATUS
+                )
             )
             if ack:
                 if self.pending_command != "pause":

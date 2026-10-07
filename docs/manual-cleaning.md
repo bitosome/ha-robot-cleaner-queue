@@ -8,7 +8,7 @@ The companion discovers the modes and values actually exposed by the selected na
 
 ## Areas and sequence
 
-Manual tiles come from the vacuum's existing Home Assistant **Cleaning by area** mapping. They are not the saved preset tiles, and the two lists need not match. A Home Assistant area can contain several mapped Roborock rooms; those rooms remain one tile and are submitted together. Only areas whose entire mapping exists on the robot's current map are offered. The companion does not switch maps or discover maps during capability lookup.
+Manual tiles come from the vacuum's existing Home Assistant **Cleaning by area** mapping. They are not the saved preset tiles, and the two lists need not match. A Home Assistant area can contain several mapped Roborock rooms; those rooms remain one tile and are submitted together. Only areas whose entire mapping exists on the robot's current map are offered, and only when the entity advertises area cleaning: without that feature a plan can only clean the whole home. Settings are validated against the options the native select entities themselves expose, because those are the strings `select_option` accepts; a native trait that labels a setting by value or by display name is accepted either way. The companion does not switch maps or discover maps during capability lookup.
 
 Select tiles in the desired sequence, or leave all areas unselected and press **Clean all rooms**. The queue starts one area at a time using `vacuum.clean_area`, retaining Home Assistant's existing area mapping. Empty areas use `vacuum.start` for the whole current map. The robot chooses the internal order of multiple segments grouped in one HA area; the queue guarantees order between the selected HA areas.
 
@@ -27,7 +27,7 @@ data:
 response_variable: capabilities
 ```
 
-The response contains `supported`, `modes` (`value` and `label`), option arrays `suction`, `water`, `routes`, `routes_by_mode`, `repeats`, `room_targets` (`id`, `name`, optional area `icon`), and `defaults`. An unavailable response includes `error`.
+The response contains `supported`, `area_cleaning` (whether the vacuum entity advertises the `CLEAN_AREA` feature that `vacuum.clean_area` needs), `modes` (`value` and `label`), option arrays `suction`, `water`, `routes`, `routes_by_mode`, `repeats`, `room_targets` (`id`, `name`, optional area `icon`), and `defaults`. An unavailable response includes `error`.
 
 It also returns a read-only zone report, because the Roborock app names every room while Home Assistant areas group them into real rooms:
 

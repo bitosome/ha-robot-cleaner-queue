@@ -22,7 +22,8 @@ def fixture():
     vacuum = NS(entity_id="vacuum.robot", unique_id="robot1", device_id="device", config_entry_id="entry", platform="roborock", domain="vacuum", disabled_by=None,
                 options={"vacuum": {"area_mapping": {"kitchen": ["0_1", "0_2"], "office": ["0_3"], "upstairs": ["1_1"], "stale": ["0_99"]}}})
     entries = [vacuum]
-    states = {vacuum.entity_id: NS(state="docked", attributes={"fan_speed_list": ["quiet", "balanced", "max", "off", "smart_mode", "custom"]})}
+    states = {vacuum.entity_id: NS(state="docked", attributes={"fan_speed_list": ["quiet", "balanced", "max", "off", "smart_mode", "custom"],
+                                                              "supported_features": manual.AREA_FEATURE | 8192})}
     option_sets = {"mode": ["vacuum", "vac_and_mop", "mop", "smart_mode", "custom"],
                    "water": ["off", "low", "medium", "high", "custom_water_flow", "smart_mode", "custom"],
                    "route": ["standard", "deep", "deep_plus", "fast", "smart_mode", "custom"]}
@@ -112,6 +113,14 @@ class ManualPlanTests(unittest.TestCase):
         self.targets["kitchen"]["segments"] = ["0_1"]
         with self.assertRaises(ValueError):
             manual.validate_stage(stage, self.caps, self.targets, 0)
+
+    def test_area_tiles_require_the_native_area_feature(self):
+        """A robot without area cleaning keeps whole-home cleaning but offers no tiles."""
+        self.states[self.vacuum.entity_id].attributes["supported_features"] = 8192
+        caps = manual.capabilities(self.vacuum, self.coordinator, self.entries, self.states, self.areas)[0]
+        self.assertTrue(caps["supported"])
+        self.assertFalse(caps["area_cleaning"])
+        self.assertEqual(caps["room_targets"], [])
 
     def test_native_only_vacuum_does_not_offer_synthetic_mopping(self):
         self.states["select.renamed_mode"].attributes["options"] = ["vacuum"]
@@ -303,9 +312,11 @@ class ManagerTraceTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(self.manager.store.saved, "State must be persisted before commands")
             if getattr(self, "fail_service", None) == service:
                 raise RuntimeError("Sensitive native payload must not escape")
-            # Native setting services refresh cached state after setting.
+            # Native setting services refresh cached state after setting, and Home
+            # Assistant also moves the select entity to the option it accepted.
             status = self.coordinator.properties_api.status
             if service == "select_option":
+                self.states[data["entity_id"]].state = data["option"]
                 key = data["entity_id"].removeprefix("select.renamed_")
                 if key == "mode":
                     status.current_cleaning_mode_name = data["option"]
@@ -316,6 +327,7 @@ class ManagerTraceTests(unittest.IsolatedAsyncioTestCase):
                     setattr(status, {"water": "water_mode_name", "route": "mop_route_name"}[key], data["option"])
             elif service == "set_fan_speed":
                 status.fan_speed_name = data["fan_speed"]
+                self.states["vacuum.robot"].attributes["fan_speed"] = data["fan_speed"]
             self.coordinator._last_update_success_time = datetime.now(timezone.utc)
             if getattr(self, "interrupt_after", None) == len(self.calls):
                 self.manager.queue.attention("External command")

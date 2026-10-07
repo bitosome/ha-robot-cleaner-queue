@@ -96,6 +96,33 @@ class StandaloneEngineTests(unittest.TestCase):
                 queue.external_control("pause", "vacuum.robot", state(observed_at=159), 165, "new")
             self.assertEqual(queue.external_control("pause", "vacuum.robot", state(observed_at=166), 166, "new"), ("vacuum", "pause"))
 
+    def test_stale_telemetry_cannot_confirm_a_command(self):
+        """A snapshot older than the command cannot stand in for it landing."""
+        queue = Queue(phase="running", vacuum="vacuum.robot", presets=["button.kitchen"], started_at=100)
+        self.assertEqual(queue.command("pause", state(), 200), ("vacuum", "pause"))
+        # The robot already looked paused at 190, before the command was sent at 200.
+        self.assertIsNone(queue.observe(state("paused", "paused", "on", observed_at=190), 201))
+        self.assertEqual(queue.pending_command, "pause")
+        self.assertIsNone(queue.observe(state("paused", "paused", "on", observed_at=205), 206))
+        self.assertEqual((queue.phase, queue.pending_command), ("paused", ""))
+
+    def test_barrier_reports_the_window_it_actually_guards(self):
+        queue = Queue(phase="starting", vacuum="vacuum.robot", pending_command="start", command_at=100)
+        queue.command("cancel", Snapshot(), 110)
+        self.assertEqual(queue.not_before, 1000)
+        with self.assertRaises(ValueError) as caught:
+            queue.start("vacuum.robot", ["button.bedroom"],
+                        Snapshot("docked", "charging", "off", "none", "ok", True, observed_at=200), 200, "new")
+        self.assertIn("15 minutes", str(caught.exception))
+
+    def test_finishing_refuses_to_discard_a_device_reservation(self):
+        queue = Queue(mode="device", phase="controlling", vacuum="vacuum.robot",
+                      pending_command="device", command_at=100, setup={"control": "mop_washing"},
+                      control_entities={"device": "switch.robot_mop_washing"})
+        with self.assertRaisesRegex(ValueError, "still being confirmed"):
+            queue.finish("vacuum.robot", state("docked", "charging", "off", observed_at=101), 101, "finish")
+        self.assertEqual((queue.mode, queue.pending_command), ("device", "device"))
+
     def test_confirmed_command_releases_its_barrier(self):
         """A stop the robot has confirmed must not lock docking behind a window."""
         queue = Queue(phase="running", vacuum="vacuum.robot", presets=["button.kitchen"], started_at=100)

@@ -149,8 +149,11 @@ class Manager:
         except PermissionError as err:
             raise Unauthorized(context=call.context, permission=POLICY_CONTROL) from err
         except (ValueError, AttributeError, TypeError):
-            return {"supported": False, "modes": [], "suction": [], "water": [], "routes": [], "repeats": [],
-                    "room_targets": [], "defaults": {}, "error": "Manual cleaning is unavailable. Check the native Roborock integration and area mapping."}
+            return {"supported": False, "modes": [], "suction": [], "water": [], "routes": [],
+                    "routes_by_mode": {"vacuum": [], "vacuum_mop": [], "mop": [], "vacuum_then_mop": []},
+                    "repeats": [], "area_cleaning": False, "room_targets": [], "robot_maps": [], "robot_rooms": [],
+                    "unmapped_areas": [], "rooms_complete": False, "defaults": {},
+                    "error": "Manual cleaning is unavailable. Check the native Roborock integration and area mapping."}
 
     async def read_saved_preset(self, vacuum, user_id):
         plan = self.saved_presets.get(vacuum)
@@ -295,8 +298,21 @@ class Manager:
             self.coordinator_unsub = coordinator.async_add_listener(self.schedule_tick)
         state = self.hass.states.get(vacuum)
         current = snapshot(coordinator, state.state if state else "unavailable")
-        current.settings = cached_settings(coordinator)
+        current.settings = self.observed_settings(vacuum, state, coordinator)
         return current
+
+    def observed_settings(self, vacuum: str, state, coordinator) -> dict:
+        """Prefer the native select states: they hold exactly the strings select_option accepts."""
+        settings = cached_settings(coordinator)
+        for key in ("mode", "water", "route"):
+            entity_id = self.queue.control_entities.get(key)
+            select_state = self.hass.states.get(entity_id) if entity_id else None
+            if select_state is not None and select_state.state not in {"unknown", "unavailable"}:
+                settings[key] = select_state.state
+        fan = getattr(getattr(state, "attributes", None), "get", lambda *_: None)("fan_speed")
+        if isinstance(fan, str) and fan:
+            settings["suction"] = fan
+        return settings
 
     @callback
     def schedule_tick(self) -> None:
@@ -320,6 +336,10 @@ class Manager:
                 if command == "start" and use_saved:
                     saved_plan = self.saved_presets.get(vacuum)
                     if saved_plan:
+                        missing = [key for key in ("source", "presets", "rooms", "setup")
+                                   if not isinstance(saved_plan, dict) or key not in saved_plan]
+                        if missing:
+                            raise ServiceValidationError("The saved preset is incomplete. Save it again from the card.")
                         data.update({key: saved_plan[key] for key in ("presets", "rooms", "setup")})
                         command = "start_manual" if saved_plan["source"] == "manual" else "start"
             bound = self.queue.phase in ACTIVE or self.queue.phase == "attention" or bool(self.queue.pending_command)
