@@ -61,7 +61,7 @@ Other commands:
 
 The card contract is `control_version: 5`. Version 0.2.2 can pause/resume/dock an app-started job with an explicit vacuum. It stores `mode: external` without targets or stages; acknowledgement returns it to idle and cannot advance an old plan. Resume requires a paused, unfinished job. Active, attention and uncertain commands cannot be bypassed by controlling a different robot.
 
-For non-start commands, pass the same `vacuum` to protect against a card configured for another robot. An `attention` queue must be cleared with `cancel` before a new queue can start. Clearing an unacknowledged command preserves a safety barrier: another start requires that command's window to expire — fifteen minutes for a start or resume, sixty seconds for settings or a control command — and a new native poll after that window confirming idle/job-off. The barrier is released as soon as the robot is observed confirming that command, so a stop the robot has already acknowledged never delays docking. Cancelling cannot reuse a stale docked state to send a duplicate job. Only an idle/docked robot with no unfinished job can start a new sequence. Starts cannot replace an existing queue or unfinished job.
+For non-start commands, pass the same `vacuum` to protect against a card configured for another robot. With execution_version 3, an explicit new start can replace historical `attention` after fresh native readiness and uncertainty checks. It starts the requested plan from its beginning, never resumes old stages. `cancel` remains an optional queue-only dismissal, available even when the robot is offline. Clearing an unacknowledged command preserves a safety barrier: another start requires that command's window to expire — fifteen minutes for a start or resume, sixty seconds for settings or a control command — and a new native poll after that window confirming idle/job-off. The barrier is released as soon as the robot is observed confirming that command, so a stop the robot has already acknowledged never delays docking. Cancelling cannot reuse a stale docked state to send a duplicate job. Only an idle/docked robot with no unfinished job can start a new sequence. Starts cannot replace an existing queue or unfinished job.
 
 `start_manual` accepts either a list of room requests (`{"id": "0_12", "mode": ..., "suction": ..., "water": ..., "route": ..., "repeat": ...}`) or the legacy list of Home Assistant area IDs (`["kitchen"]`). Room ids come from `get_capabilities.robot_rooms` and must exist on the robot's current map. Each room's settings fall back to the request's `setup` defaults, and a plan may hold 1–32 rooms and at most 128 stages. Rooms cannot repeat. Area-shaped requests keep working for plans saved before rooms existed.
 
@@ -75,7 +75,8 @@ The optional `cleaning_entity`, `status_entity`, `error_entity` and `last_clean_
 - `starting`: a start/resume command is awaiting observed acknowledgement.
 - `running`: the acknowledged room job is active or waiting to return to the dock before the next room.
 - `paused`: the queue is paused; check `pending_command` for pause acknowledgement.
-- `completed`: every stage of the plan reported successful completion.
+- `finishing`: every floor pass succeeded; final return and active dock care are still being observed.
+- `completed`: every stage succeeded and final stable docking was confirmed. Passive drying may continue.
 - `cancelled`: remaining rooms were cleared; the robot may still be active.
 - `attention`: execution stopped because a fault, restart, conflict or uncertain result requires review.
 
@@ -136,7 +137,7 @@ Every step is logged under the `custom_components.robot_cleaner_queue` logger, a
 
 - **DEBUG** — each observation that differs from the previous one: robot state, status, job flag, fault, dock state, observation time, the cleaning record, and the engine's own reason for the current state (`decision`).
 - **INFO** — every received command with its caller, the dispatch of each room, and deferrals such as *"native setting entities are unavailable: water; waiting"*.
-- **WARNING** — a refusal or a failed command, with the full traceback in the log. The sensor only names the exception type, so no private payload reaches an attribute.
+- **WARNING** — a refusal or failed command, with allowlisted error classification. Raw native messages, payloads and tracebacks are excluded from command diagnostics.
 
 ```yaml
 action: robot_cleaner_queue.get_diagnostics
@@ -147,7 +148,7 @@ response_variable: diagnostics
 
 The response contains the persisted `queue`, the `robot` observation, the saved plan keys, and up to 100 `events` with time, kind, detail, phase, decision, pending command, room index and completed count — enough to reconstruct what a stopped sequence was waiting for without reading the log.
 
-A dock that is servicing hides the native setting entities for a while. That is not a plan change: a manual stage waits for them (logging the deferral) instead of stopping, and the settings readback window is 10 minutes because writing settings is not motion. A sequence that does stop keeps the real cause in the log while the sensor stays sanitised.
+A dock that is servicing hides the native setting entities for a while. That is not a plan change: a manual stage waits for them (logging the deferral) instead of stopping, and the settings readback window is 10 minutes because writing settings is not motion. A stopped sequence retains safe error classification; the original native message is deliberately not retained.
 
 ## Persisted plan — v0.4.0, rooms since v0.7.0
 
@@ -250,3 +251,26 @@ allowlisted exception types, numeric error codes, translation keys, operation,
 setting key where applicable, attempt flag and timestamp. Raw error messages,
 service payloads, traceback contents, credentials and placeholders are excluded.
 Categories are diagnostic only and never authorize a retry.
+
+
+## Stopped-run recovery — v0.10.1
+
+Historical failure does not own a new robot job. Explicit Start or the saved-plan
+wall-switch action may replace attention once the robot has fresh, healthy,
+idle/job-off telemetry and any uncertain command window has expired with a later
+native update. Pause/resume/stop/dock can control a later native app job without
+adopting the old plan. Clearing stopped history requires permission on the vacuum
+only, not obsolete setting entities, and never sends a robot command.
+
+The sensor and capability contract exposes execution_version 3. Dynamic attributes
+recovery_ready and recovery_reason explain whether a new plan may replace history;
+the actual requested mode is validated again at dispatch. All initial starts and
+native dispatches require a known observation no older than 90 seconds. Queue-only
+clearing and local plan editing remain available without fresh robot telemetry.
+
+HA 2026.9.4 omits some known V1 mop/wash activities from its vacuum state mapping.
+For connected native observations only, the adapter translates those verified numeric
+states when HA reports unknown. It never overrides unavailable/error/disconnected
+states or guesses an unrecognized code. robot_activity, robot_connected and
+robot_observed_at let the card apply the same narrowly scoped display fallback.
+No new polling, protocol commands or physical retries are introduced.

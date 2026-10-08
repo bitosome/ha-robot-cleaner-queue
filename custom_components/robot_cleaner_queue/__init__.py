@@ -266,7 +266,7 @@ class Manager:
             caps, controls, _, _ = self.manual_capabilities(call.data["vacuum"])
             await async_require_control(self.hass.auth, call.context.user_id, list(controls.values()), POLICY_CONTROL)
             caps["control_version"] = 5
-            caps["execution_version"] = 2
+            caps["execution_version"] = 3
             caps["current_map"] = current_map(self.resolve(call.data["vacuum"])[2])[0]
             caps["saved_preset"] = await self.read_saved_preset(call.data["vacuum"], call.context.user_id)
             caps["saved_plan_revision"] = (caps["saved_preset"] or {}).get("revision", 0)
@@ -427,9 +427,14 @@ class Manager:
 
     def validate_device(self, vacuum, key, value):
         current = self.current_snapshot(vacuum)
+        self.queue.validate_fresh_observation(current, time.time())
         self.queue._validate_command_barrier(current, time.time())
-        if self.queue.phase in ACTIVE or self.queue.phase == "attention" or self.queue.pending_command:
-            raise ValueError("Finish or clear the cleaning sequence before changing dock settings.")
+        if self.queue.phase in ACTIVE or self.queue.pending_command:
+            raise ValueError("Wait for the active sequence or command before changing robot settings.")
+        if self.queue.phase == "attention":
+            if self.queue.vacuum and self.queue.vacuum != vacuum:
+                raise ValueError("Clear the stopped sequence for the other robot first.")
+            self.queue.validate_recovery(current, time.time())
         if not current.connected or current.vacuum in {"unknown", "unavailable"}:
             raise ValueError("The robot is unavailable.")
         if key == "selected_map" and not current.ready_for("vacuum"):
@@ -475,6 +480,7 @@ class Manager:
                 if self.device_entities(vacuum).get(key) != entity_id:
                     raise ValueError("The native control changed before dispatch.")
                 current = self.current_snapshot(vacuum)
+                self.queue.validate_fresh_observation(current, time.time())
                 if key == "selected_map" and not current.ready_for("vacuum"):
                     raise ValueError("The robot became busy before the map change.")
                 if key in DOCK and value == "on" and (current.vacuum != "docked" or not current.ready_for("mop" if key == "mop_washing" else "vacuum")):
@@ -535,8 +541,18 @@ class Manager:
         state = self.hass.states.get(vacuum)
         current = snapshot(coordinator, state.state if state else "unavailable")
         current.settings = self.observed_settings(vacuum, state, coordinator)
-        self.robot_state = {"dock_status": current.status, "dock_drying": current.dock_drying}
+        self.robot_state = {"dock_status": current.status, "dock_drying": current.dock_drying,
+                            "robot_observed_at": current.observed_at, "robot_activity": current.vacuum,
+                            "robot_connected": current.connected, **self.recovery_state(current)}
         return current
+
+    def recovery_state(self, current: Snapshot) -> dict:
+        """Expose the same read-only recovery checks that authorize a new plan."""
+        try:
+            self.queue.validate_recovery(current, time.time())
+        except ValueError as err:
+            return {"recovery_ready": False, "recovery_reason": str(err)}
+        return {"recovery_ready": True, "recovery_reason": ""}
 
     def observed_settings(self, vacuum: str, state, coordinator) -> dict:
         """Prefer the native select states: they hold exactly the strings select_option accepts."""
@@ -592,14 +608,16 @@ class Manager:
                         raise ServiceValidationError("The saved plan is incomplete. Save it again from the card.")
                     data.update(rooms=saved_plan["rooms"], setup=saved_plan["setup"])
             bound = self.queue.phase in ACTIVE or self.queue.phase == "attention" or bool(self.queue.pending_command)
-            owned_plan = bound and self.queue.mode == "manual"
+            owned_plan = (self.queue.phase in ACTIVE or bool(self.queue.pending_command)) and self.queue.mode == "manual"
             standalone = command in {"pause", "resume", "return_to_dock", "stop"} and not owned_plan
             if standalone and not data.get("vacuum"):
                 raise ServiceValidationError("Specify a vacuum when controlling a job outside an active queue.")
             if command != "start_manual" and bound and self.queue.vacuum and vacuum != self.queue.vacuum:
                 raise ServiceValidationError("This command targets a different vacuum than the current queue.")
-            permission_entities = [vacuum, *(self.queue.control_entities.values()
-                                             if owned_plan and command != "start_manual" else [])]
+            # Queue dismissal and direct robot controls do not require permission on
+            # obsolete setting entities from the stopped plan. Future starts/settings
+            # validate their current entities independently before dispatch.
+            permission_entities = [vacuum]
             try:
                 await async_require_control(self.hass.auth, call.context.user_id, permission_entities, POLICY_CONTROL)
             except PermissionError as err:
@@ -680,7 +698,8 @@ class Manager:
         setting = None
         async def authorize():
             await async_require_control(self.hass.auth, user_id,
-                [self.queue.vacuum, *self.queue.control_entities.values()], POLICY_CONTROL)
+                [self.queue.vacuum, *(self.queue.control_entities.values()
+                                     if kind in {"configure", "manual"} else [])], POLICY_CONTROL)
         try:
             await authorize()
             if not self.effect_valid(effect):
@@ -717,7 +736,9 @@ class Manager:
                     raise ValueError("Native controls are temporarily unavailable. No start was sent.")
                 if controls != self.queue.control_entities:
                     raise ValueError("The native manual control entities changed.")
-                if not self.current_snapshot(self.queue.vacuum).ready_for(self.queue.cleaning_mode):
+                current = self.current_snapshot(self.queue.vacuum)
+                self.queue.validate_fresh_observation(current, time.time())
+                if not current.ready_for(self.queue.cleaning_mode):
                     raise ValueError("The robot is no longer ready to start a manual job.")
                 if kind == "configure":
                     # High-level mode resets lower-level settings: always set it first.
@@ -759,6 +780,7 @@ class Manager:
                         if current.servicing_for(self.queue.cleaning_mode):
                             self.deferred_configuration = (token, effect)
                             return
+                        self.queue.validate_fresh_observation(current, time.time())
                         if not current.ready_for(self.queue.cleaning_mode):
                             raise ValueError("The robot became busy before applying manual settings.")
                         attempted = True
@@ -771,6 +793,7 @@ class Manager:
                     # Tick uses freshly observed settings before issuing any start.
                     return
                 current = self.current_snapshot(self.queue.vacuum)
+                self.queue.validate_fresh_observation(current, time.time())
                 if not all(current.settings.get(key) == value for key, value in self.queue.stage["settings"].items()):
                     raise ValueError("Manual settings changed before the start command.")
                 area = self.queue.stage["target"]
@@ -793,6 +816,7 @@ class Manager:
                     await self.hass.services.async_call("vacuum", "clean_area" if area else "start", data, blocking=True, context=context)
             else:
                 current = self.current_snapshot(self.queue.vacuum)
+                self.queue.validate_fresh_observation(current, time.time())
                 self.queue._validate_command_barrier(current, time.time())
                 if not self.queue.validate_control_state(self.queue.pending_command, current):
                     return
@@ -837,7 +861,10 @@ class Manager:
                 current = self.current_snapshot(self.queue.vacuum)
             except ValueError:
                 current = Snapshot()
-                self.robot_state = {"dock_status": "unavailable", "dock_drying": None}
+                self.robot_state = {"dock_status": "unavailable", "dock_drying": None,
+                                    "robot_observed_at": 0, "robot_activity": "unavailable", "robot_connected": False,
+                                    "recovery_ready": False,
+                                    "recovery_reason": "The robot is unavailable."}
             if self.queue.mode == "device":
                 if self.queue.pending_command:
                     self.observe_device()

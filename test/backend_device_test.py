@@ -191,6 +191,24 @@ class DeviceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.calls,[])
 
 
+    async def test_old_attention_does_not_block_fresh_idle_device_controls(self):
+        self.manager.queue=Queue(phase="attention",vacuum="vacuum.robot",mode="manual",
+            command_at=self.clock-2000,not_before=self.clock-1100,error="Old failed start")
+        await self.send("volume",60)
+        self.assertEqual(self.calls,[("number","set_value",{"entity_id":"number.robot_volume","value":60.0})])
+        await self.manager.tick()
+        self.assertEqual(self.manager.queue.phase,"idle")
+
+    async def test_attention_device_recovery_never_bypasses_uncertainty_or_stale_telemetry(self):
+        for barrier,age in [(self.clock+30,0),(0,91)]:
+            self.manager.queue=Queue(phase="attention",vacuum="vacuum.robot",mode="manual",
+                command_at=self.clock-2000,not_before=barrier,error="Old failed start")
+            self.coordinator._last_update_success_time=datetime.fromtimestamp(self.clock-age,timezone.utc)
+            with self.assertRaises(m.ServiceError): await self.send("volume",60)
+            self.assertEqual(self.calls,[])
+            self.assertEqual(self.manager.queue.phase,"attention")
+
+
 class WaterManagerTests(unittest.IsolatedAsyncioTestCase):
     advance = m.ManagerTraceTests.advance
     async def test_vacuum_water_exception_covers_settings_and_final_dispatch(self):

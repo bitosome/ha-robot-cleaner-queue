@@ -903,7 +903,9 @@ class ManagerTraceTests(unittest.IsolatedAsyncioTestCase):
         before = len(self.manager.store.saved)
         self.coordinator.properties_api.status.dry_status = 1
         await self.manager.tick()
-        self.assertEqual(notifications[-1], {"dock_status":"charging", "dock_drying":True})
+        self.assertEqual({k:notifications[-1][k] for k in ("dock_status","dock_drying")}, {"dock_status":"charging", "dock_drying":True})
+        self.assertEqual(notifications[-1]["robot_activity"], "docked")
+        self.assertTrue(notifications[-1]["robot_connected"])
         self.coordinator.properties_api.status.dry_status = 0
         await self.advance()
         self.assertEqual(notifications[-1]["dock_drying"], False)
@@ -982,6 +984,91 @@ class ManagerTraceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(queue.command_failure["attempted"])
         self.assertEqual(queue.not_before, 0)
         self.assertFalse(any(service == "clean_area" for _, service, _ in self.calls))
+
+
+    def stopped_history(self):
+        self.manager.queue = Queue(phase="attention", mode="manual", vacuum="vacuum.robot",
+            command_at=self.clock-2000, not_before=self.clock-1100, barrier_window=900,
+            error="Old native start failed", current_index=3, completed=3,
+            control_entities={"mode":"select.removed"}, command_failure={"category":"unknown"})
+
+    async def test_explicit_plan_start_replaces_old_attention_without_old_control_permissions(self):
+        self.stopped_history()
+        await self.start(rooms=["office"], setup={"mode":"vacuum","suction":"max"})
+        self.assertEqual(self.manager.queue.phase,"preparing")
+        self.assertEqual(self.manager.queue.current_index,0)
+        self.assertEqual(self.manager.queue.completed,0)
+        self.assertEqual(self.manager.queue.targets,["office"])
+        self.assertEqual(self.manager.queue.error,"")
+        self.assertFalse(any(service in {"start","clean_area"} for _,service,_ in self.calls))
+        await self.settle()
+        self.assertEqual([data for _,service,data in self.calls if service=="clean_area"],
+            [{"entity_id":"vacuum.robot","cleaning_area_id":["office"]}])
+
+    async def test_wall_switch_saved_plan_can_recover_from_stopped_history(self):
+        await self.save_manual(rooms=["office"])
+        saved=dict(self.manager.saved_presets)
+        self.stopped_history()
+        await self.manager.control(NS(context=FakeContext("user"),
+            data={"command":"toggle_saved","vacuum":"vacuum.robot"}))
+        self.assertEqual(self.manager.queue.phase,"preparing")
+        self.assertEqual(self.manager.queue.targets,["office"])
+        self.assertEqual(self.manager.saved_presets,saved)
+        self.assertFalse(any(service in {"start","clean_area"} for _,service,_ in self.calls))
+        await self.settle()
+        self.assertEqual(len([s for _,s,_ in self.calls if s=="clean_area"]),1)
+
+    async def test_clear_requires_only_vacuum_permission_and_never_resolves_offline_robot(self):
+        self.stopped_history()
+        self.states["vacuum.robot"].state="unavailable"
+        def no_native_read(_vacuum): raise AssertionError("Queue-only clear must not depend on native connection")
+        self.manager.resolve=no_native_read
+        await self.manager.control(NS(context=FakeContext("user"),
+            data={"command":"cancel","vacuum":"vacuum.robot"}))
+        self.assertEqual(self.manager.queue.phase,"cancelled")
+        self.assertEqual(self.manager.queue.error,"")
+        self.assertEqual(self.manager.queue.command_failure,{})
+        self.assertEqual(self.calls,[])
+
+    async def test_recovery_readiness_updates_from_live_age_without_rewriting_queue(self):
+        self.stopped_history()
+        await self.manager.tick()
+        self.assertTrue(self.manager.robot_state["recovery_ready"])
+        writes=len(self.manager.store.saved)
+        self.clock+=91
+        await self.manager.tick()
+        self.assertFalse(self.manager.robot_state["recovery_ready"])
+        self.assertTrue(self.manager.robot_state["recovery_reason"])
+        self.assertEqual(len(self.manager.store.saved),writes)
+        self.assertEqual(self.calls,[])
+        self.coordinator._last_update_success_time=datetime.fromtimestamp(self.clock,timezone.utc)
+        await self.manager.tick()
+        self.assertTrue(self.manager.robot_state["recovery_ready"])
+
+    async def test_app_job_can_be_paused_despite_stopped_plan_and_removed_setting_entity(self):
+        self.stopped_history()
+        # Once a later job is positively active, the old history does not own it.
+        self.manager.queue.not_before=0
+        self.coordinator.data.status.state_name="segment_cleaning"
+        self.coordinator.data.status.in_cleaning=1
+        self.states["vacuum.robot"].state="cleaning"
+        await self.manager.control(NS(context=FakeContext("user"),
+            data={"command":"pause","vacuum":"vacuum.robot"}))
+        self.assertEqual(self.calls,[("vacuum","pause",{"entity_id":"vacuum.robot"})])
+        self.assertEqual(self.manager.queue.mode,"external")
+        self.assertEqual(self.manager.queue.stages,[])
+
+    async def test_settings_dispatch_rechecks_native_freshness_after_authorization(self):
+        original=self.hass.auth.async_get_user
+        async def delayed(user):
+            if self.manager.queue.phase=="preparing":
+                self.clock+=91
+            return await original(user)
+        self.hass.auth.async_get_user=delayed
+        await self.start()
+        self.assertEqual(self.calls,[])
+        self.assertEqual(self.manager.queue.phase,"attention")
+        self.assertFalse(self.manager.queue.command_failure["attempted"])
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

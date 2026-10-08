@@ -19,6 +19,7 @@ jobs:
       - run: python3 -B test/backend_device_test.py
       - run: python3 -B test/backend_schema_test.py
       - run: python3 -B test/backend_errors_test.py
+      - run: python3 -B test/backend_adapter_test.py
       - name: Verify release version
         run: |
           python3 - <<'PY'

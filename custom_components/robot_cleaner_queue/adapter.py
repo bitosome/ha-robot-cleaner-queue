@@ -7,6 +7,26 @@ from __future__ import annotations
 from typing import Any
 from .engine import Snapshot
 
+# The native library recognizes these V1 states, but HA 2026.9.4's vacuum
+# activity table does not. HA therefore exposes "unknown" during real mop work.
+# Translate only these verified numeric omissions; unknown firmware codes and
+# unavailable/disconnected entities remain unavailable to the queue.
+# python-roborock 7.4.2: data/v1/v1_code_mappings.py, RoborockStateCode.
+NATIVE_ACTIVITY_FALLBACK = {
+    25: "docked",  # washing_the_mop_2; state_name is "washing_the_mop"
+    202: "docked",  # air_drying_stopping
+    6301: "cleaning",  # robot_status_mopping
+    6302: "cleaning",  # clean_mop_cleaning
+    6303: "cleaning",  # clean_mop_mopping
+    6304: "cleaning",  # segment_mopping
+    6305: "cleaning",  # segment_clean_mop_cleaning
+    6306: "cleaning",  # segment_clean_mop_mopping
+    6307: "cleaning",  # zoned_mopping
+    6308: "cleaning",  # zoned_clean_mop_cleaning
+    6309: "cleaning",  # zoned_clean_mop_mopping
+    6310: "returning",  # back_to_dock_washing_duster
+}
+
 
 def number(value: Any) -> int | float | None:
     value = getattr(value, "value", value)
@@ -27,6 +47,9 @@ def snapshot(coordinator: Any, vacuum_state: str) -> Snapshot:
     job = number(getattr(status, "in_cleaning", None))
     error = number(getattr(status, "error_code", None))
     dock_error = number(getattr(status, "dock_error_status", None))
+    connected = bool(getattr(coordinator, "last_update_success", False))
+    if vacuum_state == "unknown" and connected:
+        vacuum_state = NATIVE_ACTIVITY_FALLBACK.get(number(getattr(status, "state", None)), vacuum_state)
     return Snapshot(
         vacuum=vacuum_state,
         status=getattr(status, "state_name", None) or "unavailable",
@@ -36,7 +59,7 @@ def snapshot(coordinator: Any, vacuum_state: str) -> Snapshot:
         # Only this known water-only fault is eligible for vacuum-only cleaning.
         dock_error="ok" if dock_error in (None, 0) else "water_empty" if dock_error == 38 else
                    (getattr(getattr(status, "dock_error_status", None), "name", None) or "error"),
-        connected=bool(getattr(coordinator, "last_update_success", False)),
+        connected=connected,
         dock_drying=(None if getattr(status, "dry_status", None) is None
                      else bool(getattr(status, "dry_status"))),
         record=clean_record(getattr(getattr(data, "clean_summary", None), "last_clean_record", None)),

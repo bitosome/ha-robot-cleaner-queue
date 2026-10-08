@@ -61,8 +61,8 @@ class StandaloneEngineTests(unittest.TestCase):
                 self.assertIsNone(queue.observe(done, now))
             self.assertEqual((queue.phase, queue.completed), ("idle", 0))
 
-    def test_active_attention_and_pending_plans_reject_without_mutation(self):
-        for queue in [Queue(phase="running"), Queue(phase="attention"), Queue(phase="idle", pending_command="pause"), Queue(phase="controlling", mode="external")]:
+    def test_active_and_pending_plans_reject_without_mutation(self):
+        for queue in [Queue(phase="running"), Queue(phase="idle", pending_command="pause"), Queue(phase="controlling", mode="external")]:
             before = queue.dump()
             with self.assertRaises(ValueError):
                 queue.external_control("pause", "vacuum.robot", state(), 100, "request")
@@ -194,6 +194,159 @@ class StandaloneEngineTests(unittest.TestCase):
         self.assertIsNone(queue.command("resume", state("docked", "charging", "off"), 150))
         self.assertIsNone(queue.observe(state("docked", "charging", "off", observed_at=150), 150))
         self.assertEqual(queue.observe(state("docked", "charging", "off", observed_at=166), 166), ("configure", "1"))
+
+
+class RecoveryEngineTests(unittest.TestCase):
+    def stopped(self):
+        return Queue(phase="attention", mode="manual", vacuum="vacuum.robot",
+                     targets=["0_1", "0_2"], stages=TWO_STAGES,
+                     completed=1, current_index=1, command_at=100,
+                     settings_sent_at=95, started_at=100, baseline_end=80,
+                     seen_job=True, finish_wait_at=70, not_before=1000,
+                     barrier_window=900, error="The previous start failed.",
+                     command_failure={"category": "unknown"}, decision="stopped old run",
+                     run_id="old")
+
+    def test_explicit_new_plan_replaces_resolved_attention_without_replaying_history(self):
+        q = self.stopped()
+        idle = state("docked", "charging", "off", observed_at=1990)
+        self.assertFalse(q.should_finish(idle), "A wall-switch hold should choose a new saved plan")
+        self.assertEqual(q.start_manual("vacuum.robot", ["0_1"], {}, ONE_STAGE, {}, idle, 2000, "new"),
+                         ("configure", "0"))
+        self.assertEqual((q.phase, q.current_index, q.completed, q.run_id), ("preparing", 0, 0, "new"))
+        self.assertEqual(q.stages, ONE_STAGE)
+        self.assertEqual((q.started_at, q.baseline_end, q.finish_wait_at, q.seen_job), (0, 0, 0, False))
+        self.assertEqual((q.error, q.command_failure, q.not_before), ("", {}, 0))
+        self.assertNotIn("old", q.decision)
+        idle.settings = {"mode": "vacuum"}
+        idle.observed_at = 2001
+        self.assertIsNone(q.observe(idle, 2001))
+        idle.observed_at = 2017
+        self.assertEqual(q.observe(idle, 2017), ("manual", "0"))
+        self.assertEqual(q.targets, ["0_1"])
+
+    def test_attention_never_automatically_restarts_on_fresh_idle(self):
+        q = self.stopped()
+        before = q.dump()
+        idle = state("docked", "charging", "off", observed_at=2000)
+        for now in [2000, 2016, 3000]:
+            idle.observed_at = now
+            self.assertIsNone(q.observe(idle, now))
+        self.assertEqual(q.dump(), before)
+
+    def test_recovery_is_read_only_and_rejects_uncertainty_stale_or_unfinished_state(self):
+        for case in ["active", "pending", "deadline", "before_deadline", "undated", "stale", "before_command",
+                     "busy", "unfinished", "washing", "offline", "robot_fault", "water_fault"]:
+            with self.subTest(case=case):
+                q = self.stopped()
+                current = state("docked", "charging", "off", observed_at=2000)
+                if case == "active": q.phase = "finishing"
+                elif case == "pending": q.pending_command = "device"
+                elif case == "deadline": q.not_before = 2001
+                elif case == "before_deadline": current.observed_at = 999
+                elif case == "undated": current.observed_at = 0
+                elif case == "stale": current.observed_at = 1909
+                elif case == "before_command": q.command_at = 2001
+                elif case == "busy": current.vacuum, current.status, current.job = "cleaning", "segment_cleaning", "on"
+                elif case == "unfinished": current.job = "on"
+                elif case == "washing": current.status = "washing_the_mop"
+                elif case == "offline": current.connected = False
+                elif case == "robot_fault": current.error = "error"
+                else: current.dock_error = "water_empty"
+                before = q.dump()
+                with self.assertRaises(ValueError):
+                    q.validate_recovery(current, 2000, "mop" if case == "water_fault" else "vacuum")
+                self.assertEqual(q.dump(), before)
+                with self.assertRaises(ValueError):
+                    q.start_manual("vacuum.robot", ["0_1"], {"mode": "mop" if case == "water_fault" else "vacuum"},
+                                   ONE_STAGE, {}, current, 2000, "new")
+                self.assertEqual(q.dump(), before)
+
+    def test_recovery_allows_vacuum_only_with_water_empty_and_does_not_mutate(self):
+        q = self.stopped()
+        current = state("docked", "charging", "off", observed_at=1910)
+        current.dock_error = "water_empty"
+        before = q.dump()
+        self.assertIsNone(q.validate_recovery(current, 2000, "vacuum"))
+        self.assertEqual(q.dump(), before)
+
+    def test_other_vacuum_cannot_discard_stopped_queue(self):
+        q = self.stopped()
+        before = q.dump()
+        with self.assertRaisesRegex(ValueError, "different vacuum"):
+            q.start_manual("vacuum.other", ["0_1"], {}, ONE_STAGE, {},
+                           state("docked", "charging", "off", observed_at=2000), 2000, "new")
+        self.assertEqual(q.dump(), before)
+
+    def test_restart_attention_can_be_replaced_only_after_original_start_barrier(self):
+        q = Queue(phase="starting", mode="manual", vacuum="vacuum.robot", targets=["0_1"],
+                  stages=ONE_STAGE, pending_command="start", command_at=100, run_id="old")
+        q = Queue.restore(q.dump())
+        self.assertEqual((q.phase, q.not_before), ("attention", 1000))
+        idle = state("docked", "charging", "off", observed_at=999)
+        with self.assertRaises(ValueError):
+            q.start_manual("vacuum.robot", ["0_1"], {}, ONE_STAGE, {}, idle, 1001, "new")
+        idle.observed_at = 1001
+        self.assertEqual(q.start_manual("vacuum.robot", ["0_1"], {}, ONE_STAGE, {}, idle, 1001, "new"),
+                         ("configure", "0"))
+
+    def test_native_job_can_be_controlled_from_stopped_history_without_resuming_old_stages(self):
+        cases = [
+            ("pause", state(), state("paused", "paused"), "pause"),
+            ("resume", state("paused", "paused"), state(), "start"),
+            ("stop", state(), state("idle", "idle", "off"), "stop"),
+            ("return_to_dock", state(), state("returning", "returning_home"), "return_to_base"),
+        ]
+        for command, before, after, service in cases:
+            with self.subTest(command=command):
+                q = self.stopped()
+                before.observed_at = 2000
+                self.assertEqual(q.external_control(command, "vacuum.robot", before, 2000, "native"),
+                                 ("vacuum", service))
+                self.assertEqual((q.mode, q.phase, q.pending_command), ("external", "controlling", command))
+                self.assertEqual((q.stages, q.targets, q.setup, q.control_entities), ([], [], {}, {}))
+                self.assertEqual((q.current_index, q.completed, q.seen_job, q.next_pending), (0, 0, False, False))
+                self.assertEqual((q.error, q.command_failure, q.run_id), ("", {}, "native"))
+                after.observed_at = 2001
+                self.assertIsNone(q.observe(after, 2001))
+                self.assertEqual((q.phase, q.pending_command), ("idle", ""))
+                idle = state("docked", "charging", "off", observed_at=2100)
+                idle.record = queue_tests.record(begin=2000, end=2100)
+                self.assertIsNone(q.observe(idle, 2100))
+                self.assertEqual(q.completed, 0)
+
+    def test_external_recovery_rejects_unknown_stale_or_uncertain_native_state_without_mutation(self):
+        for case in ["deadline", "old_observation", "undated", "stale", "offline", "unknown", "busy_resume", "other_robot"]:
+            with self.subTest(case=case):
+                q = self.stopped()
+                current = state(observed_at=2000)
+                command, vacuum = "pause", "vacuum.robot"
+                if case == "deadline": q.not_before = 2001
+                elif case == "old_observation": current.observed_at = 999
+                elif case == "undated": current.observed_at = 0
+                elif case == "stale": current.observed_at = 1909
+                elif case == "offline": current.connected = False
+                elif case == "unknown": current.status, command = "unknown", "stop"
+                elif case == "busy_resume": command = "resume"
+                else: vacuum = "vacuum.other"
+                before = q.dump()
+                with self.assertRaises(ValueError):
+                    q.external_control(command, vacuum, current, 2000, "new")
+                self.assertEqual(q.dump(), before)
+
+    def test_stopped_history_does_not_prevent_stop_for_a_known_robot_fault(self):
+        q = self.stopped()
+        current = state("error", "error", "on", observed_at=2000)
+        current.error = "error"
+        self.assertEqual(q.external_control("stop", "vacuum.robot", current, 2000, "stop"), ("vacuum", "stop"))
+        self.assertEqual(q.stages, [])
+
+    def test_clear_is_always_queue_only_and_dismisses_error_without_dropping_barrier(self):
+        q = self.stopped()
+        self.assertIsNone(q.command("cancel", Snapshot(), 500))
+        self.assertEqual((q.phase, q.error, q.command_failure, q.decision), ("cancelled", "", {}, "sequence cleared"))
+        self.assertEqual(q.not_before, 1000)
+        self.assertIsNone(q.observe(state(), 501))
 
 
 class FinishEngineTests(unittest.TestCase):
@@ -352,6 +505,32 @@ class StandaloneManagerTests(unittest.IsolatedAsyncioTestCase):
                 await self.control("pause", "vacuum.other")
             self.assertEqual(self.manager.queue.dump(), before)
         self.assertEqual(self.calls, [])
+
+    async def test_old_attention_does_not_block_native_job_pause_or_resume_with_obsolete_settings(self):
+        for command, current in [("pause", state()), ("resume", state("paused", "paused"))]:
+            with self.subTest(command=command):
+                await self.asyncSetUp()
+                now = time.time()
+                current.observed_at = now
+                self.current = current
+                self.manager.queue = Queue(phase="attention", mode="manual", vacuum="vacuum.robot",
+                                           targets=["0_1"], stages=ONE_STAGE,
+                                           control_entities={"mode": "select.removed_setting"},
+                                           error="Old failure", command_at=now - 1000, not_before=now - 100)
+                await self.control(command)
+                self.assertEqual(self.calls[0][:2], ("vacuum", "pause" if command == "pause" else "start"))
+                self.assertEqual((self.manager.queue.mode, self.manager.queue.pending_command), ("external", command))
+                self.assertEqual((self.manager.queue.stages, self.manager.queue.control_entities), ([], {}))
+
+    async def test_attention_native_control_cannot_bypass_an_uncertain_start(self):
+        now = time.time()
+        self.manager.queue = Queue(phase="attention", mode="manual", vacuum="vacuum.robot", targets=["0_1"],
+                                   stages=ONE_STAGE, command_at=now - 10, not_before=now + 890, barrier_window=900)
+        before = self.manager.queue.dump()
+        with self.assertRaisesRegex(manual_tests.ServiceError, "uncertain"):
+            await self.control("pause")
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.manager.queue.dump(), before)
 
     async def test_terminal_plan_permissions_do_not_leak_into_new_controls(self):
         self.manager.queue = Queue(phase="completed", vacuum="vacuum.old", mode="manual", targets=["0_1"], stages=ONE_STAGE, control_entities={"mode": "select.old"})

@@ -28,7 +28,7 @@ class QueueSensor(SensorEntity):
         queue = self.manager.queue
         return {
             "control_version": 5,
-            "execution_version": 2,
+            "execution_version": 3,
             "floor_cleaning_complete": bool(queue.stages) and queue.completed == len(queue.stages),
             "start_uncertain": queue.start_uncertain,
             "command_failure": dict(queue.command_failure),

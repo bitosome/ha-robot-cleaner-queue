@@ -26,6 +26,7 @@ FINISH_SECONDS = 180
 # Docking can briefly report charging before dust emptying/mop care starts. Require
 # both elapsed ready time and a later native observation, never repeated cached ticks.
 READY_SETTLE_SECONDS = 15
+MAX_OBSERVATION_AGE = 90
 DOCK_FINISH_SECONDS = 1800
 # A dispatched routine can take minutes to become visible. Immediately after a
 # completed room the robot may still be washing or drying its mop, emptying dust or
@@ -198,10 +199,42 @@ class Queue:
             if sent_at + window > self.not_before:
                 self.not_before, self.barrier_window = sent_at + window, window
 
-    def _validate_start(self, snapshot: Snapshot, now: float, mode: str = "vacuum") -> None:
-        if self.phase in ACTIVE or self.phase == "attention" or self.pending_command:
-            raise ValueError("A queue is active or needs attention. Clear it before starting another sequence.")
+    def validate_recovery(self, snapshot: Snapshot, now: float, mode: str = "vacuum") -> None:
+        """Validate an explicit replacement of stopped history; never mutate or resume it.
+
+        A historical error is not an active job. Recovery still needs a recent native
+        observation after any uncertain command window, with no unfinished robot job.
+        Callers must validate the requested action before replacing or clearing history.
+        """
+        if self.phase in ACTIVE or self.pending_command:
+            raise ValueError("A queue or command is still active. Finish it before starting another action.")
         self._validate_command_barrier(snapshot, now)
+        self._validate_recovery_observation(snapshot, now)
+        if not snapshot.ready_for(mode):
+            raise ValueError("The robot must be available, idle or docked, and have no unfinished cleaning job.")
+
+    @staticmethod
+    def validate_fresh_observation(snapshot: Snapshot, now: float) -> None:
+        """Cached native state must be dated and recent before authorizing an action."""
+        if (snapshot.observed_at <= 0 or not 0 <= now - snapshot.observed_at <= MAX_OBSERVATION_AGE
+                or snapshot.status in {"unknown", "unavailable", "device_offline"}):
+            raise ValueError("Wait for a fresh robot update before starting a new action.")
+
+    def _validate_recovery_observation(self, snapshot: Snapshot, now: float) -> None:
+        self.validate_fresh_observation(snapshot, now)
+        if snapshot.observed_at < max(self.command_at, self.settings_sent_at):
+            raise ValueError("Wait for a fresh robot update after the previous command before starting a new action.")
+
+    def _validate_start(self, snapshot: Snapshot, now: float, mode: str = "vacuum") -> None:
+        if self.phase == "attention":
+            # The user explicitly requested a new plan. Safe stopped history must not
+            # require a separate clear action, and its stages are never resumed.
+            self.validate_recovery(snapshot, now, mode)
+            return
+        if self.phase in ACTIVE or self.pending_command:
+            raise ValueError("A queue or command is still active. Finish it before starting another sequence.")
+        self._validate_command_barrier(snapshot, now)
+        self.validate_fresh_observation(snapshot, now)
         if not snapshot.ready_for(mode):
             raise ValueError("The robot must be available, idle or docked, and have no unfinished cleaning job.")
 
@@ -287,9 +320,16 @@ class Queue:
             raise ValueError("Only pause, resume, stop and return to dock can control an existing job.")
         if not vacuum:
             raise ValueError("Choose the vacuum to control.")
-        if self.phase in ACTIVE or self.phase == "attention" or self.pending_command:
-            raise ValueError("A queue or command is active or needs attention. Resolve it before controlling another job.")
+        if self.phase in ACTIVE or self.pending_command:
+            raise ValueError("A queue or command is still active. Resolve it before controlling another job.")
+        if self.phase == "attention" and self.vacuum and self.vacuum != vacuum:
+            raise ValueError("The stopped sequence belongs to a different vacuum. Clear it before controlling another robot.")
         self._validate_command_barrier(snapshot, now)
+        if self.phase == "attention":
+            # This explicit control belongs to the currently observed native job,
+            # never the interrupted plan. Fresh telemetry and normal action rules
+            # must both permit it before the historical plan can be discarded.
+            self._validate_recovery_observation(snapshot, now)
         if not self.validate_control_state(command, snapshot):
             return None
         # A terminal sequence is historical, not a job to resume. Discard all
@@ -353,6 +393,8 @@ class Queue:
                      control_entities: dict[str, str], snapshot: Snapshot, now: float, run_id: str) -> tuple[str, str]:
         if not stages or len(stages) > 128:
             raise ValueError("The cleaning plan has no supported stages or exceeds 128 stages.")
+        if self.phase == "attention" and self.vacuum and self.vacuum != vacuum:
+            raise ValueError("The stopped sequence belongs to a different vacuum. Clear it before starting another robot.")
         # A plan that names a mopping mode is blocked by an empty tank as a whole; a
         # room plan without one is judged by the room it starts with.
         plan_mode = setup.get("mode") or stages[0].get("mode") or "vacuum"
@@ -363,6 +405,8 @@ class Queue:
         self.stages = [dict(stage) for stage in stages]
         self.control_entities = dict(control_entities)
         self.current_index = self.completed = 0
+        self.started_at = self.baseline_end = self.finish_wait_at = 0
+        self.seen_job = False
         self.error = ""
         self.not_before = self.barrier_window = self.dock_finish_at = 0
         return self._dispatch(snapshot, now)
@@ -383,6 +427,7 @@ class Queue:
     def _dispatch(self, snapshot: Snapshot, now: float) -> tuple[str, str]:
         """Every plan applies its stage settings first and then starts that room."""
         self.phase = "preparing"
+        self.decision = "applying settings for pass %d" % (self.current_index + 1)
         self.pending_command = "configure"
         self.command_at = now
         self.settings_sent_at = 0
@@ -422,6 +467,8 @@ class Queue:
             self.pending_command = ""
             self.next_pending = False
             self.error = ""
+            self.command_failure = {}
+            self.decision = "sequence cleared"
             return None  # Cancelling a queue never claims to stop the robot.
         if command == "return_to_dock":
             had_pending_command = bool(self.pending_command)

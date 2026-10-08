@@ -23,8 +23,8 @@ adapter = load("adapter")
 permissions = load("permissions")
 Queue, Snapshot = engine.Queue, engine.Snapshot
 
-def ready(record=None):
-    return Snapshot("docked", "charging", "off", "none", "ok", True, record)
+def ready(record=None, observed_at=100):
+    return Snapshot("docked", "charging", "off", "none", "ok", True, record, observed_at=observed_at)
 
 def cleaning(record=None):
     return Snapshot("cleaning", "segment_cleaning", "on", "none", "ok", True, record)
@@ -242,6 +242,20 @@ class QueueTests(unittest.TestCase):
             _, stages = self.plan()
             with self.assertRaises(ValueError):
                 Queue().start_manual("vacuum.robot", ["0_1"], {}, stages, {}, s, 100, "run")
+
+    def test_initial_start_requires_dated_recent_native_state_before_any_settings(self):
+        for observed_at in [0, 909, 1001, float("nan")]:
+            with self.subTest(observed_at=observed_at):
+                q = Queue()
+                before = q.dump()
+                rooms, stages = self.plan()
+                with self.assertRaisesRegex(ValueError, "fresh robot update"):
+                    q.start_manual("vacuum.robot", rooms, {}, stages, {}, ready(observed_at=observed_at), 1000, "new")
+                self.assertEqual(q.dump(), before)
+        q = Queue()
+        rooms, stages = self.plan()
+        self.assertEqual(q.start_manual("vacuum.robot", rooms, {}, stages, {}, ready(observed_at=910), 1000, "new"),
+                         ("configure", "0"))
 
     def test_concurrent_start_rejected_preserving_queue(self):
         q = self.acknowledged()
