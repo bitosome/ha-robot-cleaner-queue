@@ -27,12 +27,25 @@ from .manual import build_plan, build_room_plan, cached_settings, capabilities, 
 DOMAIN = "robot_cleaner_queue"
 _LOGGER = logging.getLogger(__name__)
 CONFIG_SCHEMA = vol.Schema({DOMAIN: vol.Schema({})}, extra=vol.ALLOW_EXTRA)
+# A plan is an ordered list of the robot's own rooms; the legacy form is a list of
+# Home Assistant area ids. Per-room settings are optional and fall back to `setup`.
+ROOM_SCHEMA = vol.Schema({
+    vol.Required("id"): str,
+    vol.Optional("mode"): vol.In(["vacuum", "mop", "vacuum_mop", "vacuum_then_mop"]),
+    vol.Optional("suction"): str,
+    vol.Optional("water"): str,
+    vol.Optional("route"): str,
+    vol.Optional("repeat"): vol.All(int, vol.In([1, 2])),
+})
+PLAN_ROOMS = vol.All(cv.ensure_list, [vol.Any(str, ROOM_SCHEMA)])
 SERVICE_SCHEMA = vol.Schema({
     vol.Required("command"): vol.In(["start_manual", "pause", "resume", "cancel", "return_to_dock", "stop", "toggle", "toggle_saved"]),
     vol.Optional("vacuum", default=""): str,
-    vol.Optional("rooms", default=[]): vol.All(cv.ensure_list, [str]),
-    vol.Optional("setup"): vol.Schema({
-        vol.Required("mode"): vol.In(["vacuum", "mop", "vacuum_mop", "vacuum_then_mop"]),
+    vol.Optional("rooms", default=[]): PLAN_ROOMS,
+    # Plan defaults; each room may override any of them, and a room plan without
+    # defaults is valid because every room can carry its own mode.
+    vol.Optional("setup", default={}): vol.Schema({
+        vol.Optional("mode"): vol.In(["vacuum", "mop", "vacuum_mop", "vacuum_then_mop"]),
         vol.Optional("suction"): str, vol.Optional("water"): str, vol.Optional("route"): str,
         vol.Optional("repeat", default=1): vol.All(int, vol.In([1, 2])),
     }),
@@ -54,7 +67,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         vol.Required("source"): vol.In(["rooms", "manual"]),
         # Accepted from the released card and ignored: routines are no longer a plan.
         vol.Optional("presets", default=[]): vol.All(cv.ensure_list, [cv.entity_id]),
-        vol.Optional("rooms", default=[]): vol.All(cv.ensure_list, [vol.Any(str, dict)]),
+        vol.Optional("rooms", default=[]): PLAN_ROOMS,
         vol.Optional("setup", default={}): dict,
     }))
     hass.services.async_register(DOMAIN, "get_capabilities", manager.get_capabilities,
@@ -228,7 +241,7 @@ class Manager:
         try:
             caps, controls, _, _ = self.manual_capabilities(call.data["vacuum"])
             await async_require_control(self.hass.auth, call.context.user_id, list(controls.values()), POLICY_CONTROL)
-            caps["control_version"] = 4
+            caps["control_version"] = 5
             caps["current_map"] = current_map(self.resolve(call.data["vacuum"])[2])[0]
             caps["saved_preset"] = await self.read_saved_preset(call.data["vacuum"], call.context.user_id)
             caps["device_entities"] = {}

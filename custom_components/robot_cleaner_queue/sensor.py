@@ -27,7 +27,7 @@ class QueueSensor(SensorEntity):
     def extra_state_attributes(self):
         queue = self.manager.queue
         return {
-            "control_version": 4,
+            "control_version": 5,
             "vacuum": queue.vacuum,
             "mode": queue.mode,
             "targets": list(queue.targets),

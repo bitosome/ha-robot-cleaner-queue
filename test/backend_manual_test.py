@@ -425,7 +425,7 @@ class ManagerTraceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await fresh.read_saved_preset("vacuum.robot", "user"), stored["vacuum.robot"])
         caps = await self.manager.get_capabilities(NS(context=FakeContext("user"), data={"vacuum":"vacuum.robot"}))
         self.assertEqual(caps["saved_preset"], stored["vacuum.robot"])
-        self.assertEqual(caps["control_version"], 4)
+        self.assertEqual(caps["control_version"], 5)
 
     async def test_startup_restores_preset_without_starting_cleaning(self):
         await self.save_manual()
