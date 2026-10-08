@@ -59,15 +59,16 @@ class Snapshot:
             and self.error == "none"
         )
 
-    def healthy_for(self, mode: str = "preset") -> bool:
+    def healthy_for(self, mode: str = "vacuum") -> bool:
+        """A water-empty dock blocks anything that mops and permits vacuum-only work."""
         return self.robot_healthy and (self.dock_error in {"ok", "none"} or
-                                      self.dock_error == "water_empty" and mode in {"vacuum", "preset"})
+                                      self.dock_error == "water_empty" and mode == "vacuum")
 
     @property
     def healthy(self) -> bool:
         return self.healthy_for()
 
-    def ready_for(self, mode: str = "preset") -> bool:
+    def ready_for(self, mode: str = "vacuum") -> bool:
         return self.healthy_for(mode) and self.vacuum in {"docked", "idle"} and self.status in READY_STATUS and self.job == "off"
 
     @property
@@ -79,8 +80,7 @@ class Snapshot:
 class Queue:
     phase: str = "idle"
     vacuum: str = ""
-    presets: list[str] = field(default_factory=list)
-    mode: str = "preset"
+    mode: str = ""
     targets: list[str] = field(default_factory=list)
     setup: dict[str, Any] = field(default_factory=dict)
     stages: list[dict[str, Any]] = field(default_factory=list)
@@ -127,7 +127,11 @@ class Queue:
 
     def ack_window(self) -> float:
         """How long a dispatched command may take to become observable."""
-        return START_SECONDS if self.pending_command in {"start", "resume"} else ACK_SECONDS
+        if self.pending_command in {"start", "resume"}:
+            return START_SECONDS
+        if self.pending_command == "configure":
+            return CONFIGURE_SECONDS
+        return ACK_SECONDS
 
     def ack_timeout_message(self) -> str:
         if self.pending_command in {"start", "resume"}:
@@ -136,7 +140,7 @@ class Queue:
         return "The robot did not acknowledge the command within 60 seconds. No retry was sent."
 
     def _preserve_command_barrier(self) -> None:
-        if self.pending_command in {"start", "pause", "resume", "return_to_dock", "stop", "device"}:
+        if self.pending_command in {"start", "configure", "pause", "resume", "return_to_dock", "stop", "device"}:
             # A cloud command may have been accepted before telemetry catches up.
             # Clearing the UI must not permit another start on that stale state, so the
             # barrier lasts as long as that command may still be acknowledged.
@@ -144,7 +148,7 @@ class Queue:
             if self.command_at + window > self.not_before:
                 self.not_before, self.barrier_window = self.command_at + window, window
 
-    def _validate_start(self, snapshot: Snapshot, now: float, mode: str = "preset") -> None:
+    def _validate_start(self, snapshot: Snapshot, now: float, mode: str = "vacuum") -> None:
         if self.phase in ACTIVE or self.phase == "attention" or self.pending_command:
             raise ValueError("A queue is active or needs attention. Clear it before starting another sequence.")
         self._validate_command_barrier(snapshot, now)
@@ -158,6 +162,7 @@ class Queue:
             raise ValueError("A previous command is still uncertain. Wait %s for a fresh robot update after its acknowledgement window, then check the robot." % wait)
 
     def should_finish(self, snapshot: Snapshot) -> bool:
+        """Whether a wall-switch toggle should end the current job instead of starting one."""
         return (self.phase in ACTIVE or bool(self.pending_command) or
                 snapshot.job == "on" or snapshot.vacuum in {"cleaning", "paused", "returning"} or
                 snapshot.status in START_STATUS - {"charger_disconnected"})
@@ -174,7 +179,7 @@ class Queue:
         self._preserve_command_barrier()
         self.mode, self.phase = "finish", "controlling"
         self.vacuum, self.run_id = vacuum, run_id
-        self.presets, self.targets, self.stages = [], [], []
+        self.targets, self.stages = [], []
         self.setup, self.control_entities = {}, {}
         self.current_index = self.completed = 0
         self.next_pending = self.seen_job = False
@@ -237,10 +242,10 @@ class Queue:
         if not self.validate_control_state(command, snapshot):
             return None
         # A terminal sequence is historical, not a job to resume. Discard all
-        # stage bookkeeping so no observation can advance its old presets.
+        # stage bookkeeping so no observation can advance its old stages.
         self.mode, self.phase = "external", "controlling"
         self.vacuum, self.run_id = vacuum, run_id
-        self.presets, self.targets, self.stages = [], [], []
+        self.targets, self.stages = [], []
         self.setup, self.control_entities = {}, {}
         self.current_index = self.completed = 0
         self.started_at = self.baseline_end = self.finish_wait_at = 0
@@ -257,7 +262,7 @@ class Queue:
             if not snapshot.connected or snapshot.vacuum in {"unknown", "unavailable"} or snapshot.job not in {"on", "off"}:
                 raise ValueError("The robot must be available before stopping.")
             return snapshot.job == "on" or snapshot.vacuum in {"cleaning", "paused", "returning"}
-        allowed = snapshot.healthy_for(snapshot.settings.get("mode", "preset")) if command == "resume" else snapshot.robot_healthy
+        allowed = snapshot.healthy_for(snapshot.settings.get("mode", "vacuum")) if command == "resume" else snapshot.robot_healthy
         if not allowed:
             raise ValueError("The robot is unavailable or has a fault that prevents this action.")
         if command == "pause" and snapshot.status not in CLEANING_STATUS | {"returning_home", "docking"}:
@@ -275,7 +280,7 @@ class Queue:
         if not self.pending_command:
             return
         if (not snapshot.connected or snapshot.vacuum in {"unknown", "unavailable"} or
-                self.pending_command == "resume" and not snapshot.healthy_for(snapshot.settings.get("mode", "preset"))):
+                self.pending_command == "resume" and not snapshot.healthy_for(snapshot.settings.get("mode", "vacuum"))):
             self.attention("The robot has a fault, or telemetry is unavailable. Check the robot before another command.")
             return
         confirmed = snapshot.observed_at >= self.command_at and (
@@ -290,25 +295,16 @@ class Queue:
         elif now - self.command_at >= ACK_SECONDS:
             self.attention("The robot did not acknowledge the command within 60 seconds. No retry was sent.")
 
-    def start(self, vacuum: str, presets: list[str], snapshot: Snapshot, now: float, run_id: str) -> tuple[str, str]:
-        self._validate_start(snapshot, now)
-        if not 1 <= len(presets) <= 32 or len(set(presets)) != len(presets):
-            raise ValueError("Select 1–32 distinct room presets.")
-        self.mode = "preset"
-        self.targets, self.stages, self.setup, self.control_entities = [], [], {}, {}
-        self.vacuum, self.presets, self.run_id = vacuum, list(presets), run_id
-        self.current_index = self.completed = 0
-        self.error = ""
-        self.not_before = self.barrier_window = 0
-        return self._dispatch(snapshot, now)
-
     def start_manual(self, vacuum: str, targets: list[str], setup: dict, stages: list[dict],
                      control_entities: dict[str, str], snapshot: Snapshot, now: float, run_id: str) -> tuple[str, str]:
-        self._validate_start(snapshot, now, setup.get("mode", "preset"))
         if not stages or len(stages) > 128:
-            raise ValueError("The manual cleaning plan has no supported stages or exceeds 128 stages.")
+            raise ValueError("The cleaning plan has no supported stages or exceeds 128 stages.")
+        # A plan that names a mopping mode is blocked by an empty tank as a whole; a
+        # room plan without one is judged by the room it starts with.
+        plan_mode = setup.get("mode") or stages[0].get("mode") or "vacuum"
+        self._validate_start(snapshot, now, plan_mode)
         self.mode = "manual"
-        self.vacuum, self.presets, self.run_id = vacuum, [], run_id
+        self.vacuum, self.run_id = vacuum, run_id
         self.targets, self.setup = list(targets), dict(setup)
         self.stages = [dict(stage) for stage in stages]
         self.control_entities = dict(control_entities)
@@ -321,7 +317,7 @@ class Queue:
     def cleaning_mode(self) -> str:
         """The mode of the job being dispatched, not the plan's first setting."""
         if self.mode != "manual":
-            return "preset"
+            return "vacuum"
         return self.stage.get("mode") or self.setup.get("mode") or "vacuum"
 
     @property
@@ -329,13 +325,12 @@ class Queue:
         return self.stages[self.current_index] if self.mode == "manual" and self.current_index < len(self.stages) else {}
 
     def _dispatch(self, snapshot: Snapshot, now: float) -> tuple[str, str]:
-        if self.mode == "manual":
-            self.phase = "preparing"
-            self.pending_command = "configure"
-            self.command_at = now
-            self.next_pending = False
-            return "configure", str(self.current_index)
-        return self._start_job(snapshot, now)
+        """Every plan applies its stage settings first and then starts that room."""
+        self.phase = "preparing"
+        self.pending_command = "configure"
+        self.command_at = now
+        self.next_pending = False
+        return "configure", str(self.current_index)
 
     def _start_job(self, snapshot: Snapshot, now: float) -> tuple[str, str]:
         self.decision = "dispatching room %d" % (self.current_index + 1)
@@ -346,7 +341,7 @@ class Queue:
         self.seen_job = False
         self.finish_wait_at = 0
         self.next_pending = False
-        return ("manual", str(self.current_index)) if self.mode == "manual" else ("preset", self.presets[self.current_index])
+        return "manual", str(self.current_index)
 
     def command(self, command: str, snapshot: Snapshot, now: float) -> tuple[str, str] | None:
         if command == "stop":
@@ -510,8 +505,8 @@ class Queue:
             self.decision = "cleaning (job active, status=%s)" % snapshot.status
             return None  # Includes low-battery breaks and mop washing.
         if not self.seen_job:
-            # A routine can acknowledge by washing its mops before in_cleaning
-            # turns on. Preparation is not completion, and never advances rooms.
+            # A job can acknowledge by washing its mops before in_cleaning turns on.
+            # Preparation is not completion, and never advances rooms.
             if snapshot.status in START_STATUS and now - self.started_at < PREPARE_SECONDS:
                 self.decision = "waiting for the job to start (status=%s, %ds of %ds)" % (
                     snapshot.status, int(now - self.started_at), int(PREPARE_SECONDS))
@@ -538,7 +533,7 @@ class Queue:
             self.attention("The cleaning job was interrupted, failed, or did not report successful completion. No next room was started.")
             return None
         self.completed += 1
-        if self.completed == (len(self.stages) if self.mode == "manual" else len(self.presets)):
+        if self.completed == len(self.stages):
             self.phase = "completed"
             return None
         self.current_index += 1

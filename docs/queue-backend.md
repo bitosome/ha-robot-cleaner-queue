@@ -1,8 +1,8 @@
 # Home Assistant queue companion
 
-The card selects an ordered list of existing Roborock **routine buttons**, or a [manual cleaning plan](manual-cleaning.md) using native Home Assistant areas and robot settings. This companion executes it in Home Assistant, so closing the dashboard or locking the phone does not stop the sequence. Native Roborock area cleaning does not promise room order; submitting several areas in one command cannot implement an elevator-style queue.
+The card selects an ordered list of the **robot's own rooms** (the rooms named in the Roborock app, addressed by segment), each with its own cleaning mode and settings. This companion executes the plan in Home Assistant, so closing the dashboard or locking the phone does not stop the sequence. Roborock app **routines are not used**: they cannot be introspected, cannot carry per-room settings, and a routine that internally ends one job and starts another cannot be chained safely. Cleaning rooms in a chosen order needs one job per room, which no single native command provides.
 
-This first version supports **one robot and one queue per Home Assistant instance**, using the native Roborock V1 integration. Other robot platforms and Roborock protocols are not implicitly supported. Room routines must each represent the room named on its tile. A routine may contain multiple internal steps; its final cleaning record must represent the entire routine before this companion can safely chain it. Set up and verify one-room routines in the Roborock app. Their suction, mopping and repetition settings remain owned by that app.
+This version supports **one robot and one queue per Home Assistant instance**, using the native Roborock V1 integration. Other robot platforms and Roborock protocols are not implicitly supported. Rooms are read from the robot's current map, so a room can be cleaned on its own or together with a group, and the app keeps owning the map itself. Each room's job must produce its own cleaning record before the next room starts.
 
 ## Installation
 
@@ -23,7 +23,7 @@ Add `https://github.com/bitosome/ha-robot-cleaner-queue` as a **Custom repositor
 
    Merge with existing configuration; do not replace another `homeassistant:` or `packages:` section.
 3. Check HA configuration, then restart Home Assistant. Installation and restart do not send a robot command.
-4. Confirm `sensor.robot_cleaner_queue`, `script.robot_cleaner_queue_control` and the `robot_cleaner_queue.control` action exist. Configure the card's `queue_entity` and room preset buttons.
+4. Confirm `sensor.robot_cleaner_queue`, `script.robot_cleaner_queue_control` and the `robot_cleaner_queue.control` action exist. Configure the card's `queue_entity`.
 
 The card is a separate HACS repository and does not install these Python files; add this repository as an integration as above. No Roborock credentials, tokens, new cloud client, extra polling, or native integration modification is required.
 
@@ -34,12 +34,18 @@ Prefer calling the fast custom action directly, so validation errors can be show
 ```yaml
 action: robot_cleaner_queue.control
 data:
-  command: start
+  command: start_manual
   vacuum: vacuum.robot
-  presets:
-    - button.robot_kitchen
-    - button.robot_office
-    - button.robot_bedroom
+  rooms:
+    - id: "0_12"          # a room id from get_capabilities.robot_rooms
+      mode: vacuum_mop
+      suction: max
+      water: high
+      route: standard
+    - id: "0_13"
+      mode: mop
+      water: low
+      route: deep
 ```
 
 The optional `script.robot_cleaner_queue_control` wrapper accepts the same fields. Calling it through `script.turn_on` does not propagate validation exceptions to its caller; direct `robot_cleaner_queue.control` is preferred. The service waits for the initial HA command dispatch, then returns. A successful service return does not mean the robot started: `pending_command` remains until physical telemetry acknowledges it.
@@ -53,11 +59,11 @@ Other commands:
 | `cancel` | Clear the remaining queue only. The current robot operation continues. |
 | `return_to_dock` | Clear the remaining queue first, then request docking when the robot's state permits it. Mop servicing and uncertain states are not interrupted. |
 
-The card contract is `control_version: 4`. Version 0.2.2 can pause/resume/dock an app-started job with an explicit vacuum. It stores `mode: external` without presets or stages; acknowledgement returns it to idle and cannot advance an old plan. Resume requires a paused, unfinished job. Active, attention and uncertain commands cannot be bypassed by controlling a different robot.
+The card contract is `control_version: 4`. Version 0.2.2 can pause/resume/dock an app-started job with an explicit vacuum. It stores `mode: external` without targets or stages; acknowledgement returns it to idle and cannot advance an old plan. Resume requires a paused, unfinished job. Active, attention and uncertain commands cannot be bypassed by controlling a different robot.
 
-For non-start commands, pass the same `vacuum` to protect against a card configured for another robot. An `attention` queue must be cleared with `cancel` before a new queue can start. Clearing an unacknowledged start/resume preserves a safety barrier: another start requires that command's acknowledgement window to expire (15 minutes for a start or resume, 60 seconds for a control command) and a new native poll after that window confirming idle/job-off. The barrier lasts as long as the start it guards, because a late routine can still arrive. It is released as soon as the robot is observed confirming that command, so a stop the robot has already acknowledged never delays docking. Cancelling cannot reuse a stale docked state to send duplicate routines. Only an idle/docked robot with no unfinished job can start a new sequence. Starts cannot replace an existing queue or unfinished job.
+For non-start commands, pass the same `vacuum` to protect against a card configured for another robot. An `attention` queue must be cleared with `cancel` before a new queue can start. Clearing an unacknowledged command preserves a safety barrier: another start requires that command's window to expire — fifteen minutes for a start or resume, ten minutes while settings are being applied, sixty seconds for a control command — and a new native poll after that window confirming idle/job-off. The barrier is released as soon as the robot is observed confirming that command, so a stop the robot has already acknowledged never delays docking. Cancelling cannot reuse a stale docked state to send a duplicate job. Only an idle/docked robot with no unfinished job can start a new sequence. Starts cannot replace an existing queue or unfinished job.
 
-The service accepts 1–32 distinct preset entity IDs. It verifies that each is an enabled, available native Roborock **routine** button on the selected vacuum's device and config entry. It rejects maintenance-reset buttons and arbitrary entities. An `unknown` routine button state is valid before its first press.
+`start_manual` accepts either a list of room requests (`{"id": "0_12", "mode": ..., "suction": ..., "water": ..., "route": ..., "repeat": ...}`) or the legacy list of Home Assistant area IDs (`["kitchen"]`). Room ids come from `get_capabilities.robot_rooms` and must exist on the robot's current map. Each room's settings fall back to the request's `setup` defaults, and a plan may hold 1–32 rooms and at most 128 stages. Rooms cannot repeat. Area-shaped requests keep working for plans saved before rooms existed.
 
 The optional `cleaning_entity`, `status_entity`, `error_entity` and `last_clean_end_entity` service fields are accepted for frontend configuration compatibility. Safety decisions use the matching native Roborock coordinator's coherent cached state, rather than trusting caller-supplied sensor mappings.
 
@@ -67,33 +73,33 @@ The optional `cleaning_entity`, `status_entity`, `error_entity` and `last_clean_
 - `controlling`: a pause/resume/dock command for an externally started job is awaiting fresh acknowledgement; new commands and starts are blocked.
 - `preparing`: manual settings are being applied and awaiting fresh native readback.
 - `starting`: a start/resume command is awaiting observed acknowledgement.
-- `running`: the acknowledged routine is active or waiting to return to the dock before the next room.
+- `running`: the acknowledged room job is active or waiting to return to the dock before the next room.
 - `paused`: the queue is paused; check `pending_command` for pause acknowledgement.
-- `completed`: every selected routine reported successful completion.
+- `completed`: every stage of the plan reported successful completion.
 - `cancelled`: remaining rooms were cleared; the robot may still be active.
 - `attention`: execution stopped because a fault, restart, conflict or uncertain result requires review.
 
-Manual queues also expose `mode: manual`, ordered `targets` (HA area IDs), `setup` (chosen settings), and `stages` (target, cleaning mode, zero-based room/pass/repeat indices). `current_index` and `completed` count stages, while `room_index + 1` preserves the displayed area sequence. Empty targets represent whole-home cleaning. Preset queues expose `mode: preset`.
+Every plan exposes `mode: manual`, ordered `targets` (room ids, or Home Assistant area ids for a legacy plan), `address` (`room` when the robot's own segments are cleaned, `area` when a Home Assistant area is), `setup`, and `stages` (target, cleaning mode, frozen settings, zero-based room/pass/repeat indices). `current_index` and `completed` count stages, while `room_index + 1` preserves the displayed room sequence. A room plan stores its per-room settings under `setup.rooms`. Empty targets represent whole-home cleaning.
 
-Attributes: `vacuum`, ordered `presets`, zero-based `current_index`, `completed` count, `pending_command`, `error`, `run_id`, and `waiting_for_dock`, and `command_barrier_until` (UTC epoch seconds or null). The tile order shown to a person is `index + 1`. `completed` reports successful routine records; robot location alone never proves room coverage.
+Attributes: `vacuum`, `mode`, `address`, ordered `targets`, `setup`, `stages`, zero-based `current_index`, `completed` count, `pending_command`, `decision`, `error`, `run_id`, `waiting_for_dock`, `control_version` and `command_barrier_until` (UTC epoch seconds or null). The tile order shown to a person is `index + 1`. `completed` reports successful cleaning records; robot location alone never proves room coverage.
 
 ## Completion and interruption rules
 
 A normal room transition requires all of these:
 
-1. A preset was sent once and the robot acknowledged a preparing, washing or cleaning state within 15 minutes. A routine pressed immediately after a finished room can take minutes to appear: the robot still has to wash or dry its mop, empty dust or top up its battery, and it ignores a routine until that servicing ends. Production traces show a routine first observed 677 seconds after the press, so the shorter window abandoned a sequence that was in fact proceeding. The command is never re-sent while this window runs. An active job must subsequently be observed; initial mop preparation can take up to a further ten minutes without being mistaken for completion.
+1. A room was dispatched once and the robot acknowledged a preparing, washing or cleaning state within 15 minutes. A job dispatched immediately after a finished room can take minutes to appear: the robot still has to wash or dry its mop, empty dust or top up its battery, and it ignores a new job until that servicing ends. Production traces show a job first observed 677 seconds after the dispatch, so the shorter window abandoned a sequence that was in fact proceeding. The command is never re-sent while this window runs. An active job must subsequently be observed; initial mop preparation can take up to a further ten minutes without being mistaken for completion.
 2. The job-active flag is now off. Pauses, mop washing and low-battery charging breaks remain part of the same job while that flag is on.
 3. The native cached cleaning record is newer than the pre-command record and began no earlier than three seconds before the command (to allow whole-second timestamps).
 4. Every confirmation needs telemetry newer than the command that asked for it, so a state the robot already had cannot stand in for the command landing. A zero observation time means the adapter could not date the reading, and connectivity is checked separately in that case. The record explicitly says `complete == 1`, `error == 0`, and its finish reason is successful when present. Missing/unknown completion fields, a manual interruption, an unreachable area or a washing failure stop the queue.
-5. Before another preset is dispatched, the robot is healthy and idle/docked rather than returning, washing, emptying or charging for an unfinished job.
+5. Before another room is dispatched, the robot is healthy and idle/docked rather than returning, washing, emptying or charging for an unfinished job.
 
 The companion waits up to three minutes after job-off for the corresponding completion record. It never infers completion from the current-room sensor, a stale percentage, a generic docked state, or `last_clean_end` alone. The native end timestamp is also updated for unsuccessful records.
 
-The initiating Home Assistant user's control permission is checked on the vacuum and every selected preset before the queue changes. The caller's user ID is retained in HA's private queue storage and propagated to native commands. Permissions are fetched again before each later dispatch, so deleting/deactivating a user or revoking entity access stops progression. This does not grant additional access; automations without a user context retain normal HA system behavior.
+The initiating Home Assistant user's control permission is checked on the vacuum and its setting entities before the queue changes. The caller's user ID is retained in HA's private queue storage and propagated to native commands. Permissions are fetched again before each later dispatch, so deleting/deactivating a user or revoking entity access stops progression. This does not grant additional access; automations without a user context retain normal HA system behavior.
 
-No automatic retries are sent. Faults and lost telemetry stop progression for review. HA commands from other controls stop this queue to avoid competing writers. App/device interruption is caught by the cleaning record's completion/finish reason; changes that produce indistinguishable successful records cannot be attributed to a particular caller. A single-room routine that internally ends and starts another independent job is unsuitable for automatic chaining and must be simplified in the app.
+No automatic retries are sent. Faults and lost telemetry stop progression for review. HA commands from other controls stop this queue to avoid competing writers, and so does a Roborock app routine or schedule that starts its own job. App/device interruption is caught by the cleaning record's completion/finish reason; changes that produce indistinguishable successful records cannot be attributed to a particular caller.
 
-Pause and return-to-dock also require observed acknowledgement within 60 seconds; a start or resume gets the 15-minute window described above. Queued presets and position are persisted in HA's storage before dispatch. An HA restart or shutdown preserves the sequence for inspection and changes it to `attention`; it never resumes cleaning automatically. Clear and reselect the desired remaining rooms after checking the robot. Cancelling or docking clears progression before sending another robot action.
+Pause and return-to-dock also require observed acknowledgement within 60 seconds; a start or resume gets the 15-minute window and settings get the ten-minute window described above. Queued rooms and position are persisted in HA's storage before dispatch. An HA restart or shutdown preserves the sequence for inspection and changes it to `attention`; it never resumes cleaning automatically. Clear and reselect the desired remaining rooms after checking the robot. Cancelling or docking clears progression before sending another robot action.
 
 ## Compatibility and validation
 
@@ -109,13 +115,13 @@ python3 -B test/backend_manual_test.py
 python3 -B test/backend_controls_test.py
 ```
 
-These test ordered success, low-battery/wash breaks, interrupted records, faults, missing acknowledgements, stale records, pause/resume, cancellation, return-to-dock, concurrent starts, restart behavior and routine validation. They do not prove physical operation or native HA runtime compatibility.
+These test ordered success with per-room settings, low-battery/wash breaks, interrupted records, faults, missing acknowledgements, stale records, pause/resume, cancellation, return-to-dock, concurrent starts, restart behavior and room plan validation. They do not prove physical operation or native HA runtime compatibility.
 
 To remove the companion, first clear its queue, remove the package include and custom component, then restart HA. Card resources and the native Roborock integration are independent. Removing this queue does not issue a robot command.
 
 ### Mode-specific dock faults and auxiliary controls
 
-v0.3.0 retains the native dock fault identity. Roborock V1 `water_empty` (code 38, python-roborock 7.4.2) permits an explicit manual vacuum-only plan. Since v0.4.0 it also permits launching native app presets; Roborock decides whether their mop operations can proceed. The exception is checked at acceptance, every settings write, final start dispatch, observation and each subsequent stage. Explicit manual mopping plans remain blocked. Preset settings are never rewritten to vacuum-only. Other dock faults and missing robot telemetry fail closed.
+v0.3.0 retains the native dock fault identity. Roborock V1 `water_empty` (code 38, python-roborock 7.4.2) permits vacuum-only work: a plan that names a mopping mode is refused, and a room plan is judged by the room it starts with. Every later stage is re-checked, so a mopping room waits for water instead of starting. The exception is checked at acceptance, every settings write, final dispatch, observation and each subsequent stage. Settings are never rewritten to vacuum-only. Other dock faults and missing robot telemetry fail closed.
 
 `control: stop` differs from `cancel`: it cancels future stages and sends `vacuum.stop`, awaiting fresh idle/docked telemetry with `in_cleaning == 0`. It does not replace a command already awaiting acknowledgement, and `finish`/`toggle` refuse while a dock or settings reservation is still being confirmed instead of discarding its readback. Pause/Home do not require a healthy water tank; Resume still checks the cleaning mode.
 
@@ -139,10 +145,14 @@ data:
 response_variable: diagnostics
 ```
 
-The response contains the persisted `queue`, the `robot` observation, the saved preset keys, and up to 100 `events` with time, kind, detail, phase, decision, pending command, room index and completed count — enough to reconstruct what a stopped sequence was waiting for without reading the log.
+The response contains the persisted `queue`, the `robot` observation, the saved plan keys, and up to 100 `events` with time, kind, detail, phase, decision, pending command, room index and completed count — enough to reconstruct what a stopped sequence was waiting for without reading the log.
 
 A dock that is servicing hides the native setting entities for a while. That is not a plan change: a manual stage waits for them (logging the deferral) instead of stopping, and the settings readback window is 10 minutes because writing settings is not motion. A sequence that does stop keeps the real cause in the log while the sensor stays sanitised.
 
-## Persisted preset — v0.4.0
+## Persisted plan — v0.4.0, rooms since v0.7.0
 
-`save_preset` stores one validated plan per vacuum in the separate version-1 HA store `robot_cleaner_queue_presets`. Writes share the controller lock, and the new plan is published to memory only after durable save. Saving requires control permissions and never writes robot settings. `get_capabilities` exposes the authorized saved plan, current map and control_version 4. `toggle_saved` chooses finish/start atomically; only its idle branch reads the saved plan, then normal start validation and dispatch permissions apply. Manual plans retain map identity and are revalidated against current area mappings/settings. A supplied routine list is used only if no saved plan exists. Storage survives queue clearing and restarts without triggering a run.
+`save_preset` stores one validated plan per vacuum in the separate version-1 HA store `robot_cleaner_queue_presets`. Writes share the controller lock, and the new plan is published to memory only after durable save. Saving requires control permissions and never writes robot settings. `get_capabilities` exposes the authorized saved plan, current map and control_version 4.
+
+A plan is `{"source": "rooms", "rooms": [...], "setup": {...}, "map_id": <flag>}`. The stored `rooms` are exactly what `start_manual` accepts: room requests, or Home Assistant area ids for a plan saved before rooms existed. `source: "manual"` is accepted as a legacy alias. The legacy `presets` field is ignored.
+
+`toggle` and `toggle_saved` are the wall-switch entry points and behave identically: while a job is active or uncertain they cancel and dock instead, and when idle they start the saved plan for that vacuum, failing with a validation error when no plan is saved. Plans retain map identity and are revalidated against the current map and robot rooms before running. Storage survives queue clearing and restarts without triggering a run.

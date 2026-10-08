@@ -18,6 +18,15 @@ def state(vacuum="cleaning", status="segment_cleaning", job="on", observed_at=10
     return Snapshot(vacuum, status, job, "none", "ok", True, observed_at=observed_at)
 
 
+def stage(target, index=0, mode="vacuum"):
+    return {"target": target, "mode": mode, "room_index": index, "pass_index": 0, "repeat_index": 0,
+            "settings": {"mode": mode}, "map_id": 0, "segments": [str(index + 1)]}
+
+
+ONE_STAGE = [stage("0_1")]
+TWO_STAGES = [stage("0_1", 0), stage("0_2", 1)]
+
+
 class StandaloneEngineTests(unittest.TestCase):
     def test_each_action_requires_fresh_confirmation_then_becomes_idle(self):
         cases = [
@@ -37,20 +46,20 @@ class StandaloneEngineTests(unittest.TestCase):
                 queue.observe(after, 102)
                 self.assertEqual((queue.phase, queue.pending_command, queue.completed), ("idle", "", 0))
 
-    def test_terminal_manual_or_preset_history_never_adopted_or_advanced(self):
-        for mode in ["preset", "manual"]:
-            queue = Queue(mode=mode, phase="cancelled", vacuum="vacuum.robot", presets=["button.kitchen", "button.office"],
-                          targets=["kitchen"], stages=[{"target": "kitchen"}], setup={"mode": "mop"},
-                          control_entities={"mode": "select.mode"}, completed=1, current_index=1, seen_job=True, next_pending=True)
-            queue.external_control("resume", "vacuum.robot", state("paused", "paused"), 100, "request")
-            self.assertEqual((queue.presets, queue.targets, queue.stages, queue.setup, queue.control_entities), ([], [], [], {}, {}))
-            self.assertEqual((queue.current_index, queue.completed, queue.seen_job, queue.next_pending), (0, 0, False, False))
-            queue.observe(state(observed_at=101), 101)
+    def test_terminal_manual_history_never_adopted_or_advanced(self):
+        queue = Queue(mode="manual", phase="cancelled", vacuum="vacuum.robot",
+                      targets=["kitchen"], stages=[{"target": "kitchen"}], setup={"mode": "mop"},
+                      control_entities={"mode": "select.mode"}, completed=1, current_index=1, seen_job=True, next_pending=True)
+        queue.external_control("resume", "vacuum.robot", state("paused", "paused"), 100, "request")
+        self.assertEqual((queue.targets, queue.stages, queue.setup, queue.control_entities), ([], [], {}, {}))
+        self.assertEqual((queue.current_index, queue.completed, queue.seen_job, queue.next_pending), (0, 0, False, False))
+        queue.observe(state(observed_at=101), 101)
+        if True:
             done = state("docked", "charging", "off", observed_at=200)
             done.record = queue_tests.record()
             for now in [200, 300, 500]:
                 self.assertIsNone(queue.observe(done, now))
-            self.assertEqual((queue.phase, queue.completed, queue.presets), ("idle", 0, []))
+            self.assertEqual((queue.phase, queue.completed), ("idle", 0))
 
     def test_active_attention_and_pending_plans_reject_without_mutation(self):
         for queue in [Queue(phase="running"), Queue(phase="attention"), Queue(phase="idle", pending_command="pause"), Queue(phase="controlling", mode="external")]:
@@ -98,7 +107,7 @@ class StandaloneEngineTests(unittest.TestCase):
 
     def test_stale_telemetry_cannot_confirm_a_command(self):
         """A snapshot older than the command cannot stand in for it landing."""
-        queue = Queue(phase="running", vacuum="vacuum.robot", presets=["button.kitchen"], started_at=100)
+        queue = Queue(phase="running", vacuum="vacuum.robot", mode="manual", targets=["0_1"], stages=ONE_STAGE, started_at=100)
         self.assertEqual(queue.command("pause", state(), 200), ("vacuum", "pause"))
         # The robot already looked paused at 190, before the command was sent at 200.
         self.assertIsNone(queue.observe(state("paused", "paused", "on", observed_at=190), 201))
@@ -111,8 +120,8 @@ class StandaloneEngineTests(unittest.TestCase):
         queue.command("cancel", Snapshot(), 110)
         self.assertEqual(queue.not_before, 1000)
         with self.assertRaises(ValueError) as caught:
-            queue.start("vacuum.robot", ["button.bedroom"],
-                        Snapshot("docked", "charging", "off", "none", "ok", True, observed_at=200), 200, "new")
+            queue.start_manual("vacuum.robot", ["0_1"], {}, ONE_STAGE, {},
+                               Snapshot("docked", "charging", "off", "none", "ok", True, observed_at=200), 200, "new")
         self.assertIn("15 minutes", str(caught.exception))
 
     def test_finishing_refuses_to_discard_a_device_reservation(self):
@@ -125,7 +134,7 @@ class StandaloneEngineTests(unittest.TestCase):
 
     def test_confirmed_command_releases_its_barrier(self):
         """A stop the robot has confirmed must not lock docking behind a window."""
-        queue = Queue(phase="running", vacuum="vacuum.robot", presets=["button.kitchen"], started_at=100)
+        queue = Queue(phase="running", vacuum="vacuum.robot", mode="manual", targets=["0_1"], stages=ONE_STAGE, started_at=100)
         self.assertEqual(queue.command("stop", state(), 100), ("vacuum", "stop"))
         # The robot reports the stop: idle with no active job.
         queue.observe(state("idle", "idle", "off", observed_at=104), 104)
@@ -135,7 +144,7 @@ class StandaloneEngineTests(unittest.TestCase):
                          ("vacuum", "return_to_base"))
 
     def test_unconfirmed_command_still_keeps_its_barrier(self):
-        queue = Queue(phase="running", vacuum="vacuum.robot", presets=["button.kitchen"], started_at=100)
+        queue = Queue(phase="running", vacuum="vacuum.robot", mode="manual", targets=["0_1"], stages=ONE_STAGE, started_at=100)
         queue.command("stop", state(), 100)
         queue.observe(state("cleaning", "segment_cleaning", "on", observed_at=101), 101)
         self.assertEqual(queue.pending_command, "stop")
@@ -149,13 +158,13 @@ class StandaloneEngineTests(unittest.TestCase):
         queue.command("cancel", Snapshot(), 110)
         idle = state("docked", "charging", "off", observed_at=110)
         with self.assertRaises(ValueError):
-            queue.start("vacuum.other", ["button.other"], idle, 120, "new")
+            queue.start_manual("vacuum.other", ["0_1"], {}, ONE_STAGE, {}, idle, 120, "new")
         idle.observed_at = 1005
-        self.assertEqual(queue.start("vacuum.robot", ["button.kitchen"], idle, 1005, "new"), ("preset", "button.kitchen"))
+        self.assertEqual(queue.start_manual("vacuum.robot", ["0_1"], {}, ONE_STAGE, {}, idle, 1005, "new"), ("configure", "0"))
 
 
     def test_owned_dock_cancels_future_stages_but_respects_existing_barrier(self):
-        queue = Queue(phase="attention", vacuum="vacuum.robot", presets=["button.kitchen", "button.office"], not_before=160)
+        queue = Queue(phase="attention", vacuum="vacuum.robot", mode="manual", targets=["0_1", "0_2"], stages=TWO_STAGES, not_before=160)
         paused = state("paused", "paused", observed_at=110)
         for now in [120, 165]:
             self.assertIsNone(queue.command("return_to_dock", paused, now))
@@ -166,7 +175,7 @@ class StandaloneEngineTests(unittest.TestCase):
 
     def test_owned_pending_commands_cannot_be_replaced_with_dock(self):
         for pending in ["start", "pause", "resume", "return_to_dock"]:
-            queue = Queue(phase="running", vacuum="vacuum.robot", presets=["button.kitchen", "button.office"],
+            queue = Queue(phase="running", vacuum="vacuum.robot", mode="manual", targets=["0_1", "0_2"], stages=TWO_STAGES,
                           pending_command=pending, command_at=100, next_pending=True)
             self.assertIsNone(queue.command("return_to_dock", state(observed_at=110), 110))
             barrier = 1000 if pending in {"start", "resume"} else 160
@@ -175,23 +184,23 @@ class StandaloneEngineTests(unittest.TestCase):
             self.assertIsNone(queue.observe(state(observed_at=170), 170))
 
     def test_owned_resume_requires_unfinished_job_but_preserves_queued_next_stage(self):
-        queue = Queue(phase="paused", vacuum="vacuum.robot", presets=["button.kitchen", "button.office"], started_at=100)
+        queue = Queue(phase="paused", vacuum="vacuum.robot", mode="manual", targets=["0_1", "0_2"], stages=TWO_STAGES, started_at=100)
         before = queue.dump()
         with self.assertRaisesRegex(ValueError, "unfinished"):
             queue.command("resume", state("paused", "paused", "off"), 150)
         self.assertEqual(queue.dump(), before)
         queue.next_pending = True
         queue.current_index = queue.completed = 1
-        self.assertEqual(queue.command("resume", state("docked", "charging", "off"), 150), ("preset", "button.office"))
+        self.assertEqual(queue.command("resume", state("docked", "charging", "off"), 150), ("configure", "1"))
 
 
 class FinishEngineTests(unittest.TestCase):
     def test_finish_clears_every_stage_and_docks_once_despite_water_fault(self):
-        q = Queue(phase="running", presets=["button.one", "button.two"], next_pending=True)
+        q = Queue(phase="running", mode="manual", targets=["0_1", "0_2"], stages=TWO_STAGES, next_pending=True)
         current = state(); current.dock_error = "water_empty"
         self.assertTrue(q.should_finish(current))
         self.assertEqual(q.finish("vacuum.robot", current, 100, "finish"), ("vacuum", "return_to_base"))
-        self.assertEqual((q.presets, q.stages, q.next_pending), ([], [], False))
+        self.assertEqual((q.stages, q.next_pending), ([], False))
         self.assertIsNone(q.finish("vacuum.robot", current, 101, "repeat"))
         q.observe(state("returning", "returning_home", observed_at=102), 102)
         q.observe(state("docked", "washing_the_mop", "off", 103), 103)
@@ -302,10 +311,9 @@ class StandaloneManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.calls, [])
         self.assertEqual(self.manager.queue.phase, "attention")
 
-    async def test_toggle_idle_requires_valid_preset_but_finish_does_not(self):
+    async def test_toggle_idle_needs_a_saved_plan_but_finish_does_not(self):
         self.current = state("docked", "charging", "off", time.time())
-        self.manager.resolve = lambda vacuum: (None, None, None)
-        with self.assertRaisesRegex(manual_tests.ServiceError, "Select"):
+        with self.assertRaisesRegex(manual_tests.ServiceError, "No cleaning plan is saved"):
             await self.control("toggle")
         self.assertEqual(self.calls, [])
         self.current = state(observed_at=time.time())
@@ -323,7 +331,7 @@ class StandaloneManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((self.manager.queue.mode, self.manager.queue.phase), ("external", "idle"))
 
     async def test_explicit_vacuum_required_even_with_terminal_history(self):
-        self.manager.queue = Queue(phase="completed", vacuum="vacuum.robot", presets=["button.old"])
+        self.manager.queue = Queue(phase="completed", vacuum="vacuum.robot", mode="manual", targets=["0_1"], stages=ONE_STAGE)
         with self.assertRaisesRegex(manual_tests.ServiceError, "Specify a vacuum"):
             await self.control("pause", "")
         self.assertEqual(self.calls, [])
@@ -335,19 +343,19 @@ class StandaloneManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.manager.queue.pending_command, "pause")
 
     async def test_different_vacuum_cannot_bypass_active_attention_or_pending(self):
-        for phase, mode, pending in [("running", "preset", ""), ("attention", "preset", ""), ("controlling", "external", "resume"), ("attention", "external", "")]:
-            self.manager.queue = Queue(phase=phase, mode=mode, vacuum="vacuum.robot", pending_command=pending, presets=["button.old"])
+        for phase, mode, pending in [("running", "manual", ""), ("attention", "manual", ""), ("controlling", "external", "resume"), ("attention", "external", "")]:
+            self.manager.queue = Queue(phase=phase, mode=mode, vacuum="vacuum.robot", pending_command=pending, targets=["0_1"], stages=ONE_STAGE)
             before = self.manager.queue.dump()
             with self.assertRaisesRegex(manual_tests.ServiceError, "different vacuum"):
                 await self.control("pause", "vacuum.other")
             self.assertEqual(self.manager.queue.dump(), before)
         self.assertEqual(self.calls, [])
 
-    async def test_terminal_preset_permissions_do_not_leak_into_new_controls(self):
-        self.manager.queue = Queue(phase="completed", vacuum="vacuum.old", presets=["button.old"], control_entities={"mode": "select.old"})
+    async def test_terminal_plan_permissions_do_not_leak_into_new_controls(self):
+        self.manager.queue = Queue(phase="completed", vacuum="vacuum.old", mode="manual", targets=["0_1"], stages=ONE_STAGE, control_entities={"mode": "select.old"})
         await self.control("pause")
         self.assertEqual(len(self.calls), 1)
-        self.assertEqual(self.manager.queue.presets, [])
+        self.assertEqual(self.manager.queue.stages, [])          # the old plan is discarded
 
     async def test_unauthorized_and_revoked_permissions_never_dispatch(self):
         self.allowed.clear()
@@ -389,20 +397,20 @@ class StandaloneManagerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_owned_queue_pause_still_preserves_sequence_and_start_time(self):
         self.allowed.update({"button.kitchen", "button.office"})
-        self.manager.queue = Queue(phase="running", vacuum="vacuum.robot", presets=["button.kitchen", "button.office"], started_at=100, owner_user_id="user")
+        self.manager.queue = Queue(phase="running", vacuum="vacuum.robot", mode="manual", targets=["0_1", "0_2"], stages=TWO_STAGES, started_at=100, owner_user_id="user")
         # This assertion applies only to standalone calls; record owned dispatch separately.
         async def call(domain, service, data, **kwargs):
             self.calls.append((domain, service, data, kwargs["context"]))
         self.manager.hass.services.async_call = call
         await self.control("pause")
-        self.assertEqual((self.manager.queue.mode, self.manager.queue.started_at), ("preset", 100))
-        self.assertEqual(self.manager.queue.presets, ["button.kitchen", "button.office"])
+        self.assertEqual((self.manager.queue.mode, self.manager.queue.started_at), ("manual", 100))
+        self.assertEqual(self.manager.queue.stages, TWO_STAGES)
         self.assertEqual(self.calls[0][1], "pause")
 
 
     async def test_owned_resume_rechecks_unfinished_job_after_authorization(self):
         self.allowed.add("button.kitchen")
-        self.manager.queue = Queue(phase="paused", vacuum="vacuum.robot", presets=["button.kitchen"], owner_user_id="user")
+        self.manager.queue = Queue(phase="paused", vacuum="vacuum.robot", mode="manual", targets=["0_1"], stages=ONE_STAGE, owner_user_id="user")
         self.current = state("paused", "paused", observed_at=time.time())
         self.finish_before_dispatch = True
         await self.control("resume")
@@ -412,7 +420,7 @@ class StandaloneManagerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_owned_pause_rechecks_native_state_after_authorization(self):
         self.allowed.add("button.kitchen")
-        self.manager.queue = Queue(phase="running", vacuum="vacuum.robot", presets=["button.kitchen"], owner_user_id="user")
+        self.manager.queue = Queue(phase="running", vacuum="vacuum.robot", mode="manual", targets=["0_1"], stages=ONE_STAGE, owner_user_id="user")
         self.finish_before_dispatch = True
         await self.control("pause")
         self.assertEqual(self.calls, [])
@@ -420,7 +428,7 @@ class StandaloneManagerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_repeated_owned_dock_does_not_send_second_command_and_persists_barrier(self):
         self.allowed.add("button.kitchen")
-        self.manager.queue = Queue(phase="running", vacuum="vacuum.robot", presets=["button.kitchen"], owner_user_id="user")
+        self.manager.queue = Queue(phase="running", vacuum="vacuum.robot", mode="manual", targets=["0_1"], stages=ONE_STAGE, owner_user_id="user")
         async def call(domain, service, data, **kwargs):
             self.calls.append((domain, service, data, kwargs["context"]))
         self.manager.hass.services.async_call = call

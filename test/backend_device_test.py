@@ -11,6 +11,11 @@ import backend_manual_test as m
 from backend_queue_test import Queue, Snapshot, ready, cleaning, record, adapter
 
 
+def stage(target, index=0, mode="vacuum"):
+    return {"target": target, "mode": mode, "room_index": index, "pass_index": 0, "repeat_index": 0,
+            "settings": {"mode": mode}, "map_id": 0, "segments": [str(index + 1)]}
+
+
 class PolicyTests(unittest.TestCase):
     def test_water_fault_retains_identity_and_unknown_fault_does_not_gain_exception(self):
         _, coordinator, *_ = m.fixture()
@@ -18,11 +23,11 @@ class PolicyTests(unittest.TestCase):
             coordinator.data.status.dock_error_status=code
             self.assertEqual(adapter.snapshot(coordinator,"docked").dock_error,expected)
 
-    def test_water_exception_allows_app_presets_and_explicit_vacuum(self):
+    def test_water_exception_allows_vacuum_only_work(self):
         for fault in ["water_empty","error","waste_water_tank_full","unknown"]:
-            for mode in ["vacuum","mop","vacuum_mop","vacuum_then_mop","preset"]:
+            for mode in ["vacuum","mop","vacuum_mop","vacuum_then_mop"]:
                 current=ready(); current.dock_error=fault
-                self.assertEqual(current.ready_for(mode),fault=="water_empty" and mode in {"vacuum", "preset"})
+                self.assertEqual(current.ready_for(mode),fault=="water_empty" and mode == "vacuum")
                 current.error="error"
                 self.assertFalse(current.ready_for(mode))
 
@@ -42,7 +47,8 @@ class PolicyTests(unittest.TestCase):
         self.assertIsNone(q.observe(current,203));self.assertEqual(q.phase,"attention")
 
     def test_stop_clears_future_stages_and_requires_fresh_ack(self):
-        q=Queue(phase="running",vacuum="vacuum.robot",presets=["button.a","button.b"])
+        q=Queue(mode="manual",phase="running",vacuum="vacuum.robot",targets=["0_1","0_2"],
+                stages=[stage("0_1",0),stage("0_2",1)])
         active=cleaning();active.dock_error="water_empty"
         self.assertEqual(q.command("stop",active,100),("vacuum","stop"))
         stale=ready();stale.observed_at=99

@@ -1,4 +1,4 @@
-"""Allowlisted manual settings and HA-area plans from the native Roborock cache.
+"""Allowlisted cleaning settings, robot-room plans and legacy area plans from the native cache.
 
 No discovery, polling, raw commands, map switching, credentials, or preset presses.
 Compatibility: Home Assistant 2026.9.4 / python-roborock 7.4.2.

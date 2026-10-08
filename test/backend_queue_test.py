@@ -33,48 +33,83 @@ def record(begin=100, end=200, complete=1, error=0, finish_reason=52):
     return dict(begin=begin, end=end, complete=complete, error=error, finish_reason=finish_reason)
 
 class QueueTests(unittest.TestCase):
-    def start(self, presets=None):
+    """Room plans: each room is configured, started, then verified before the next."""
+
+    ROOMS = ["0_1", "0_2"]
+
+    def plan(self, rooms=None):
+        rooms = list(rooms or self.ROOMS)
+        stages = [{"target": room, "mode": "vacuum", "room_index": index, "pass_index": 0, "repeat_index": 0,
+                   "settings": {"mode": "vacuum", "suction": "max"}, "map_id": 0, "segments": [str(index + 1)]}
+                  for index, room in enumerate(rooms)]
+        return rooms, stages
+
+    def start(self, rooms=None):
+        rooms, stages = self.plan(rooms)
         queue = Queue()
-        effect = queue.start("vacuum.robot", presets or ["button.kitchen", "button.office"], ready(record(10, 20)), 100, "run1")
-        self.assertEqual(effect, ("preset", (presets or ["button.kitchen"])[0]))
+        effect = queue.start_manual("vacuum.robot", rooms, {"rooms": []}, stages, {}, ready(record(10, 20)), 100, "run1")
+        self.assertEqual(effect, ("configure", "0"))
         return queue
 
-    def acknowledged(self, presets=None):
-        queue = self.start(presets)
-        self.assertIsNone(queue.observe(cleaning(), 105))
+    def configured(self, queue, now=110, **overrides):
+        """The robot reporting exactly the settings the current stage asked for."""
+        current = ready(record(10, 20))
+        current.settings = {**queue.stage["settings"], **overrides}
+        current.observed_at = now
+        return current
+
+    def dispatch(self, queue, now=110):
+        return queue.observe(self.configured(queue, now), now)
+
+    def acknowledged(self, rooms=None):
+        queue = self.start(rooms)
+        self.assertEqual(self.dispatch(queue, 110), ("manual", "0"))
+        self.assertIsNone(queue.observe(cleaning(), 115))
         self.assertEqual(queue.phase, "running")
         self.assertEqual(queue.pending_command, "")
         return queue
 
+    def done(self, begin=120, end=200, **kwargs):
+        """A successful record for the room that is running."""
+        return record(begin, end, **kwargs)
+
     def test_order_two_rooms_only_after_success_and_ready(self):
         q = self.acknowledged()
-        q.observe(Snapshot("returning", "returning_home", "off", "none", "ok", True, record()), 202)
+        q.observe(Snapshot("returning", "returning_home", "off", "none", "ok", True, self.done()), 202)
         self.assertEqual((q.completed, q.current_index), (1, 1))
-        self.assertIsNone(q.observe(Snapshot("docked", "washing_the_mop", "off", "none", "ok", True, record()), 205))
-        self.assertEqual(q.observe(ready(record()), 220), ("preset", "button.office"))
+        self.assertIsNone(q.observe(Snapshot("docked", "washing_the_mop", "off", "none", "ok", True, self.done()), 205))
+        self.assertEqual(q.observe(ready(record()), 220), ("configure", "1"))
+        self.assertEqual(q.pending_command, "configure")
+        self.assertEqual(self.dispatch(q, 225), ("manual", "1"))
         self.assertEqual(q.pending_command, "start")
-        q.observe(cleaning(record()), 225)
-        q.observe(ready(record(220, 300)), 305)
+        q.observe(cleaning(record()), 230)
+        q.observe(ready(record(230, 300)), 305)
         self.assertEqual((q.phase, q.completed), ("completed", 2))
-        self.assertIsNone(q.observe(ready(record(220, 300)), 400))
+        self.assertIsNone(q.observe(ready(record(230, 300)), 400))
 
-    def test_initial_mop_wash_acknowledges_without_claiming_active_job(self):
-        q = self.start()
-        wash = Snapshot("docked", "washing_the_mop", "off", "none", "ok", True)
-        q.observe(wash, 105)
-        self.assertEqual((q.phase, q.pending_command, q.seen_job), ("running", "", False))
-        q.observe(wash, 180)
-        self.assertEqual(q.completed, 0)
-        q.observe(cleaning(), 240)
-        self.assertTrue(q.seen_job)
-        q.observe(ready(record(100, 300)), 310)
-        self.assertEqual(q.completed, 1)
+    def test_every_room_applies_its_own_settings_first(self):
+        rooms, stages = self.plan()
+        stages[0]["settings"] = {"mode": "vacuum", "suction": "max"}
+        stages[1]["settings"] = {"mode": "mop", "water": "high", "route": "deep"}
+        stages[1]["mode"] = "mop"
+        queue = Queue()
+        self.assertEqual(queue.start_manual("vacuum.robot", rooms, {"rooms": []}, stages, {}, ready(record(10, 20)), 100, "run"),
+                         ("configure", "0"))
+        self.assertEqual(self.dispatch(queue, 110), ("manual", "0"))
+        queue.observe(cleaning(), 115)
+        queue.observe(ready(self.done()), 200)
+        self.assertEqual(queue.observe(ready(record()), 205), ("configure", "1"))
+        # The mop room is not started until its own settings are read back.
+        misread = self.configured(queue, 250, water="low")
+        self.assertIsNone(queue.observe(misread, 250))
+        self.assertEqual(queue.pending_command, "configure")
+        self.assertEqual(self.dispatch(queue, 260), ("manual", "1"))
 
-    def test_initial_wash_never_starting_job_stops_after_timeout(self):
-        q = self.start()
+    def test_preparation_that_never_starts_a_job_stops_after_timeout(self):
+        q = self.acknowledged()
         wash = Snapshot("docked", "washing_the_mop", "off", "none", "ok", True)
-        q.observe(wash, 105)
-        q.observe(wash, 1601)
+        self.assertIsNone(q.observe(wash, 200))
+        q.observe(wash, 2000)
         self.assertEqual(q.phase, "attention")
         self.assertEqual(q.completed, 0)
 
@@ -84,13 +119,13 @@ class QueueTests(unittest.TestCase):
             self.assertIsNone(q.observe(Snapshot("docked", status, "on", "none", "ok", True, record()), 200))
             self.assertEqual((q.phase, q.current_index, q.completed), ("running", 0, 0))
 
-    def test_app_cancel_record_never_starts_next_room(self):
+    def test_unsuccessful_record_never_starts_next_room(self):
         for complete, reason in [(0, 21), (1, 21), (0, 52), (None, None)]:
             q = self.acknowledged()
-            q.observe(ready(record(complete=complete, finish_reason=reason)), 210)
+            q.observe(ready(self.done(complete=complete, finish_reason=reason)), 210)
             self.assertEqual(q.phase, "attention")
             self.assertEqual(q.completed, 0)
-            self.assertIsNone(q.observe(ready(record()), 240))
+            self.assertIsNone(q.observe(ready(self.done()), 240))
 
     def test_failure_then_clear_error_does_not_resume_queue(self):
         q = self.acknowledged()
@@ -120,40 +155,44 @@ class QueueTests(unittest.TestCase):
 
     def test_missed_ack_never_retries(self):
         q = self.start()
+        self.assertEqual(self.dispatch(q, 110), ("manual", "0"))
         # Docked and charging is not an acknowledgement: the dock may still be servicing.
         self.assertIsNone(q.observe(ready(record()), 300))
         self.assertEqual((q.phase, q.pending_command), ("starting", "start"))
         # The start window ends without a retry ever being sent.
-        self.assertIsNone(q.observe(ready(record()), 1001))
+        self.assertIsNone(q.observe(ready(record()), 1011))
         self.assertEqual(q.phase, "attention")
         self.assertEqual(q.completed, 0)
 
     def test_slow_start_after_dock_servicing_is_awaited(self):
-        """A routine can first appear minutes after the press (production: 677 s)."""
+        """A dispatched room can first appear minutes later (production: 677 s)."""
         q = self.acknowledged()
-        q.observe(Snapshot("returning", "returning_home", "off", "none", "ok", True, record()), 202)
+        q.observe(Snapshot("returning", "returning_home", "off", "none", "ok", True, self.done()), 202)
         self.assertEqual((q.completed, q.current_index), (1, 1))
-        self.assertEqual(q.observe(ready(record()), 205), ("preset", "button.office"))
+        self.assertEqual(q.observe(ready(record()), 205), ("configure", "1"))
+        self.assertEqual(self.dispatch(q, 210), ("manual", "1"))
         # The dock services the mop while the robot sits on it, charging.
         for timestamp in (260, 400, 700):
             self.assertIsNone(q.observe(Snapshot("docked", "charging", "off", "none", "ok", True, record()), timestamp))
             self.assertEqual((q.phase, q.pending_command), ("starting", "start"))
-        # 677 seconds after the press the robot begins cleaning, and the queue continues.
-        self.assertIsNone(q.observe(Snapshot("cleaning", "segment_cleaning", "on", "none", "ok", True, record()), 882))
+        # 677 seconds after the dispatch the robot begins cleaning, and the queue continues.
+        self.assertIsNone(q.observe(Snapshot("cleaning", "segment_cleaning", "on", "none", "ok", True, record()), 887))
         self.assertEqual((q.phase, q.pending_command), ("running", ""))
-        q.observe(ready(record(205, 900)), 905)
+        q.observe(ready(record(220, 900)), 905)
         self.assertEqual((q.phase, q.completed), ("completed", 2))
 
     def test_busy_robot_or_unfinished_docked_job_reject_start(self):
         for s in [cleaning(), Snapshot("docked", "charging", "on", "none", "ok", True), Snapshot()]:
+            _, stages = self.plan()
             with self.assertRaises(ValueError):
-                Queue().start("vacuum.robot", ["button.office"], s, 100, "run")
+                Queue().start_manual("vacuum.robot", ["0_1"], {}, stages, {}, s, 100, "run")
 
     def test_concurrent_start_rejected_preserving_queue(self):
         q = self.acknowledged()
         saved = q.dump()
+        _, stages = self.plan(["0_1"])
         with self.assertRaises(ValueError):
-            q.start("vacuum.robot", ["button.bedroom"], ready(), 120, "run2")
+            q.start_manual("vacuum.robot", ["0_1"], {}, stages, {}, ready(), 120, "run2")
         self.assertEqual(q.dump(), saved)
 
     def test_pause_resume_wait_for_ack_and_preserve_start(self):
@@ -165,7 +204,7 @@ class QueueTests(unittest.TestCase):
         q.observe(paused, 130)
         self.assertEqual((q.phase, q.pending_command), ("paused", ""))
         self.assertEqual(q.command("resume", paused, 140), ("vacuum", "start"))
-        self.assertEqual(q.started_at, 100)
+        self.assertEqual(q.started_at, 110)
         q.observe(cleaning(), 150)
         self.assertEqual(q.phase, "running")
 
@@ -199,44 +238,43 @@ class QueueTests(unittest.TestCase):
         for q in [self.start(), self.acknowledged()]:
             restored = Queue.restore(q.dump())
             self.assertEqual(restored.phase, "attention")
-            self.assertEqual(restored.presets, q.presets)
+            self.assertEqual(restored.stages, q.stages)
             self.assertIsNone(restored.observe(ready(record()), 1000))
 
-    def test_cancel_or_dock_pending_start_keeps_uncertainty_barrier(self):
+    def test_cancel_or_dock_pending_settings_keeps_uncertainty_barrier(self):
         for command in ["cancel", "return_to_dock"]:
             q = self.start()
             q.command(command, ready(), 101)
             self.assertEqual(q.phase, "cancelled")
-            self.assertEqual(q.not_before, 1000)
-            for timestamp in [102, 1001]:
+            self.assertEqual(q.not_before, 700)          # the settings readback window
+            for timestamp in [102, 701]:
                 with self.assertRaises(ValueError):
-                    q.start("vacuum.robot", ["button.bedroom"], ready(), timestamp, "new")
-            # A late acknowledgement cannot cause the next routine to be sent.
+                    _, stages = self.plan(["0_1"])
+                    q.start_manual("vacuum.robot", ["0_1"], {}, stages, {}, ready(), timestamp, "new")
+            # A late acknowledgement cannot cause the next room to be dispatched.
             self.assertIsNone(q.observe(cleaning(), 110))
             fresh_but_busy = cleaning()
             fresh_but_busy.observed_at = 1005
+            _, stages = self.plan(["0_1"])
             with self.assertRaises(ValueError):
-                q.start("vacuum.robot", ["button.bedroom"], fresh_but_busy, 1010, "new")
-            fresh_ready = ready()
+                q.start_manual("vacuum.robot", ["0_1"], {}, stages, {}, fresh_but_busy, 1010, "new")
+            fresh_ready = ready(record(10, 20))
             fresh_ready.observed_at = 1005
-            self.assertEqual(q.start("vacuum.robot", ["button.bedroom"], fresh_ready, 1010, "new"), ("preset", "button.bedroom"))
+            self.assertEqual(q.start_manual("vacuum.robot", ["0_1"], {}, stages, {}, fresh_ready, 1010, "new"),
+                             ("configure", "0"))
 
-    def test_clear_after_start_timeout_cannot_bypass_stale_snapshot(self):
+    def test_clear_after_settings_timeout_cannot_bypass_stale_snapshot(self):
         q = self.start()
         q.observe(ready(), 1001)
         self.assertEqual(q.phase, "attention")
         q.command("cancel", ready(), 1002)
+        _, stages = self.plan(["0_1"])
         with self.assertRaises(ValueError):
-            q.start("vacuum.robot", ["button.bedroom"], ready(), 1003, "new")
+            q.start_manual("vacuum.robot", ["0_1"], {}, stages, {}, ready(), 1003, "new")
         restored = Queue.restore(q.dump())
-        self.assertEqual(restored.not_before, 1000)
+        self.assertEqual(restored.not_before, 700)
         with self.assertRaises(ValueError):
-            restored.start("vacuum.robot", ["button.bedroom"], ready(), 1010, "new")
-
-    def test_empty_duplicate_and_excessive_sequences_rejected(self):
-        for presets in [[], ["button.a", "button.a"], ["button.a%d" % n for n in range(33)]]:
-            with self.assertRaises(ValueError):
-                Queue().start("vacuum.robot", presets, ready(), 100, "run")
+            restored.start_manual("vacuum.robot", ["0_1"], {}, stages, {}, ready(), 1010, "new")
 
     def test_external_pause_is_visible_and_external_resume_interrupts(self):
         q = self.acknowledged()
@@ -246,16 +284,17 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(q.phase, "attention")
 
     def test_unknown_finish_reason_and_record_error_fail_closed(self):
-        for r in [record(finish_reason=999), record(error=1), record(error=None)]:
+        for r in [self.done(finish_reason=999), self.done(error=1), self.done(error=None)]:
             q = self.acknowledged()
             q.observe(ready(r), 220)
             self.assertEqual(q.phase, "attention")
 
     def test_other_job_before_next_dispatch_stops_queue(self):
         q = self.acknowledged()
-        q.observe(ready(record()), 220)
+        q.observe(ready(self.done()), 220)
         q.observe(cleaning(), 230)
         self.assertEqual(q.phase, "attention")
+
 
 class AdapterTests(unittest.TestCase):
     def entry(self, **kwargs):

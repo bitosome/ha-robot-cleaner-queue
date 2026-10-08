@@ -37,7 +37,11 @@ def fixture():
                water_mode_options=list(map(enum, option_sets["water"])), mop_route_options=list(map(enum, option_sets["route"])),
                current_cleaning_mode_name="vac_and_mop", fan_speed_name="max", water_mode_name="custom_water_flow", mop_route_name="standard",
                state_name="charging", in_cleaning=0, error_code=0, dock_error_status=0)
-    coordinator = NS(duid_slug="robot1", last_update_success=True, _last_update_success_time=datetime.now(timezone.utc),
+    segments = []
+    async def clean_segments(requested):
+        segments.append(list(requested))
+    coordinator = NS(duid_slug="robot1", api=NS(vacuum=NS(clean_segments=clean_segments, segments=segments)),
+                     last_update_success=True, _last_update_success_time=datetime.now(timezone.utc),
                      properties_api=NS(status=trait, maps=NS(current_map=0), home=NS(current_map_data=NS(map_flag=0, rooms=[NS(segment_id=n) for n in [1, 2, 3]]))),
                      data=NS(status=trait, clean_summary=NS(last_clean_record=None)), async_add_listener=lambda callback: lambda: None)
     areas = NS(async_get_area=lambda area_id: NS(name=area_id.title()))
@@ -305,11 +309,13 @@ class ManualEngineTests(unittest.TestCase):
         queue.observe(ready(record(110, 200, complete=0, finish_reason=21)), 210)
         self.assertEqual((queue.phase, queue.completed, queue.current_index), ("attention", 0, 0))
 
-    def test_saved_preset_cannot_replace_active_manual_and_inverse(self):
+    def test_active_plan_cannot_be_replaced_by_another(self):
         queue = self.plan()
         before = queue.dump()
+        stages = [{"target": "0_2", "mode": "vacuum", "room_index": 0, "pass_index": 0, "repeat_index": 0,
+                   "settings": {"mode": "vacuum"}, "map_id": 0, "segments": ["2"]}]
         with self.assertRaises(ValueError):
-            queue.start("vacuum.robot", ["button.kitchen"], ready(), 102, "other")
+            queue.start_manual("vacuum.robot", ["0_2"], {}, stages, {}, ready(), 102, "other")
         self.assertEqual(before, queue.dump())
 
 
@@ -339,7 +345,8 @@ def manager_class():
                ar=NS(async_get=lambda hass: hass.areas), ServiceValidationError=ServiceError, Unauthorized=ServiceError,
                POLICY_CONTROL="control", async_require_control=permissions.async_require_control, _LOGGER=logging.getLogger("test"),
                snapshot=adapter.snapshot, routine_matches=adapter.routine_matches, is_competing_command=adapter.is_competing_command,
-               build_plan=manual.build_plan, cached_settings=manual.cached_settings, capabilities=manual.capabilities,
+               build_plan=manual.build_plan, build_room_plan=manual.build_room_plan, robot_targets=manual.robot_targets,
+               cached_settings=manual.cached_settings, capabilities=manual.capabilities,
                current_map=manual.current_map, validate_stage=manual.validate_stage)
     exec(compile(ast.Module(body=[definition], type_ignores=[]), str(source), "exec", flags=__future__.annotations.compiler_flag), env)
     return env["Manager"]
@@ -396,16 +403,16 @@ class ManagerTraceTests(unittest.IsolatedAsyncioTestCase):
                 "setup":{"mode":"vacuum", "suction":"max", "repeat":2}, **overrides}
         await self.manager.save_preset(NS(context=FakeContext("user"), data=data))
 
-    async def test_app_preset_save_and_water_empty_dispatch_preserve_routine(self):
-        eid = "button.robot_office"
-        self.entries.append(NS(entity_id=eid, unique_id="123_robot1", device_id="device", config_entry_id="entry", platform="roborock", domain="button", disabled_by=None))
-        self.states[eid] = NS(state="unknown", attributes={})
-        self.allowed.add(eid)
-        await self.manager.save_preset(NS(context=FakeContext("user"), data={"vacuum":"vacuum.robot", "source":"preset", "presets":[eid]}))
+    async def test_saved_room_plan_dispatches_robot_segments_not_areas(self):
+        await self.save_rooms()
         self.assertEqual(self.calls, [])
-        self.coordinator.data.status.dock_error_status = 38
-        await self.manager.control(NS(context=FakeContext("user"), data={"command":"toggle_saved", "vacuum":"vacuum.robot", "presets":[], "rooms":[]}))
-        self.assertEqual(self.calls, [("button", "press", {"entity_id":eid})])
+        self.coordinator.data.status.dock_error_status = 38      # water empty: vacuuming may proceed
+        await self.manager.control(NS(context=FakeContext("user"), data={"command":"toggle_saved", "vacuum":"vacuum.robot"}))
+        self.assertEqual(self.manager.queue.address, "room")
+        await self.manager.tick()
+        self.assertEqual(self.coordinator.api.vacuum.segments, [[1]])
+        self.assertFalse(any(service in {"clean_area", "start"} for _, service, _ in self.calls))
+        self.assertFalse(any(domain == "button" for domain, _, _ in self.calls))
 
     async def test_save_is_durable_no_commands_and_retrievable_from_new_manager(self):
         await self.save_manual()
@@ -438,6 +445,12 @@ class ManagerTraceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fresh.queue.phase, "idle")
         self.assertEqual(self.calls, [])
 
+    async def save_rooms(self, rooms=None, setup=None):
+        await self.manager.save_preset(NS(context=FakeContext("user"), data={
+            "vacuum": "vacuum.robot", "source": "rooms",
+            "rooms": rooms if rooms is not None else [{"id": "0_1", "mode": "vacuum", "suction": "max"}],
+            "setup": {} if setup is None else setup}))
+
     async def test_busy_saved_toggle_finishes_even_if_saved_plan_is_invalid(self):
         self.manager.saved_presets = {"vacuum.robot": {"source":"broken"}}
         self.coordinator.data.status.state_name = "segment_cleaning"
@@ -445,7 +458,6 @@ class ManagerTraceTests(unittest.IsolatedAsyncioTestCase):
         self.states["vacuum.robot"].state = "cleaning"
         await self.manager.control(NS(context=FakeContext("user"), data={"command":"toggle_saved", "vacuum":"vacuum.robot", "presets":[], "rooms":[]}))
         self.assertEqual(self.manager.queue.mode, "finish")
-        self.assertFalse(self.manager.queue.presets)
 
     async def test_saved_toggle_uses_manual_order_and_settings_not_fallback_button(self):
         await self.save_manual()

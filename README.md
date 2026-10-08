@@ -1,8 +1,8 @@
 # Robot Cleaner Queue
 
-A Home Assistant companion integration that runs an **ordered** room-cleaning sequence on a Roborock robot: it sends one routine at a time, verifies the robot's own cleaning record before moving on, and never retries blindly. The sequence lives in Home Assistant, so closing the dashboard or locking the phone does not stop it.
+A Home Assistant companion integration that runs an **ordered** room-cleaning sequence on a Roborock robot: it cleans the robot's own rooms one at a time, each with its own mode and settings, verifies the robot's own cleaning record before moving on, and never retries blindly. The sequence lives in Home Assistant, so closing the dashboard or locking the phone does not stop it.
 
-This is the backend half. It is driven by the [Robot Vacuum Cleaner Card](https://github.com/bitosome/robot-vacuum-cleaner-card), which supplies the tiles, presets and manual setup. Without the card you can call the services directly.
+This is the backend half. It is driven by the [Robot Vacuum Cleaner Card](https://github.com/bitosome/robot-vacuum-cleaner-card), which supplies the room tiles and the per-room setup. Without the card you can call the services directly.
 
 ## Why a queue exists
 
@@ -39,13 +39,13 @@ Installation and restart send no robot command. Afterwards, `sensor.robot_cleane
 
 - **Home Assistant 2026.9.0 or later**, verified against Core 2026.9.4 with python-roborock 7.4.2.
 - **The native Roborock integration** connected to a **V1-protocol** robot. The integration reads that coordinator's cached state only: no credentials, no cloud client, no extra polling and no modification of the native integration. An unfamiliar coordinator shape fails closed instead of guessing.
-- **One routine per room, created in the Roborock app.** Preset queues press those routine buttons, so the app keeps ownership of suction, mopping and repetition, and the integration never rewrites them. Each routine must represent the whole room named on its tile; a routine that internally ends one job and starts another cannot be chained safely and must be simplified in the app.
+- **A robot with named rooms on its current map.** Rooms are read from the map the Roborock app maintains, so nothing has to be rebuilt in Home Assistant and app routines are not needed.
 - **Mapped Home Assistant areas for manual queues.** Manual cleaning calls `vacuum.clean_area`, so Home Assistant's own area mapping connects areas to robot rooms, and an area is offered only when every Roborock room it maps to exists on the robot's current map. Map areas to rooms in the vacuum entity's settings; `get_capabilities` reports what is mapped, which robot rooms no area covers, and which mapped areas the robot no longer reports.
-- **Home Assistant permissions** to control the vacuum and every selected preset. The initiating user is checked at acceptance, before every later dispatch and before any dock or settings change.
+- **Home Assistant permissions** to control the vacuum and its setting entities. The initiating user is checked at acceptance, before every later dispatch and before any dock or settings change.
 
 **Optional but recommended**
 
-- The [Robot Vacuum Cleaner Card](https://github.com/bitosome/robot-vacuum-cleaner-card) supplies the tiles, saved presets and manual setup. Every capability is also reachable through the services below, so the card is not required.
+- The [Robot Vacuum Cleaner Card](https://github.com/bitosome/robot-vacuum-cleaner-card) supplies the room tiles, per-room setup and the saved plan. Every capability is also reachable through the services below, so the card is not required.
 
 **Limits**
 
@@ -57,7 +57,7 @@ Installation and restart send no robot command. Afterwards, `sensor.robot_cleane
 
 | Action | Purpose |
 | --- | --- |
-| `robot_cleaner_queue.control` | `start`, `start_manual`, `pause`, `resume`, `cancel`, `return_to_dock`, `stop`, `toggle`, `toggle_saved` |
+| `robot_cleaner_queue.control` | `start_manual`, `pause`, `resume`, `cancel`, `return_to_dock`, `stop`, `toggle`, `toggle_saved` |
 | `robot_cleaner_queue.device_control` | Allowlisted dock and robot settings (mop washing, child lock, DND, volume, …) |
 | `robot_cleaner_queue.save_preset` | Store one validated plan per vacuum |
 | `robot_cleaner_queue.get_capabilities` | Read-only capabilities, manual options, and the zones-and-areas report |
@@ -65,26 +65,27 @@ Installation and restart send no robot command. Afterwards, `sensor.robot_cleane
 ```yaml
 action: robot_cleaner_queue.control
 data:
-  command: start
+  command: start_manual
   vacuum: vacuum.robot
-  presets:
-    - button.robot_kitchen
-    - button.robot_office
-    - button.robot_bedroom
+  rooms:
+    - {id: "0_12", mode: vacuum_mop, suction: max, water: high, route: standard}
+    - {id: "0_13", mode: mop, water: low, route: deep}
 ```
+
+Each room is one entry from `get_capabilities.robot_rooms`; anything a room omits falls back to the request's `setup` defaults. A legacy plan may still pass Home Assistant area ids (`rooms: [kitchen]`) instead, and the whole home is `rooms: []`.
 
 Call the action directly rather than through `script.turn_on` so validation errors reach the caller. A successful return means the command was dispatched, not that the robot started: `pending_command` stays set until telemetry acknowledges it.
 
 ## Zones and areas
 
-The Roborock app names every room and often splits them finer than Home Assistant areas do. Room cleaning in Home Assistant goes only through `vacuum.clean_area`, so the entity registry's area mapping is what connects the two. `get_capabilities` reports that relationship read-only:
+The Roborock app names every room and often splits them finer than Home Assistant areas do. Rooms are cleaned through the robot's own client, so no Home Assistant area mapping is needed for a room plan. `get_capabilities` reports the relationship read-only:
 
 - `robot_maps` — every floor the robot reports.
 - `robot_rooms` — each robot room with the app's `name`, its `segment`, its `floor`, and the `area_id`/`area_name` claiming it, or `null` when none does.
 - `unmapped_areas` — areas whose mapped rooms the robot no longer reports.
 - `rooms_complete` — whether every floor was readable, so a single readable floor never makes another floor's areas look stale.
 
-One area may cover several robot rooms: a `Kitchen` area mapped to two segments cleans both, and the report names them. Nothing in this report writes configuration, creates areas or switches maps.
+One Home Assistant area may cover several robot rooms: a `Kitchen` area mapped to two segments cleans both, and the report names them. A room plan does not depend on that mapping — it names the robot's rooms directly. Nothing in this report writes configuration, creates areas or switches maps.
 
 ## Documentation
 

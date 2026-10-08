@@ -29,7 +29,6 @@ class QueueSensor(SensorEntity):
         return {
             "control_version": 4,
             "vacuum": queue.vacuum,
-            "presets": list(queue.presets),
             "mode": queue.mode,
             "targets": list(queue.targets),
             "setup": dict(queue.setup),
