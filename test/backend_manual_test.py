@@ -389,7 +389,13 @@ class ManagerTraceTests(unittest.IsolatedAsyncioTestCase):
             if getattr(self, "app_start_after", None) == len(self.calls):
                 status.state_name, status.in_cleaning = "segment_cleaning", 1
                 self.states["vacuum.robot"].state = "cleaning"
-        self.hass = NS(states=self.states, areas=self.areas, auth=NS(async_get_user=get_user), services=NS(async_call=call), async_create_task=asyncio.create_task)
+        self.segment_calls = []
+        async def clean_segments(segment_ids, **kwargs):
+            self.segment_calls.append(list(segment_ids))
+        self.vacuum_entity = NS(async_clean_segments=clean_segments, async_get_segments=lambda: [])
+        self.hass = NS(states=self.states, areas=self.areas, auth=NS(async_get_user=get_user),
+                       services=NS(async_call=call), async_create_task=asyncio.create_task,
+                       data={"vacuum": NS(get_entity=lambda entity_id: self.vacuum_entity)})
         self.manager = manager_class()(self.hass)
         self.manager.resolve = lambda vacuum: (self.registry, self.vacuum, self.coordinator)
 
@@ -410,7 +416,9 @@ class ManagerTraceTests(unittest.IsolatedAsyncioTestCase):
         await self.manager.control(NS(context=FakeContext("user"), data={"command":"toggle_saved", "vacuum":"vacuum.robot"}))
         self.assertEqual(self.manager.queue.address, "room")
         await self.manager.tick()
-        self.assertEqual(self.coordinator.api.vacuum.segments, [[1]])
+        # The native entity is called with the room's own id: the V1 entity parses
+        # "<map>_<room>" and ignores other maps, the Q-series take bare segment ids.
+        self.assertEqual(self.segment_calls, [["0_1"]])
         self.assertFalse(any(service in {"clean_area", "start"} for _, service, _ in self.calls))
         self.assertFalse(any(domain == "button" for domain, _, _ in self.calls))
 

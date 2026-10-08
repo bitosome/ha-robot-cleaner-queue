@@ -386,6 +386,15 @@ class Manager:
         elif time.time() - queue.command_at >= ACK_SECONDS:
             queue.attention("The device did not confirm this setting within 60 seconds. No retry was sent.")
 
+    def room_entity(self, vacuum: str):
+        """The native vacuum entity that can clean individual rooms."""
+        data = getattr(self.hass, "data", None)
+        component = data.get("vacuum") if isinstance(data, dict) else None
+        entity = component.get_entity(vacuum) if hasattr(component, "get_entity") else None
+        if entity is None or not hasattr(entity, "async_clean_segments"):
+            raise ValueError("This robot's integration cannot clean individual rooms.")
+        return entity
+
     def current_snapshot(self, vacuum: str) -> Snapshot:
         _, _, coordinator = self.resolve(vacuum)
         if coordinator is not self.coordinator:
@@ -578,12 +587,13 @@ class Manager:
                     raise ValueError("Manual settings changed before the start command.")
                 area = self.queue.stage["target"]
                 if self.queue.address == "room" and area:
-                    _, _, coordinator = self.resolve(self.queue.vacuum)
-                    segments = [int(segment) for segment in self.queue.stage.get("segments", [])]
-                    if not segments:
-                        raise ValueError("The room has no robot segment to clean.")
-                    self.event("dispatch", "cleaning room %s as segments %s" % (area, segments), logging.INFO)
-                    await coordinator.api.vacuum.clean_segments(segments)
+                    entity = self.room_entity(self.queue.vacuum)
+                    self.event("dispatch", "cleaning room %s" % area, logging.INFO)
+                    # The native entity's own call is the only protocol-safe one: the V1
+                    # entity takes "<map>_<room>" ids and ignores other maps, while the
+                    # Q-series entities take bare segment ids. `coordinator.api` exists
+                    # only for the Q-series classes.
+                    await entity.async_clean_segments([area])
                 else:
                     data = {"entity_id": self.queue.vacuum}
                     if area:
