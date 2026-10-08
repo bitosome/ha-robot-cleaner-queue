@@ -299,6 +299,60 @@ def build_plan(rooms: list[str], setup: dict, caps: dict, targets: dict, map_id:
     return normalized, stages
 
 
+def robot_targets(coordinator, map_id: int | None) -> dict[str, dict]:
+    """The robot's own rooms on one map, shaped like area targets.
+
+    Each room is a target whose single segment is that room, so the existing plan
+    builder, validator and stage freeze are reused unchanged while addressing the
+    robot's rooms directly instead of Home Assistant areas.
+    """
+    if map_id is None:
+        return {}
+    result = {}
+    for entry in home_maps(coordinator)[0]:
+        if entry["flag"] != map_id:
+            continue
+        for room in entry["rooms"]:
+            segment = room.get("segment")
+            if not isinstance(segment, int):
+                continue
+            result[room["id"]] = {"id": room["id"], "name": room["name"] or room["id"],
+                                  "segments": [str(segment)], "segment": segment}
+    return result
+
+
+def build_room_plan(requests: list, defaults: dict, caps: dict, targets: dict,
+                    map_id: int) -> tuple[list[dict], list[dict]]:
+    """Freeze an ordered room plan where every room carries its own settings.
+
+    A request is {"id": <room id>, **settings}; anything it omits falls back to the
+    plan defaults, and each room is validated exactly like a single-room plan.
+    """
+    if not isinstance(requests, list) or not 1 <= len(requests) <= 32:
+        raise ValueError("Select between 1 and 32 rooms.")
+    if not isinstance(defaults, dict) or set(defaults) - {"mode", "suction", "water", "route", "repeat"}:
+        raise ValueError("Unknown cleaning settings.")
+    plan_rooms, stages, seen = [], [], set()
+    for request in requests:
+        if not isinstance(request, dict) or not isinstance(request.get("id"), str):
+            raise ValueError("Every room needs an id from get_capabilities.")
+        room_id = request["id"]
+        spec = {key: value for key, value in request.items() if key != "id"}
+        if set(spec) - {"mode", "suction", "water", "route", "repeat"}:
+            raise ValueError("Unknown cleaning settings.")
+        if room_id in seen:
+            raise ValueError("Select each room only once.")
+        seen.add(room_id)
+        if room_id not in targets:
+            raise ValueError("Every selected room must exist on the robot's current map.")
+        normalized, room_stages = build_plan([room_id], {**defaults, **spec}, caps, targets, map_id)
+        if len(stages) + len(room_stages) > 128:
+            raise ValueError("The cleaning plan exceeds 128 stages.")
+        plan_rooms.append({"id": room_id, "name": targets[room_id]["name"], "setup": normalized})
+        stages.extend(room_stages)
+    return plan_rooms, stages
+
+
 def validate_stage(stage: dict, caps: dict, targets: dict, map_id: int | None) -> None:
     """Never silently clean a changed map or a different area mapping."""
     if not caps.get("supported") or map_id is None or map_id != stage.get("map_id"):

@@ -99,6 +99,7 @@ class Queue:
     not_before: float = 0
     barrier_window: float = 0
     decision: str = ""
+    address: str = ""
     owner_user_id: str | None = None
 
     def dump(self) -> dict[str, Any]:
@@ -318,7 +319,10 @@ class Queue:
 
     @property
     def cleaning_mode(self) -> str:
-        return self.setup.get("mode", "preset") if self.mode == "manual" else "preset"
+        """The mode of the job being dispatched, not the plan's first setting."""
+        if self.mode != "manual":
+            return "preset"
+        return self.stage.get("mode") or self.setup.get("mode") or "vacuum"
 
     @property
     def stage(self) -> dict:

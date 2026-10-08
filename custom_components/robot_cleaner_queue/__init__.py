@@ -22,7 +22,7 @@ from .adapter import is_competing_command, routine_matches, snapshot
 from .engine import ACTIVE, ACK_SECONDS, Queue, Snapshot
 from .device import CONTROLS, DOCK, device_entities, device_command
 from .permissions import async_require_control
-from .manual import build_plan, cached_settings, capabilities, current_map, validate_stage
+from .manual import build_plan, build_room_plan, cached_settings, capabilities, current_map, robot_targets, validate_stage
 
 DOMAIN = "robot_cleaner_queue"
 _LOGGER = logging.getLogger(__name__)
@@ -450,6 +450,8 @@ class Manager:
             standalone = command in {"pause", "resume", "return_to_dock", "stop"} and not owned_plan
             if standalone and not data.get("vacuum"):
                 raise ServiceValidationError("Specify a vacuum when controlling a job outside an active queue.")
+            if command == "start_manual":
+                self.queue.address = "room" if any(isinstance(item, dict) for item in data.get("rooms", [])) else "area"
             if command not in {"start", "start_manual"} and bound and self.queue.vacuum and vacuum != self.queue.vacuum:
                 raise ServiceValidationError("This command targets a different vacuum than the current queue.")
             permission_entities = [vacuum, *(data["presets"] if command == "start" else [] if command == "start_manual" else self.queue.presets if owned_plan else []),
@@ -472,7 +474,15 @@ class Manager:
                         caps, controls, targets, map_id = self.manual_capabilities(vacuum)
                         if saved_plan is not None and saved_plan.get("map_id") != map_id:
                             raise ValueError("The saved preset belongs to another map. Select that map or save a new preset.")
-                        setup, stages = build_plan(data["rooms"], data.get("setup", {}), caps, targets, map_id)
+                        requests = data["rooms"]
+                        if requests and all(isinstance(item, dict) for item in requests):
+                            rooms_map = robot_targets(self.resolve(vacuum)[2], map_id)
+                            plan_rooms, stages = build_room_plan(requests, data.get("setup", {}), caps, rooms_map, map_id)
+                            targets = {room["id"]: rooms_map[room["id"]] for room in plan_rooms}
+                            data["rooms"] = [room["id"] for room in plan_rooms]
+                            setup = {"rooms": plan_rooms}
+                        else:
+                            setup, stages = build_plan(requests, data.get("setup", {}), caps, targets, map_id)
                         try:
                             await async_require_control(self.hass.auth, call.context.user_id, list(controls.values()), POLICY_CONTROL)
                         except PermissionError as err:
@@ -531,6 +541,8 @@ class Manager:
                 self.contexts = {context.id}
             if kind in {"manual", "configure"}:
                 caps, controls, targets, map_id = self.manual_capabilities(self.queue.vacuum)
+                if self.queue.address == "room":
+                    targets = robot_targets(self.resolve(self.queue.vacuum)[2], map_id)
                 if caps.get("unavailable_controls"):
                     self.event("settings-deferred", "native setting entities are unavailable: %s; waiting"
                                % ", ".join(caps["unavailable_controls"]), logging.INFO)
@@ -555,6 +567,8 @@ class Manager:
                         if not self.current_snapshot(self.queue.vacuum).ready_for(self.queue.cleaning_mode):
                             raise ValueError("The robot became busy while applying manual settings.")
                         latest_caps, latest_controls, latest_targets, latest_map = self.manual_capabilities(self.queue.vacuum)
+                        if self.queue.address == "room":
+                            latest_targets = robot_targets(self.resolve(self.queue.vacuum)[2], latest_map)
                         validate_stage(self.queue.stage, latest_caps, latest_targets, latest_map)
                         if self.control_state(latest_controls) == "waiting":
                             return
@@ -571,10 +585,18 @@ class Manager:
                 if not all(current.settings.get(key) == value for key, value in self.queue.stage["settings"].items()):
                     raise ValueError("Manual settings changed before the start command.")
                 area = self.queue.stage["target"]
-                data = {"entity_id": self.queue.vacuum}
-                if area:
-                    data["cleaning_area_id"] = [area]
-                await self.hass.services.async_call("vacuum", "clean_area" if area else "start", data, blocking=True, context=context)
+                if self.queue.address == "room" and area:
+                    _, _, coordinator = self.resolve(self.queue.vacuum)
+                    segments = [int(segment) for segment in self.queue.stage.get("segments", [])]
+                    if not segments:
+                        raise ValueError("The room has no robot segment to clean.")
+                    self.event("dispatch", "cleaning room %s as segments %s" % (area, segments), logging.INFO)
+                    await coordinator.api.vacuum.clean_segments(segments)
+                else:
+                    data = {"entity_id": self.queue.vacuum}
+                    if area:
+                        data["cleaning_area_id"] = [area]
+                    await self.hass.services.async_call("vacuum", "clean_area" if area else "start", data, blocking=True, context=context)
             elif kind == "preset":
                 if not self.current_snapshot(self.queue.vacuum).ready:
                     raise ValueError("The robot is no longer ready for a preset.")

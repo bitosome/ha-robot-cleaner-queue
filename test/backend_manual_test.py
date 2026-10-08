@@ -187,6 +187,50 @@ class RoomReportTests(unittest.TestCase):
         self.assertEqual([r["area_id"] for r in caps["robot_rooms"]], ["kitchen", "kitchen", "office"])
         self.assertEqual(caps["unmapped_areas"], [])
 
+    def test_room_plan_freezes_per_room_settings_and_order(self):
+        vacuum, coordinator, entries, states, areas = self.fixture()
+        caps, _, _ = manual.capabilities(vacuum, coordinator, entries, states, areas)
+        targets = manual.robot_targets(coordinator, 0)
+        self.assertEqual(sorted(targets), ["0_1", "0_2", "0_3"])
+        self.assertEqual(targets["0_2"]["name"], "Dining area")
+        rooms, stages = manual.build_room_plan(
+            [{"id": "0_2", "mode": "mop", "water": "low", "route": "deep"},
+             {"id": "0_1", "mode": "vacuum", "suction": "max"}],
+            {"repeat": 1}, caps, targets, 0)
+        self.assertEqual([room["id"] for room in rooms], ["0_2", "0_1"])
+        self.assertEqual(rooms[0]["setup"]["mode"], "mop")
+        self.assertEqual(rooms[1]["setup"]["mode"], "vacuum")
+        self.assertEqual([stage["target"] for stage in stages], ["0_2", "0_1"])
+        self.assertEqual(stages[0]["settings"]["mode"], "mop")
+        self.assertNotIn("suction", stages[0]["settings"])          # mop needs no suction
+        self.assertEqual(stages[1]["settings"], {"mode": "vacuum", "suction": "max"})
+        self.assertEqual(stages[0]["segments"], ["2"])              # the robot's own segment
+
+    def test_room_plan_rejects_unknown_duplicate_and_excess_rooms(self):
+        vacuum, coordinator, entries, states, areas = self.fixture()
+        caps, _, _ = manual.capabilities(vacuum, coordinator, entries, states, areas)
+        targets = manual.robot_targets(coordinator, 0)
+        with self.assertRaisesRegex(ValueError, "current map"):
+            manual.build_room_plan([{"id": "0_99", "mode": "vacuum"}], {}, caps, targets, 0)
+        with self.assertRaisesRegex(ValueError, "only once"):
+            manual.build_room_plan([{"id": "0_1", "mode": "vacuum"}, {"id": "0_1", "mode": "mop"}], {}, caps, targets, 0)
+        with self.assertRaisesRegex(ValueError, "32 rooms"):
+            manual.build_room_plan([{"id": "0_1", "mode": "vacuum"}] * 33, {}, caps, targets, 0)
+        with self.assertRaisesRegex(ValueError, "supported.*cleaning mode"):
+            manual.build_room_plan([{"id": "0_1", "mode": "teleport"}], {}, caps, targets, 0)
+
+    def test_room_plan_repeats_and_two_pass_rooms_expand_to_stages(self):
+        vacuum, coordinator, entries, states, areas = self.fixture()
+        caps, _, _ = manual.capabilities(vacuum, coordinator, entries, states, areas)
+        targets = manual.robot_targets(coordinator, 0)
+        rooms, stages = manual.build_room_plan(
+            [{"id": "0_1", "mode": "vacuum_then_mop"}, {"id": "0_3", "mode": "vacuum", "repeat": 2}],
+            {}, caps, targets, 0)
+        self.assertEqual(len(stages), 2 + 2)
+        self.assertEqual([stage["pass_index"] for stage in stages[:2]], [0, 1])
+        self.assertEqual([stage["target"] for stage in stages[2:]], ["0_3", "0_3"])
+        self.assertEqual(len(rooms), 2)
+
     def test_unavailable_robot_reports_no_invented_rooms(self):
         vacuum, coordinator, entries, states, areas, _ = fixture()
         coordinator.properties_api.home = NS()
