@@ -81,7 +81,8 @@ device_control:
 save_preset:
   name: Save cleaning plan
   description: Save one validated native room/area plan for this robot, without changing
-    settings or starting cleaning. Replaces the previous saved plan.
+    settings or starting cleaning. Replaces the previous saved plan. Optional revision
+    rejects stale saves when another user has updated the plan.
   fields:
     vacuum:
       required: true
@@ -89,6 +90,12 @@ save_preset:
         entity:
           domain: vacuum
           integration: roborock
+    revision:
+      description: Revision from saved_preset in get_capabilities, or 0 when no plan exists.
+      selector:
+        number:
+          min: 0
+          mode: box
     source:
       required: true
       selector:

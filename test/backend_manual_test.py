@@ -560,6 +560,98 @@ class ManagerTraceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Sensitive", str(result))
         self.assertEqual(self.manager.queue.phase, "attention")
 
+    async def test_saved_room_plan_freezes_omitted_settings_before_native_defaults_change(self):
+        await self.save_rooms(rooms=[{"id":"0_1", "mode":"vacuum"}, {"id":"0_3", "mode":"mop"}])
+        plan = self.manager.saved_presets["vacuum.robot"]
+        self.assertEqual(plan["rooms"], [
+            {"id":"0_1", "mode":"vacuum", "repeat":1, "suction":"max"},
+            {"id":"0_3", "mode":"mop", "repeat":1, "water":"medium", "route":"standard"}])
+        self.assertEqual(plan["setup"], {})
+        self.coordinator.properties_api.status.fan_speed_name = "quiet"
+        self.coordinator.properties_api.status.water_mode_name = "low"
+        self.coordinator.properties_api.status.mop_route_name = "deep"
+        await self.manager.control(NS(context=FakeContext("user"), data={"command":"toggle_saved", "vacuum":"vacuum.robot"}))
+        self.assertEqual(self.manager.queue.stages[0]["settings"]["suction"], "max")
+        self.assertEqual(self.manager.queue.stages[1]["settings"], {"mode":"mop", "water":"medium", "route":"standard"})
+
+    async def test_capabilities_advertise_revision_support_before_the_first_saved_plan(self):
+        call = NS(context=FakeContext("user"), data={"vacuum":"vacuum.robot"})
+        caps = await self.manager.get_capabilities(call)
+        self.assertIsNone(caps["saved_preset"])
+        self.assertEqual(caps["saved_plan_revision"], 0)
+        self.assertEqual(caps["control_version"], 5)
+        await self.save_manual(revision=caps["saved_plan_revision"])
+        caps = await self.manager.get_capabilities(call)
+        self.assertEqual(caps["saved_plan_revision"], 1)
+        self.assertEqual(caps["saved_plan_revision"], caps["saved_preset"]["revision"])
+        self.manager.saved_presets["vacuum.robot"].pop("revision")
+        self.assertEqual((await self.manager.get_capabilities(call))["saved_plan_revision"], 0)
+        self.assertEqual(self.calls, [])
+
+    async def test_plan_revisions_notify_other_users_only_after_successful_durable_save(self):
+        notifications = []
+        self.manager.subscribe(lambda: notifications.append(self.manager.saved_presets["vacuum.robot"]["revision"]))
+        await self.save_manual(revision=0)
+        self.assertEqual(self.manager.saved_presets["vacuum.robot"]["source"], "manual")
+        self.assertEqual(notifications, [1])
+        # The same revision read by two users cannot overwrite the first user's save.
+        with self.assertRaisesRegex(ServiceError, "Another user"):
+            await self.save_manual(revision=0, rooms=["kitchen"])
+        self.assertEqual(notifications, [1])
+        self.assertEqual(self.manager.saved_presets["vacuum.robot"]["rooms"], ["office", "kitchen"])
+        await self.save_manual(revision=1, rooms=["kitchen"])
+        self.assertEqual(notifications, [1, 2])
+        async def fail(_): raise OSError("Disk full")
+        self.manager.preset_store.async_save = fail
+        with self.assertRaises(OSError): await self.save_manual(revision=2)
+        self.assertEqual(notifications, [1, 2])
+        self.assertEqual(self.manager.saved_presets["vacuum.robot"]["revision"], 2)
+        self.assertEqual(self.calls, [])
+
+    async def test_legacy_plan_is_revision_zero_and_survives_reload(self):
+        await self.save_manual()
+        stored = self.manager.saved_presets
+        stored["vacuum.robot"].pop("revision")
+        async def load(): return stored
+        self.manager.preset_store.async_load = load
+        await self.manager.load_saved_presets()
+        await self.save_manual(revision=0)
+        self.assertEqual(self.manager.saved_presets["vacuum.robot"]["revision"], 1)
+        fresh = manager_class()(self.hass)
+        stored = self.manager.preset_store.saved[-1]
+        fresh.preset_store.async_load = load
+        await fresh.load_saved_presets()
+        self.assertEqual(await fresh.read_saved_preset("vacuum.robot", "user"), stored["vacuum.robot"])
+        self.assertEqual(self.calls, [])
+
+    async def test_unreadable_saved_plans_cannot_be_overwritten_or_started(self):
+        for damaged in [["not a store"], {"vacuum.robot":[]},
+                        {"vacuum.robot":{"source":"rooms", "rooms":[{"id":"0_1", "repeat":[] }], "setup":{}}}]:
+            async def load(): return damaged
+            self.manager.preset_store.async_load = load
+            await self.manager.load_saved_presets()
+            self.assertTrue(self.manager.presets_load_failed)
+            with self.assertRaises(ServiceError): await self.save_manual()
+            with self.assertRaises(ServiceError):
+                await self.manager.control(NS(context=FakeContext("user"), data={"command":"toggle_saved", "vacuum":"vacuum.robot"}))
+        self.assertEqual(self.manager.preset_store.saved, [])
+        self.assertEqual(self.calls, [])
+
+    async def test_nested_corrupt_preferences_do_not_load_as_usable_profiles(self):
+        invalid_profiles = [
+            {"revision":True, "defaults":{}, "rooms":{}},
+            {"revision":-1, "defaults":{}, "rooms":{}},
+            {"revision":1, "defaults":{"mode":[]}, "rooms":{}},
+            {"revision":1, "defaults":{}, "rooms":{"0_1":None}},
+            {"revision":1, "defaults":{}, "rooms":{"0_1":{"repeat":True}}},
+        ]
+        for profile in invalid_profiles:
+            async def load(): return {"vacuum.robot":profile}
+            self.manager.preferences_store.async_load = load
+            await self.manager.load_preferences()
+            with self.assertRaises(ServiceError): self.manager.preference_profile("vacuum.robot")
+        self.assertEqual(self.manager.preferences_store.saved, [])
+
     async def test_saved_room_plan_dispatches_robot_segments_not_areas(self):
         await self.save_rooms()
         self.assertEqual(self.calls, [])

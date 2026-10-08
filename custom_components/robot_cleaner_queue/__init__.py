@@ -65,6 +65,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     hass.services.async_register(DOMAIN, "save_preset", manager.save_preset, schema=vol.Schema({
         vol.Required("vacuum"): cv.entity_id,
         vol.Required("source"): vol.In(["rooms", "manual"]),
+        vol.Optional("revision"): vol.All(int, vol.Range(min=0)),
         # Accepted from the released card and ignored: routines are no longer a plan.
         vol.Optional("presets", default=[]): vol.All(cv.ensure_list, [cv.entity_id]),
         vol.Optional("rooms", default=[]): PLAN_ROOMS,
@@ -97,6 +98,7 @@ class Manager:
         self.store = Store(hass, 1, DOMAIN)
         self.preset_store = Store(hass, 1, DOMAIN + "_presets")
         self.saved_presets: dict = {}
+        self.presets_load_failed = False
         self.preferences_store = Store(hass, 1, DOMAIN + "_preferences")
         self.preferences: dict = {}
         self.preferences_load_failed = False
@@ -118,12 +120,7 @@ class Manager:
 
     async def setup(self) -> None:
         await self.load_preferences()
-        try:
-            loaded_presets = await self.preset_store.async_load()
-            self.saved_presets = loaded_presets if isinstance(loaded_presets, dict) else {}
-        except Exception:  # noqa: BLE001 - a damaged store must never block setup
-            _LOGGER.exception("Saved presets could not be read; starting without them")
-            self.saved_presets = {}
+        await self.load_saved_presets()
         try:
             loaded_queue = await self.store.async_load()
             self.queue = Queue.restore(loaded_queue if isinstance(loaded_queue, dict) else None)
@@ -261,6 +258,7 @@ class Manager:
             caps["control_version"] = 5
             caps["current_map"] = current_map(self.resolve(call.data["vacuum"])[2])[0]
             caps["saved_preset"] = await self.read_saved_preset(call.data["vacuum"], call.context.user_id)
+            caps["saved_plan_revision"] = (caps["saved_preset"] or {}).get("revision", 0)
             caps["preferences"] = self.preference_profile(call.data["vacuum"])
             caps["device_entities"] = {}
             for key, entity_id in self.device_entities(call.data["vacuum"]).items():
@@ -284,11 +282,16 @@ class Manager:
         try:
             data = await self.preferences_store.async_load()
             if data is not None and (not isinstance(data, dict) or any(
-                not isinstance(value, dict) or not isinstance(value.get("revision"), int)
-                or not isinstance(value.get("defaults"), dict) or not isinstance(value.get("rooms"), dict)
-                for value in data.values())):
+                not isinstance(key, str) or not isinstance(value, dict)
+                or type(value.get("revision")) is not int or value["revision"] < 0
+                or not self.valid_stored_settings(value.get("defaults"))
+                or not isinstance(value.get("rooms"), dict)
+                or any(not isinstance(room, str) or not self.valid_stored_settings(settings)
+                       for room, settings in value["rooms"].items())
+                for key, value in data.items())):
                 raise ValueError("Invalid preference storage")
             self.preferences = data or {}
+            self.preferences_load_failed = False
         except Exception:
             self.preferences_load_failed = True
             _LOGGER.error("Room preference storage could not be read; saving is disabled to preserve it")
@@ -334,7 +337,41 @@ class Manager:
             except ValueError as err:
                 raise ServiceValidationError(str(err)) from err
 
+    @staticmethod
+    def valid_stored_settings(value):
+        """Validate storage shape without depending on a robot being online at startup."""
+        if not isinstance(value, dict) or set(value) - {"mode", "suction", "water", "route", "repeat"}:
+            return False
+        return all(type(setting) is int and setting in {1, 2} if key == "repeat"
+                   else isinstance(setting, str) for key, setting in value.items())
+
+    async def load_saved_presets(self):
+        """Keep unreadable storage intact instead of letting the next save replace it."""
+        try:
+            data = await self.preset_store.async_load()
+            if data is not None and not isinstance(data, dict):
+                raise ValueError("Invalid saved plan storage")
+            for vacuum, plan in (data or {}).items():
+                if (not isinstance(vacuum, str) or not isinstance(plan, dict)
+                        or type(plan.get("revision", 0)) is not int or plan.get("revision", 0) < 0
+                        or plan.get("source") not in {"rooms", "manual", "preset"}
+                        or not isinstance(plan.get("rooms"), list)
+                        or not self.valid_stored_settings(plan.get("setup"))):
+                    raise ValueError("Invalid saved plan storage")
+                for room in plan["rooms"]:
+                    if not isinstance(room, str) and not (isinstance(room, dict)
+                            and isinstance(room.get("id"), str)
+                            and self.valid_stored_settings({key: value for key, value in room.items() if key != "id"})):
+                        raise ValueError("Invalid saved room storage")
+            self.saved_presets = data or {}
+            self.presets_load_failed = False
+        except Exception:  # noqa: BLE001 - do not overwrite the unreadable store
+            self.presets_load_failed = True
+            _LOGGER.error("Saved cleaning plans could not be read; saving is disabled to preserve them")
+
     async def read_saved_preset(self, vacuum, user_id):
+        if self.presets_load_failed:
+            raise ServiceValidationError("Saved plans could not be read. Restore plan storage before saving.")
         plan = self.saved_presets.get(vacuum)
         if plan:
             await async_require_control(self.hass.auth, user_id, [vacuum], POLICY_CONTROL)
@@ -345,23 +382,29 @@ class Manager:
         async with self.lock:
             if self.closing:
                 raise ServiceValidationError("Home Assistant is stopping.")
-            vacuum, source = call.data["vacuum"], call.data["source"]
+            vacuum = call.data["vacuum"]
             try:
                 await async_require_control(self.hass.auth, call.context.user_id, [vacuum], POLICY_CONTROL)
-                plan = {"source": "rooms", "rooms": [], "setup": {}}
+                current = await self.read_saved_preset(vacuum, call.context.user_id)
+                revision = (current or {}).get("revision", 0)
+                if "revision" in call.data and call.data["revision"] != revision:
+                    raise ValueError("Another user saved the cleaning plan. Reload the saved plan before saving your changes.")
+                plan = {"source": "rooms", "rooms": [], "setup": {}, "revision": revision + 1}
                 caps, controls, targets, map_id = self.manual_capabilities(vacuum)
                 await async_require_control(self.hass.auth, call.context.user_id, list(controls.values()), POLICY_CONTROL)
                 requests = list(call.data.get("rooms", []))
                 if requests and all(isinstance(item, dict) for item in requests):
                     rooms_map = robot_targets(self.resolve(vacuum)[2], map_id)
-                    build_room_plan(requests, call.data.get("setup", {}), caps, rooms_map, map_id)
-                    plan.update(rooms=requests, setup=call.data.get("setup", {}), map_id=map_id)
+                    frozen, _ = build_room_plan(requests, call.data.get("setup", {}), caps, rooms_map, map_id)
+                    plan.update(rooms=[{"id": room["id"], **room["setup"]} for room in frozen], map_id=map_id)
                 else:
                     setup, _ = build_plan(requests, call.data.get("setup", {}), caps, targets, map_id)
-                    plan.update(rooms=requests, setup=setup, map_id=map_id)
+                    plan.update(source="manual", rooms=requests, setup=setup, map_id=map_id)
                 updated = {**self.saved_presets, vacuum: plan}
                 await self.preset_store.async_save(updated)
                 self.saved_presets = updated  # Report success only after durable storage.
+                for listener in list(self.listeners):
+                    listener()
             except PermissionError as err:
                 raise Unauthorized(context=call.context, permission=POLICY_CONTROL) from err
             except ValueError as err:
@@ -524,8 +567,8 @@ class Manager:
                     command = "finish"
                 else:
                     command = "start_manual"
-                    if not isinstance(self.saved_presets, dict):
-                        raise ServiceValidationError("Saved plans could not be read. Save the plan again from the card.")
+                    if self.presets_load_failed or not isinstance(self.saved_presets, dict):
+                        raise ServiceValidationError("Saved plans could not be read. Restore plan storage before starting.")
                     saved_plan = self.saved_presets.get(vacuum)
                     if not saved_plan:
                         raise ServiceValidationError("No cleaning plan is saved for this robot. Save one from the card first.")

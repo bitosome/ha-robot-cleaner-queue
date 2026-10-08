@@ -196,3 +196,20 @@ Settings-only cancellation uses a 60-second barrier from the latest possible
 settings write plus a fresh native poll. It no longer inherits the ten-minute
 configuration deadline. Older stored ten-minute settings barriers migrate on
 restart; fifteen-minute start/resume barriers are unchanged.
+
+
+### Shared saved-plan revision contract
+
+`get_capabilities.saved_plan_revision` is always present when the companion supports
+revision-aware plan saves, including `0` before any plan exists or for a legacy plan
+without a revision. Clients can detect this field without changing `control_version: 5`.
+The saved plan also contains `saved_preset.revision`; successful saves increment it.
+Send the revision read with the plan as the optional `save_preset.revision` argument
+to reject an overwrite after another user saves. Older clients may omit the argument.
+
+`sensor.robot_cleaner_queue.saved_plan_revisions` publishes the revision by vacuum
+and notifies connected dashboards only after a durable save. Native room plans store
+all effective settings, including defaults, so later robot setting changes cannot
+alter the wall-switch plan. Area plans retain `source: manual`; native room plans use
+`source: rooms`. Unreadable plan or preference storage is preserved and cannot be
+overwritten by a subsequent save.

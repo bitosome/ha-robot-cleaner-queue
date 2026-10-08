@@ -29,6 +29,7 @@ class QueueSensor(SensorEntity):
         return {
             "control_version": 5,
             "preferences_revisions": {key: value["revision"] for key, value in self.manager.preferences.items()},
+            "saved_plan_revisions": {key: value.get("revision", 0) for key, value in self.manager.saved_presets.items()},
             "vacuum": queue.vacuum,
             "mode": queue.mode,
             "targets": list(queue.targets),
