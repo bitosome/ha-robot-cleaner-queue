@@ -459,6 +459,45 @@ class ManagerTraceTests(unittest.IsolatedAsyncioTestCase):
         await self.manager.tick()
         self.assertEqual(sum(service == "clean_area" for _, service, _ in self.calls), 1)
 
+    async def test_vacuum_to_mop_waits_for_dust_emptying_and_preserves_order(self):
+        original = self.hass.services.async_call
+        status = self.coordinator.properties_api.status
+        async def dock_race(domain, service, data, **kwargs):
+            await original(domain, service, data, **kwargs)
+            if data.get("entity_id") == "select.renamed_mode" and data.get("option") == "mop":
+                status.state_name = "emptying_the_bin"
+        self.hass.services.async_call = dock_race
+        await self.start(rooms=[{"id":"0_1","mode":"vacuum_then_mop","suction":"max","water":"high","route":"standard"},
+                                {"id":"0_3","mode":"vacuum","suction":"max"}])
+        await self.manager.tick()
+        self.assertEqual(self.segment_calls, [["0_1"]])
+        status.state_name, status.in_cleaning = "segment_cleaning", 1
+        self.states["vacuum.robot"].state = "cleaning"
+        self.coordinator._last_update_success_time = datetime.now(timezone.utc)
+        await self.manager.tick()  # Start acknowledgement.
+        await self.manager.tick()  # Observe the active job.
+        started = self.manager.queue.started_at
+        status.state_name, status.in_cleaning = "charging", 0
+        self.states["vacuum.robot"].state = "docked"
+        self.coordinator.data.clean_summary.last_clean_record = NS(**record(started, started + 1))
+        await self.manager.tick()  # Completion, then a separate observation to configure.
+        await self.manager.tick()
+        self.assertEqual(self.manager.queue.current_index, 1)
+        self.assertEqual(self.manager.queue.phase, "preparing")
+        self.assertEqual(self.manager.configured_keys, {"mode"})
+        sent = len(self.calls)
+        await self.manager.tick()
+        await self.manager.tick()
+        self.assertEqual(len(self.calls), sent, "Do not write settings during dock care")
+        self.assertEqual(self.segment_calls, [["0_1"]])
+        status.state_name = "charging"
+        await self.manager.tick()  # Resume only water and route; never repeat mode.
+        await self.manager.tick()
+        self.assertEqual(self.segment_calls, [["0_1"], ["0_1"]])
+        self.assertEqual(sum(data.get("option") == "mop" for _, _, data in self.calls), 1)
+        self.assertEqual(self.states["select.renamed_water"].state, "high")
+        self.assertEqual(self.manager.queue.stages[2]["target"], "0_3")
+
     async def test_command_failure_never_leaks_payload_into_diagnostics(self):
         self.fail_service = "set_fan_speed"
         await self.start()

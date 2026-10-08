@@ -560,6 +560,9 @@ class Manager:
                     self.configured_keys = set()
                 self.deferred_configuration = None
             if kind in {"manual", "configure"}:
+                if kind == "configure" and self.current_snapshot(self.queue.vacuum).servicing_for(self.queue.cleaning_mode):
+                    self.deferred_configuration = (token, effect)
+                    return
                 caps, controls, targets, map_id = self.manual_capabilities(self.queue.vacuum)
                 if self.queue.address == "room":
                     targets = robot_targets(self.resolve(self.queue.vacuum)[2], map_id)
@@ -588,7 +591,14 @@ class Manager:
                             return
                         # A native-app start can appear during an awaited settings
                         # refresh without a Home Assistant service event.
-                        if not self.current_snapshot(self.queue.vacuum).ready_for(self.queue.cleaning_mode):
+                        current = self.current_snapshot(self.queue.vacuum)
+                        if current.servicing_for(self.queue.cleaning_mode):
+                            # A successful earlier write is retained. Resume only the
+                            # unsent settings after normal post-clean dock care ends.
+                            self.deferred_configuration = (token, effect)
+                            self.event("settings-deferred", "waiting for dock care: %s" % current.status, logging.INFO)
+                            return
+                        if not current.ready_for(self.queue.cleaning_mode):
                             raise ValueError("The robot became busy while applying manual settings.")
                         latest_caps, latest_controls, latest_targets, latest_map = self.manual_capabilities(self.queue.vacuum)
                         if self.queue.address == "room":

@@ -105,6 +105,32 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(queue.pending_command, "configure")
         self.assertEqual(self.dispatch(queue, 260), ("manual", "1"))
 
+    def test_configuring_waits_for_known_dock_care_but_is_bounded(self):
+        for status in engine.DOCK_CARE_STATUS:
+            with self.subTest(status=status):
+                q = self.start()
+                current = self.configured(q, 120)
+                current.status = status
+                self.assertIsNone(q.observe(current, 120))
+                self.assertEqual(q.phase, "preparing")
+                self.assertIn("dock care", q.decision)
+                self.assertEqual(self.dispatch(q, 130), ("manual", "0"))
+                q = self.start()
+                self.assertIsNone(q.observe(current, 100 + engine.CONFIGURE_SECONDS))
+                self.assertEqual(q.phase, "attention")
+
+    def test_dock_care_with_job_fault_or_unknown_status_never_resumes_configuration(self):
+        for field, value in [("job", "on"), ("dock_error", "water_empty"),
+                             ("error", "error"), ("connected", False), ("status", "new_unknown_status")]:
+            with self.subTest(field=field):
+                q = self.start()
+                q.stages[0]["mode"] = "mop"
+                current = self.configured(q, 120)
+                current.status = "washing_the_mop"
+                setattr(current, field, value)
+                self.assertIsNone(q.observe(current, 120))
+                self.assertEqual(q.phase, "attention")
+
     def test_preparation_that_never_starts_a_job_stops_after_timeout(self):
         q = self.acknowledged()
         wash = Snapshot("docked", "washing_the_mop", "off", "none", "ok", True)

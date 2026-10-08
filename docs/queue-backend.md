@@ -165,3 +165,13 @@ The service metadata and bundled wrapper now match the room schema: no `start` r
 Configuration resumes only explicitly deferred, unsent setting writes. Successfully sent keys are not repeated; errors remain terminal and no uncertain start is retried. Native exception messages are omitted from diagnostic events. `get_diagnostics` refuses a different robot's bound queue.
 
 The native device allowlist includes selected map and optional off-peak controls. Discovery exposes available tank/attachment/history telemetry read-only. Selecting a map while a robot has an unfinished native job is rejected even if this queue is idle.
+
+## Dock care during preparation
+
+Version 0.8.1 handles dock care beginning after a brief charging state between
+passes. If dust emptying, mop washing or mop attachment begins while settings are
+being applied, preparation waits with no further writes or cleaning command. Only
+settings not yet successfully sent resume when the dock is ready, and fresh
+readback must match before cleaning starts. This wait retains the ten-minute
+configuration deadline. A competing job, unknown state, fault, cancellation or
+uncertain service failure still stops the sequence; no command is retried.

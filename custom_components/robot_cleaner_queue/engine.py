@@ -17,6 +17,9 @@ START_STATUS = CLEANING_STATUS | {
     "going_to_wash_the_mop", "back_to_dock_washing_duster", "attaching_the_mop",
     "detaching_the_mop",
 }
+# Post-clean care may begin just after a transient charging observation.
+DOCK_CARE_STATUS = {"emptying_the_bin", "washing_the_mop", "attaching_the_mop",
+                    "detaching_the_mop", "air_drying_stopping"}
 SUCCESS_REASONS = {52, 54, 55, 56, 57}
 ACK_SECONDS = 60
 FINISH_SECONDS = 180
@@ -70,6 +73,11 @@ class Snapshot:
 
     def ready_for(self, mode: str = "vacuum") -> bool:
         return self.healthy_for(mode) and self.vacuum in {"docked", "idle"} and self.status in READY_STATUS and self.job == "off"
+
+    def servicing_for(self, mode: str = "vacuum") -> bool:
+        """Known dock care without a competing job; safe to wait, never to dispatch."""
+        return (self.healthy_for(mode) and self.vacuum == "docked"
+                and self.job == "off" and self.status in DOCK_CARE_STATUS)
 
     @property
     def ready(self) -> bool:
@@ -437,7 +445,12 @@ class Queue:
                 snapshot.vacuum, snapshot.status, snapshot.job, snapshot.error, snapshot.dock_error, snapshot.connected)
             return None
         if self.pending_command == "configure":
-            if not snapshot.ready_for(self.cleaning_mode):
+            if snapshot.servicing_for(self.cleaning_mode):
+                self.decision = "waiting for dock care before applying manual settings: %s" % snapshot.status
+                if now - self.command_at >= CONFIGURE_SECONDS:
+                    self.attention("Dock care did not finish within %d minutes while preparing the next pass. No cleaning was started."
+                                   % (CONFIGURE_SECONDS // 60))
+            elif not snapshot.ready_for(self.cleaning_mode):
                 self.attention("The robot became busy while manual settings were being applied. No cleaning was started.")
                 self.decision = "stopped: robot left the ready state while applying settings (vacuum=%s status=%s job=%s)" % (
                     snapshot.vacuum, snapshot.status, snapshot.job)
