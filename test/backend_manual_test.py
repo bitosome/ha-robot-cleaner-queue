@@ -210,6 +210,17 @@ class RoomReportTests(unittest.TestCase):
         self.assertEqual(stages[1]["settings"], {"mode": "vacuum", "suction": "max"})
         self.assertEqual(stages[0]["segments"], ["2"])              # the robot's own segment
 
+    def test_mixed_room_defaults_and_repeats_keep_room_indices(self):
+        vacuum, coordinator, entries, states, areas = self.fixture()
+        caps, _, _ = manual.capabilities(vacuum, coordinator, entries, states, areas)
+        targets = manual.robot_targets(coordinator, 0)
+        defaults = {"mode":"vacuum_mop", "suction":"max", "water":"high", "route":"standard", "repeat":2}
+        rooms, stages = manual.build_room_plan([{ "id":"0_1", "mode":"vacuum_then_mop" }, {"id":"0_2", "mode":"vacuum"}], defaults, caps, targets, 0)
+        self.assertEqual([stage["room_index"] for stage in stages], [0,0,0,0,1,1])
+        self.assertNotIn("water", rooms[1]["setup"])
+        with self.assertRaises(ValueError):
+            manual.build_room_plan([{ "id":"0_1", "mode":"vacuum", "water":"high" }], defaults, caps, targets, 0)
+
     def test_room_plan_rejects_unknown_duplicate_and_excess_rooms(self):
         vacuum, coordinator, entries, states, areas = self.fixture()
         caps, _, _ = manual.capabilities(vacuum, coordinator, entries, states, areas)
@@ -408,6 +419,52 @@ class ManagerTraceTests(unittest.IsolatedAsyncioTestCase):
         data = {"vacuum":"vacuum.robot", "source":"manual", "presets":[], "rooms":["office", "kitchen"],
                 "setup":{"mode":"vacuum", "suction":"max", "repeat":2}, **overrides}
         await self.manager.save_preset(NS(context=FakeContext("user"), data=data))
+
+    async def test_rejected_area_start_never_readdresses_an_active_room_plan(self):
+        await self.save_rooms()
+        await self.manager.control(NS(context=FakeContext("user"), data={"command":"toggle_saved", "vacuum":"vacuum.robot"}))
+        before = self.manager.queue.dump()
+        with self.assertRaises(ServiceError):
+            await self.start()
+        self.assertEqual(self.manager.queue.dump(), before)
+        await self.manager.tick()
+        self.assertEqual(self.segment_calls, [["0_1"]])
+        self.assertFalse(any(service == "clean_area" for _, service, _ in self.calls))
+
+    async def test_retired_routine_plan_never_turns_into_whole_home_clean(self):
+        self.manager.saved_presets = {"vacuum.robot": {"source":"preset", "rooms":[], "setup":{}, "presets":["button.old"]}}
+        with self.assertRaisesRegex(ServiceError, "retired"):
+            await self.manager.control(NS(context=FakeContext("user"), data={"command":"toggle_saved", "vacuum":"vacuum.robot"}))
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.manager.queue.phase, "idle")
+
+    async def test_deferred_configuration_resumes_only_unsent_settings(self):
+        original = self.hass.services.async_call
+        async def pause_entities(domain, service, data, **kwargs):
+            await original(domain, service, data, **kwargs)
+            if len(self.calls) == 1:
+                self.states["select.renamed_water"].state = "unavailable"
+        self.hass.services.async_call = pause_entities
+        await self.start()
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.manager.queue.phase, "preparing")
+        await self.manager.tick()
+        self.assertEqual(len(self.calls), 1)
+        self.states["select.renamed_water"].state = "medium"
+        await self.manager.tick()
+        self.assertEqual(len(self.calls), 4)
+        self.assertEqual(sum(data.get("entity_id") == "select.renamed_mode" for _, _, data in self.calls), 1)
+        await self.manager.tick()
+        self.assertEqual(self.calls[-1][1], "clean_area")
+        await self.manager.tick()
+        self.assertEqual(sum(service == "clean_area" for _, service, _ in self.calls), 1)
+
+    async def test_command_failure_never_leaks_payload_into_diagnostics(self):
+        self.fail_service = "set_fan_speed"
+        await self.start()
+        result = await self.manager.get_diagnostics(NS(data={"vacuum":"vacuum.robot"},context=NS(user_id=None,id="diag")))
+        self.assertNotIn("Sensitive", str(result))
+        self.assertEqual(self.manager.queue.phase, "attention")
 
     async def test_saved_room_plan_dispatches_robot_segments_not_areas(self):
         await self.save_rooms()

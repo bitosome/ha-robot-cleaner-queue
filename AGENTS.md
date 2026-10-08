@@ -6,8 +6,7 @@ Cleaner Card. The card itself, its design system and its frontend tests live in
 do not duplicate frontend code or design tokens here.
 
 Queue execution belongs in Home Assistant, never in browser timers. Commands, cleaning
-acknowledgement and completion are separate facts. Preserve Roborock routine settings by
-invoking configured preset button entities. Fail closed on errors, lost state or
+acknowledgement and completion are separate facts. Use native rooms/areas and explicit per-room settings; never reintroduce Roborock routine-button execution. Fail closed on errors, lost state or
 uncertain completion.
 
 Keep physical robot actions out of tests: use mock Home Assistant state and service

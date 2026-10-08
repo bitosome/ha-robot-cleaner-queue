@@ -59,7 +59,7 @@ Other commands:
 | `cancel` | Clear the remaining queue only. The current robot operation continues. |
 | `return_to_dock` | Clear the remaining queue first, then request docking when the robot's state permits it. Mop servicing and uncertain states are not interrupted. |
 
-The card contract is `control_version: 4`. Version 0.2.2 can pause/resume/dock an app-started job with an explicit vacuum. It stores `mode: external` without targets or stages; acknowledgement returns it to idle and cannot advance an old plan. Resume requires a paused, unfinished job. Active, attention and uncertain commands cannot be bypassed by controlling a different robot.
+The card contract is `control_version: 5`. Version 0.2.2 can pause/resume/dock an app-started job with an explicit vacuum. It stores `mode: external` without targets or stages; acknowledgement returns it to idle and cannot advance an old plan. Resume requires a paused, unfinished job. Active, attention and uncertain commands cannot be bypassed by controlling a different robot.
 
 For non-start commands, pass the same `vacuum` to protect against a card configured for another robot. An `attention` queue must be cleared with `cancel` before a new queue can start. Clearing an unacknowledged command preserves a safety barrier: another start requires that command's window to expire — fifteen minutes for a start or resume, ten minutes while settings are being applied, sixty seconds for a control command — and a new native poll after that window confirming idle/job-off. The barrier is released as soon as the robot is observed confirming that command, so a stop the robot has already acknowledged never delays docking. Cancelling cannot reuse a stale docked state to send a duplicate job. Only an idle/docked robot with no unfinished job can start a new sequence. Starts cannot replace an existing queue or unfinished job.
 
@@ -125,7 +125,7 @@ v0.3.0 retains the native dock fault identity. Roborock V1 `water_empty` (code 3
 
 `control: stop` differs from `cancel`: it cancels future stages and sends `vacuum.stop`, awaiting fresh idle/docked telemetry with `in_cleaning == 0`. It does not replace a command already awaiting acknowledgement, and `finish`/`toggle` refuse while a dock or settings reservation is still being confirmed instead of discarding its readback. Pause/Home do not require a healthy water tank; Resume still checks the cleaning mode.
 
-`robot_cleaner_queue.device_control` accepts `vacuum`, an allowlisted `control` and its native `value`. Registry unique IDs and config-entry ownership select the target; callers cannot pass arbitrary entity IDs. Settings/dock actions persist a `mode: device` reservation under the same queue lock, preserve the caller's permissions, and wait for fresh entity readback. Failure, timeout or restart requires review and retains the uncertainty barrier. A rejected concurrent command does not cancel an existing reservation. Read-only `get_capabilities` includes enabled/available, permission-filtered `device_entities` and `control_version: 4`.
+`robot_cleaner_queue.device_control` accepts `vacuum`, an allowlisted `control` and its native `value`. Registry unique IDs and config-entry ownership select the target; callers cannot pass arbitrary entity IDs. Settings/dock actions persist a `mode: device` reservation under the same queue lock, preserve the caller's permissions, and wait for fresh entity readback. Failure, timeout or restart requires review and retains the uncertainty barrier. A rejected concurrent command does not cancel an existing reservation. Read-only `get_capabilities` includes enabled/available, permission-filtered `device_entities` and `control_version: 5`.
 
 Dock starts require a docked idle robot with no unfinished job. Washing requires a healthy dock; emptying/drying may proceed with the specific water-empty warning. Turning an already-running dock action off does not require water. Native robot/dock firmware remains authoritative. `locate` plays a sound and does not adopt or advance any cleaning plan. Map images and maintenance values are read-only.
 
@@ -151,8 +151,17 @@ A dock that is servicing hides the native setting entities for a while. That is 
 
 ## Persisted plan — v0.4.0, rooms since v0.7.0
 
-`save_preset` stores one validated plan per vacuum in the separate version-1 HA store `robot_cleaner_queue_presets`. Writes share the controller lock, and the new plan is published to memory only after durable save. Saving requires control permissions and never writes robot settings. `get_capabilities` exposes the authorized saved plan, current map and control_version 4.
+`save_preset` stores one validated plan per vacuum in the separate version-1 HA store `robot_cleaner_queue_presets`. Writes share the controller lock, and the new plan is published to memory only after durable save. Saving requires control permissions and never writes robot settings. `get_capabilities` exposes the authorized saved plan, current map and control_version 5.
 
 A plan is `{"source": "rooms", "rooms": [...], "setup": {...}, "map_id": <flag>}`. The stored `rooms` are exactly what `start_manual` accepts: room requests, or Home Assistant area ids for a plan saved before rooms existed. `source: "manual"` is accepted as a legacy alias. The legacy `presets` field is ignored.
 
 `toggle` and `toggle_saved` are the wall-switch entry points and behave identically: while a job is active or uncertain they cancel and dock instead, and when idle they start the saved plan for that vacuum, failing with a validation error when no plan is saved. Plans retain map identity and are revalidated against the current map and robot rooms before running. Storage survives queue clearing and restarts without triggering a run.
+
+
+### Inline room-plan release (0.8.0)
+
+The service metadata and bundled wrapper now match the room schema: no `start` routine command or routine selectors. `save_preset` accepts `rooms` and `manual` sources; old app-routine plans are rejected before execution. Rejected starts preserve the existing queue's address mode. Per-room stage indices remain room indices even when a room has multiple passes.
+
+Configuration resumes only explicitly deferred, unsent setting writes. Successfully sent keys are not repeated; errors remain terminal and no uncertain start is retried. Native exception messages are omitted from diagnostic events. `get_diagnostics` refuses a different robot's bound queue.
+
+The native device allowlist includes selected map and optional off-peak controls. Discovery exposes available tank/attachment/history telemetry read-only. Selecting a map while a robot has an unfinished native job is rejected even if this queue is idle.

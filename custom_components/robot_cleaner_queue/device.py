@@ -10,10 +10,22 @@ CONTROLS = {
     "dnd": ("dnd_switch", "switch"), "dnd_start": ("dnd_start_time", "time"),
     "dnd_end": ("dnd_end_time", "time"), "volume": ("volume", "number"),
     "empty_mode": ("dust_collection_mode", "select"),
+    "selected_map": ("selected_map", "select"),
+    "off_peak": ("off_peak_switch", "switch"),
+    "off_peak_start": ("off_peak_start", "time"), "off_peak_end": ("off_peak_end", "time"),
 }
 MAINTENANCE = {key: (key, "sensor") for key in (
     "main_brush_time_left", "side_brush_time_left", "filter_time_left", "sensor_time_left",
     "strainer_time_left", "cleaning_brush_time_left")}
+TELEMETRY = {
+    "mop_attached": ("water_box_carriage_status", "binary_sensor"),
+    "water_box_attached": ("water_box_status", "binary_sensor"),
+    "clean_water_empty": ("clean_box_empty", "binary_sensor"),
+    "dirty_water_full": ("dirty_box_full", "binary_sensor"),
+    "drying_remaining": ("mop_clean_remaining", "sensor"),
+    "last_clean_begin": ("last_clean_start", "sensor"), "last_clean_end": ("last_clean_end", "sensor"),
+    **{key:(key,"sensor") for key in ("total_cleaning_time", "total_cleaning_area", "total_cleaning_count")},
+}
 DOCK = {"dust_emptying", "mop_washing", "mop_drying"}
 
 
@@ -27,7 +39,7 @@ def device_entities(vacuum_entry, coordinator, entries, states):
         state = states.get(entry.entity_id)
         if state is None or state.state in {"unavailable", "unknown"}:
             continue
-        for key, (prefix, domain) in {**CONTROLS, **MAINTENANCE}.items():
+        for key, (prefix, domain) in {**CONTROLS, **MAINTENANCE, **TELEMETRY}.items():
             if entry.domain == domain and entry.unique_id == f"{prefix}_{slug}":
                 result[key] = entry.entity_id
         if (entry.domain == "image" and entry.device_id == vacuum_entry.device_id

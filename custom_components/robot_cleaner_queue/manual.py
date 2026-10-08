@@ -333,7 +333,7 @@ def build_room_plan(requests: list, defaults: dict, caps: dict, targets: dict,
     if not isinstance(defaults, dict) or set(defaults) - {"mode", "suction", "water", "route", "repeat"}:
         raise ValueError("Unknown cleaning settings.")
     plan_rooms, stages, seen = [], [], set()
-    for request in requests:
+    for room_index, request in enumerate(requests):
         if not isinstance(request, dict) or not isinstance(request.get("id"), str):
             raise ValueError("Every room needs an id from get_capabilities.")
         room_id = request["id"]
@@ -345,7 +345,15 @@ def build_room_plan(requests: list, defaults: dict, caps: dict, targets: dict,
         seen.add(room_id)
         if room_id not in targets:
             raise ValueError("Every selected room must exist on the robot's current map.")
-        normalized, room_stages = build_plan([room_id], {**defaults, **spec}, caps, targets, map_id)
+        merged = {**defaults, **spec}
+        # Discard only inherited settings made irrelevant by an explicit room mode.
+        # Explicitly contradictory settings are still rejected by build_plan.
+        irrelevant = {"water", "route"} if merged.get("mode") == "vacuum" else {"suction"} if merged.get("mode") == "mop" else set()
+        for key in irrelevant - spec.keys():
+            merged.pop(key, None)
+        normalized, room_stages = build_plan([room_id], merged, caps, targets, map_id)
+        for stage in room_stages:
+            stage["room_index"] = room_index
         if len(stages) + len(room_stages) > 128:
             raise ValueError("The cleaning plan exceeds 128 stages.")
         plan_rooms.append({"id": room_id, "name": targets[room_id]["name"], "setup": normalized})

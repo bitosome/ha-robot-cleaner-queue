@@ -101,6 +101,11 @@ class Manager:
         self.last_published = None
         self.events: deque = deque(maxlen=100)
         self.last_observation: dict = {}
+        # Only resume configuration that was explicitly deferred before dispatch.
+        # Never retry a start or an uncertain service call; restarts require review.
+        self.deferred_configuration = None
+        self.configuration_token = None
+        self.configured_keys: set[str] = set()
 
     async def setup(self) -> None:
         try:
@@ -181,6 +186,8 @@ class Manager:
             await async_require_control(self.hass.auth, call.context.user_id, [vacuum], POLICY_CONTROL)
         except PermissionError as err:
             raise Unauthorized(context=call.context, permission=POLICY_CONTROL) from err
+        if self.queue.vacuum and self.queue.vacuum != vacuum:
+            raise ServiceValidationError("Diagnostics belong to a different robot.")
         current = self.current_snapshot(vacuum)
         return {
             "queue": self.queue.dump(),
@@ -189,7 +196,7 @@ class Manager:
                       "error": current.error, "dock_error": current.dock_error,
                       "connected": current.connected, "observed_at": current.observed_at,
                       "settings": dict(current.settings), "record": dict(current.record or {})},
-            "saved_presets": sorted(self.saved_presets) if isinstance(self.saved_presets, dict) else [],
+            "has_saved_plan": isinstance(self.saved_presets, dict) and vacuum in self.saved_presets,
         }
 
     @callback
@@ -306,6 +313,8 @@ class Manager:
             raise ValueError("Finish or clear the cleaning sequence before changing dock settings.")
         if not current.connected or current.vacuum in {"unknown", "unavailable"}:
             raise ValueError("The robot is unavailable.")
+        if key == "selected_map" and not current.ready_for("vacuum"):
+            raise ValueError("Finish the current job before changing maps.")
         if key in DOCK and value == "on":
             mode = "mop" if key == "mop_washing" else "vacuum"
             if current.vacuum != "docked" or not current.ready_for(mode):
@@ -347,6 +356,8 @@ class Manager:
                 if self.device_entities(vacuum).get(key) != entity_id:
                     raise ValueError("The native control changed before dispatch.")
                 current = self.current_snapshot(vacuum)
+                if key == "selected_map" and not current.ready_for("vacuum"):
+                    raise ValueError("The robot became busy before the map change.")
                 if key in DOCK and value == "on" and (current.vacuum != "docked" or not current.ready_for("mop" if key == "mop_washing" else "vacuum")):
                     raise ValueError("The robot became busy before the dock command.")
                 context = Context(user_id=call.context.user_id, parent_id=call.context.id)
@@ -453,6 +464,8 @@ class Manager:
                     saved_plan = self.saved_presets.get(vacuum)
                     if not saved_plan:
                         raise ServiceValidationError("No cleaning plan is saved for this robot. Save one from the card first.")
+                    if not isinstance(saved_plan, dict) or saved_plan.get("source") not in {"rooms", "manual"}:
+                        raise ServiceValidationError("The saved plan uses retired Roborock routines. Select rooms and save a new plan from the card.")
                     missing = [key for key in ("rooms", "setup")
                                if not isinstance(saved_plan, dict) or key not in saved_plan]
                     if missing:
@@ -463,8 +476,6 @@ class Manager:
             standalone = command in {"pause", "resume", "return_to_dock", "stop"} and not owned_plan
             if standalone and not data.get("vacuum"):
                 raise ServiceValidationError("Specify a vacuum when controlling a job outside an active queue.")
-            if command == "start_manual":
-                self.queue.address = "room" if any(isinstance(item, dict) for item in data.get("rooms", [])) else "area"
             if command != "start_manual" and bound and self.queue.vacuum and vacuum != self.queue.vacuum:
                 raise ServiceValidationError("This command targets a different vacuum than the current queue.")
             permission_entities = [vacuum, *(self.queue.control_entities.values()
@@ -498,7 +509,9 @@ class Manager:
                             await async_require_control(self.hass.auth, call.context.user_id, list(controls.values()), POLICY_CONTROL)
                         except PermissionError as err:
                             raise Unauthorized(context=call.context, permission=POLICY_CONTROL) from err
+                        address = "room" if requests and all(isinstance(item, dict) for item in requests) else "area"
                         effect = self.queue.start_manual(vacuum, data["rooms"], setup, stages, controls, current, time.time(), uuid4().hex)
+                        self.queue.address = address
                         self.queue.owner_user_id = call.context.user_id
                     elif standalone:
                         effect = self.queue.external_control(command, vacuum, current, time.time(), uuid4().hex)
@@ -540,6 +553,12 @@ class Manager:
             self.contexts.add(context.id)
             if len(self.contexts) > 128:
                 self.contexts = {context.id}
+            if kind == "configure":
+                token = (self.queue.run_id, self.queue.current_index, self.queue.command_at)
+                if token != self.configuration_token:
+                    self.configuration_token = token
+                    self.configured_keys = set()
+                self.deferred_configuration = None
             if kind in {"manual", "configure"}:
                 caps, controls, targets, map_id = self.manual_capabilities(self.queue.vacuum)
                 if self.queue.address == "room":
@@ -547,9 +566,13 @@ class Manager:
                 if caps.get("unavailable_controls"):
                     self.event("settings-deferred", "native setting entities are unavailable: %s; waiting"
                                % ", ".join(caps["unavailable_controls"]), logging.INFO)
+                    if kind == "configure":
+                        self.deferred_configuration = (token, effect)
                     return
                 validate_stage(self.queue.stage, caps, targets, map_id)
                 if self.control_state(controls) == "waiting":
+                    if kind == "configure":
+                        self.deferred_configuration = (token, effect)
                     return
                 if controls != self.queue.control_entities:
                     raise ValueError("The native manual control entities changed.")
@@ -558,7 +581,7 @@ class Manager:
                 if kind == "configure":
                     # High-level mode resets lower-level settings: always set it first.
                     for key in ("mode", "suction", "water", "route"):
-                        if key not in self.queue.stage["settings"]:
+                        if key not in self.queue.stage["settings"] or key in self.configured_keys:
                             continue
                         await authorize()
                         if not self.effect_valid(effect):
@@ -570,8 +593,12 @@ class Manager:
                         latest_caps, latest_controls, latest_targets, latest_map = self.manual_capabilities(self.queue.vacuum)
                         if self.queue.address == "room":
                             latest_targets = robot_targets(self.resolve(self.queue.vacuum)[2], latest_map)
+                        if latest_caps.get("unavailable_controls"):
+                            self.deferred_configuration = (token, effect)
+                            return
                         validate_stage(self.queue.stage, latest_caps, latest_targets, latest_map)
                         if self.control_state(latest_controls) == "waiting":
+                            self.deferred_configuration = (token, effect)
                             return
                         if latest_controls != self.queue.control_entities:
                             raise ValueError("Manual control entities changed during setup.")
@@ -580,6 +607,7 @@ class Manager:
                             await self.hass.services.async_call("vacuum", "set_fan_speed", {"entity_id": self.queue.vacuum, "fan_speed": value}, blocking=True, context=context)
                         else:
                             await self.hass.services.async_call("select", "select_option", {"entity_id": controls[key], "option": value}, blocking=True, context=context)
+                        self.configured_keys.add(key)
                     # Tick uses freshly observed settings before issuing any start.
                     return
                 current = self.current_snapshot(self.queue.vacuum)
@@ -609,10 +637,9 @@ class Manager:
             self.queue.attention("The initiating user can no longer control this cleaning sequence. No further command was sent.")
             await self.publish()
         except Exception as err:  # noqa: BLE001 - reported, never retried automatically
-            # The log keeps the real cause; the sensor only names the exception type, so
-            # a private payload can never reach an attribute or a service response.
-            _LOGGER.exception("Robot queue command %s failed for %s: %s", effect, self.queue.vacuum, err)
-            self.event("command-failed", "%s raised %s: %s" % (effect, type(err).__name__, err), logging.WARNING)
+            # Native exceptions can contain credentials, map payloads or user data.
+            # Keep the operation and exception type, not the raw payload or traceback.
+            self.event("command-failed", "%s raised %s" % (kind, type(err).__name__), logging.WARNING)
             self.queue.attention("The command failed or could not be confirmed (%s). Check the robot before retrying; "
                                  "no automatic retry was sent." % type(err).__name__)
             await self.publish()
@@ -634,6 +661,13 @@ class Manager:
             await self.publish()
             if effect:
                 await self.execute(effect)
+            elif self.deferred_configuration:
+                token, deferred = self.deferred_configuration
+                current_token = (self.queue.run_id, self.queue.current_index, self.queue.command_at)
+                if token == current_token and self.effect_valid(deferred):
+                    await self.execute(deferred)
+                else:
+                    self.deferred_configuration = None
 
     @callback
     def external_command(self, event) -> None:

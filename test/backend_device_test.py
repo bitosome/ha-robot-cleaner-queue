@@ -98,6 +98,23 @@ class DeviceTests(unittest.IsolatedAsyncioTestCase):
         e.disabled_by=None;e.unique_id="mop_washing_other_robot"
         self.assertNotIn("mop_washing",self.manager.device_entities("vacuum.robot"))
 
+    async def test_map_change_rejected_during_native_cleaning_without_queue_mutation(self):
+        self.states["vacuum.robot"].state = "cleaning"
+        self.coordinator.data.status.state_name = "segment_cleaning"
+        self.coordinator.data.status.in_cleaning = 1
+        before = self.manager.queue.dump()
+        with self.assertRaisesRegex(m.ServiceError,"current job"):
+            await self.send("selected_map", "smart")
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.manager.queue.dump(), before)
+
+    async def test_map_and_off_peak_use_only_discovered_native_controls(self):
+        for key, value, service in [("selected_map","smart","select_option"),("off_peak","on","turn_on"),("off_peak_start","01:30","set_value")]:
+            await self.send(key,value)
+            self.assertEqual(self.calls[-1][1],service)
+            await self.manager.tick()
+            self.assertEqual(self.manager.queue.phase,"idle")
+
     async def test_named_map_requires_same_robot_device_and_entry(self):
         image=NS(entity_id="image.renamed_map",unique_id="robot1_map_Ground floor",device_id="device",config_entry_id="entry",platform="roborock",domain="image",disabled_by=None)
         self.registry.entities[image.entity_id]=image

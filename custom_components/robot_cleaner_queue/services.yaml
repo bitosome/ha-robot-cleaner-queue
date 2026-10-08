@@ -1,36 +1,41 @@
 control:
   name: Control cleaning queue
-  description: Start ordered saved presets or a manual cleaning plan, pause, resume, clear remaining jobs, or return to dock.
+  description: Start an ordered native room/area plan, pause, resume, clear future
+    work, stop or return to dock.
   fields:
     command:
       required: true
       selector:
         select:
-          options: [start, start_manual, pause, resume, cancel, return_to_dock, stop, toggle, toggle_saved]
+          options:
+          - start_manual
+          - pause
+          - resume
+          - cancel
+          - return_to_dock
+          - stop
+          - toggle
+          - toggle_saved
     vacuum:
       selector:
         entity:
           domain: vacuum
           integration: roborock
-    presets:
-      description: Ordered routine button entity IDs. Required for start and the idle branch of toggle; one room per routine.
-      selector:
-        entity:
-          domain: button
-          integration: roborock
-          multiple: true
     rooms:
-      description: Ordered Home Assistant area IDs for start_manual; empty means the whole current map. Each area must be mapped to this vacuum.
+      description: Ordered room objects with id and per-room settings, or legacy mapped-area
+        IDs. An explicitly empty list through this API cleans the current map.
       selector:
-        area:
-          multiple: true
+        object: {}
     setup:
-      description: Manual mode, suction, water, route and repeat options returned by get_capabilities. Used only by start_manual.
+      description: Manual mode, suction, water, route and repeat options returned
+        by get_capabilities. Used only by start_manual.
       selector:
         object: {}
 get_capabilities:
   name: Get manual cleaning capabilities
-  description: Read cached native cleaning modes, settings and mapped areas for the current map. Does not change settings, switch maps, poll or start the robot. Returns a response.
+  description: Read cached native cleaning modes, settings and mapped areas for the
+    current map. Does not change settings, switch maps, poll or start the robot. Returns
+    a response.
   fields:
     vacuum:
       required: true
@@ -38,10 +43,10 @@ get_capabilities:
         entity:
           domain: vacuum
           integration: roborock
-
 device_control:
   name: Control native robot and dock
-  description: Change one available native control, or find the robot. Dock and settings commands share the queue lock and wait for native readback; no automatic retries.
+  description: Change one available native control, or find the robot. Dock and settings
+    commands share the queue lock and wait for native readback; no automatic retries.
   fields:
     vacuum:
       required: true
@@ -53,15 +58,30 @@ device_control:
       required: true
       selector:
         select:
-          options: [locate, dust_emptying, mop_washing, mop_drying, volume, dnd, dnd_start, dnd_end, child_lock, empty_mode]
+          options:
+          - locate
+          - dust_emptying
+          - mop_washing
+          - mop_drying
+          - volume
+          - dnd
+          - dnd_start
+          - dnd_end
+          - child_lock
+          - empty_mode
+          - selected_map
+          - off_peak
+          - off_peak_start
+          - off_peak_end
     value:
-      description: Switches use on/off; volume uses a number; times use HH:MM; empty_mode uses a native option. Omit for locate.
+      description: Switches use on/off; volume uses a number; times use HH:MM; empty_mode
+        uses a native option. Omit for locate.
       selector:
         text: {}
-
 save_preset:
-  name: Save cleaning preset
-  description: Save this robot's room order and manual settings in Home Assistant for reuse by the card and hardware toggle. Does not start cleaning or change robot settings. Replaces its previous saved preset.
+  name: Save cleaning plan
+  description: Save one validated native room/area plan for this robot, without changing
+    settings or starting cleaning. Replaces the previous saved plan.
   fields:
     vacuum:
       required: true
@@ -73,16 +93,23 @@ save_preset:
       required: true
       selector:
         select:
-          options: [preset, manual]
-    presets:
-      selector:
-        entity:
-          domain: button
-          multiple: true
+          options:
+          - rooms
+          - manual
     rooms:
       selector:
-        area:
-          multiple: true
+        object: {}
     setup:
       selector:
         object: {}
+get_diagnostics:
+  name: Get queue diagnostics
+  description: Read the queue and recent controller events for the authorized robot.
+    No robot commands.
+  fields:
+    vacuum:
+      required: true
+      selector:
+        entity:
+          domain: vacuum
+          integration: roborock

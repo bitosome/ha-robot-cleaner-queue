@@ -1,7 +1,4 @@
-# Install custom_components/robot_cleaner_queue first, include this package, then restart HA.
-# No physical command runs during setup or restart. See docs/queue-backend.md.
 robot_cleaner_queue: {}
-
 script:
   robot_cleaner_queue_control:
     alias: Robot cleaner queue control
@@ -13,41 +10,39 @@ script:
         required: true
         selector:
           select:
-            options: [start, start_manual, pause, resume, cancel, return_to_dock, stop]
+            options:
+            - start_manual
+            - pause
+            - resume
+            - cancel
+            - return_to_dock
+            - stop
+            - toggle_saved
       vacuum:
         selector:
           entity:
             domain: vacuum
             integration: roborock
-      presets:
-        selector:
-          entity:
-            domain: button
-            integration: roborock
-            multiple: true
       rooms:
-        description: Ordered mapped area IDs for manual cleaning; empty means whole home.
+        description: Ordered native room objects or mapped-area IDs.
         selector:
-          area:
-            multiple: true
+          object: null
       setup:
         description: Manual cleaning settings from robot_cleaner_queue.get_capabilities.
         selector:
-          # Keep a null selector config: HA package merging drops empty mappings.
           object: null
     sequence:
-      - choose:
-          - conditions: "{{ command == 'start_manual' }}"
-            sequence:
-              - action: robot_cleaner_queue.control
-                data:
-                  command: start_manual
-                  vacuum: "{{ vacuum }}"
-                  rooms: "{{ rooms | default([]) }}"
-                  setup: "{{ setup }}"
-        default:
-          - action: robot_cleaner_queue.control
-            data:
-              command: "{{ command }}"
-              vacuum: "{{ vacuum | default('') }}"
-              presets: "{{ presets | default([]) }}"
+    - choose:
+      - conditions: '{{ command == ''start_manual'' }}'
+        sequence:
+        - action: robot_cleaner_queue.control
+          data:
+            command: start_manual
+            vacuum: '{{ vacuum }}'
+            rooms: '{{ rooms | default([]) }}'
+            setup: '{{ setup | default({}) }}'
+      default:
+      - action: robot_cleaner_queue.control
+        data:
+          command: '{{ command }}'
+          vacuum: '{{ vacuum | default('''') }}'

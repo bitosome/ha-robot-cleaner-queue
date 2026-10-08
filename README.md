@@ -40,7 +40,7 @@ Installation and restart send no robot command. Afterwards, `sensor.robot_cleane
 - **Home Assistant 2026.9.0 or later**, verified against Core 2026.9.4 with python-roborock 7.4.2.
 - **The native Roborock integration** connected to a **V1-protocol** robot. The integration reads that coordinator's cached state only: no credentials, no cloud client, no extra polling and no modification of the native integration. An unfamiliar coordinator shape fails closed instead of guessing.
 - **A robot with named rooms on its current map.** Rooms are read from the map the Roborock app maintains, so nothing has to be rebuilt in Home Assistant and app routines are not needed.
-- **Mapped Home Assistant areas for manual queues.** Manual cleaning calls `vacuum.clean_area`, so Home Assistant's own area mapping connects areas to robot rooms, and an area is offered only when every Roborock room it maps to exists on the robot's current map. Map areas to rooms in the vacuum entity's settings; `get_capabilities` reports what is mapped, which robot rooms no area covers, and which mapped areas the robot no longer reports.
+- **Mapped Home Assistant areas only for legacy area queues.** Manual cleaning calls `vacuum.clean_area`, so Home Assistant's own area mapping connects areas to robot rooms, and an area is offered only when every Roborock room it maps to exists on the robot's current map. Map areas to rooms in the vacuum entity's settings; `get_capabilities` reports what is mapped, which robot rooms no area covers, and which mapped areas the robot no longer reports.
 - **Home Assistant permissions** to control the vacuum and its setting entities. The initiating user is checked at acceptance, before every later dispatch and before any dock or settings change.
 
 **Optional but recommended**
@@ -60,7 +60,8 @@ Installation and restart send no robot command. Afterwards, `sensor.robot_cleane
 | `robot_cleaner_queue.control` | `start_manual`, `pause`, `resume`, `cancel`, `return_to_dock`, `stop`, `toggle`, `toggle_saved` |
 | `robot_cleaner_queue.device_control` | Allowlisted dock and robot settings (mop washing, child lock, DND, volume, …) |
 | `robot_cleaner_queue.save_preset` | Store one validated plan per vacuum |
-| `robot_cleaner_queue.get_capabilities` | Read-only capabilities, manual options, and the zones-and-areas report |
+| `robot_cleaner_queue.get_capabilities` | Read-only capabilities, manual options, native control discovery and zones-and-areas report |
+| `robot_cleaner_queue.get_diagnostics` | Authorized robot’s queue and recent controller events |
 
 ```yaml
 action: robot_cleaner_queue.control
@@ -99,6 +100,8 @@ Set the `custom_components.robot_cleaner_queue` logger to `debug` for a step-by-
 ## Tests
 
 ```sh
+python3 -m pip install voluptuous
+python3 -B test/backend_schema_test.py
 python3 -B test/backend_queue_test.py
 python3 -B test/backend_manual_test.py
 python3 -B test/backend_controls_test.py
@@ -110,3 +113,13 @@ These are offline event traces against the production transition code with simul
 ## License
 
 MIT
+
+## Room-plan updates in 0.8.0
+
+Room plans finish all passes of one room before advancing, preserving the actual room index across repeated and vacuum-then-mop stages. Inherited settings irrelevant to a room's mode are omitted; explicitly contradictory settings are rejected. Rejected starts cannot change the address mode of a running plan.
+
+Temporarily unavailable dock setting entities can defer configuration. Only settings not yet sent resume when those entities return; failed/uncertain calls and physical starts are never automatically repeated. Raw native exceptions are excluded from diagnostics because they may contain private payloads.
+
+Retired saved Roborock routine plans are rejected with instructions to save a new room plan. `toggle_saved` never guesses a whole-house fallback. The service name `save_preset` and existing storage key are retained for compatibility. No routine buttons are pressed.
+
+Device discovery now includes map selection, optional off-peak charging/times, and read-only attachment, tank, drying and cleaning-history sensors. Disabled native entities remain disabled. Map changes are rejected during unfinished jobs. The frontend README contains the supported-feature matrix and explicit Roborock-app-only limitations.
