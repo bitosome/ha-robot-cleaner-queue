@@ -191,7 +191,9 @@ class StandaloneEngineTests(unittest.TestCase):
         self.assertEqual(queue.dump(), before)
         queue.next_pending = True
         queue.current_index = queue.completed = 1
-        self.assertEqual(queue.command("resume", state("docked", "charging", "off"), 150), ("configure", "1"))
+        self.assertIsNone(queue.command("resume", state("docked", "charging", "off"), 150))
+        self.assertIsNone(queue.observe(state("docked", "charging", "off", observed_at=150), 150))
+        self.assertEqual(queue.observe(state("docked", "charging", "off", observed_at=166), 166), ("configure", "1"))
 
 
 class FinishEngineTests(unittest.TestCase):

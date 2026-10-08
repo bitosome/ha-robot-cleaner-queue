@@ -28,6 +28,11 @@ class QueueSensor(SensorEntity):
         queue = self.manager.queue
         return {
             "control_version": 5,
+            "execution_version": 2,
+            "floor_cleaning_complete": bool(queue.stages) and queue.completed == len(queue.stages),
+            "start_uncertain": queue.start_uncertain,
+            "command_failure": dict(queue.command_failure),
+            **self.manager.robot_state,
             "preferences_revisions": {key: value["revision"] for key, value in self.manager.preferences.items()},
             "saved_plan_revisions": {key: value.get("revision", 0) for key, value in self.manager.saved_presets.items()},
             "vacuum": queue.vacuum,

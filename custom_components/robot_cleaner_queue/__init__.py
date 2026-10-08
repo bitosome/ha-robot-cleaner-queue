@@ -21,6 +21,7 @@ from homeassistant.helpers.storage import Store
 from .adapter import is_competing_command, routine_matches, snapshot
 from .engine import ACTIVE, ACK_SECONDS, Queue, Snapshot
 from .device import CONTROLS, DOCK, device_entities, device_command
+from .errors import command_failure_metadata
 from .permissions import async_require_control
 from .manual import build_plan, build_room_plan, cached_settings, capabilities, current_map, robot_targets, validate_stage
 
@@ -110,6 +111,8 @@ class Manager:
         self.coordinator = None
         self.coordinator_unsub = None
         self.last_published = None
+        self.robot_state: dict = {}
+        self.last_robot_published: dict = {}
         self.events: deque = deque(maxlen=100)
         self.last_observation: dict = {}
         # Only resume configuration that was explicitly deferred before dispatch.
@@ -117,6 +120,7 @@ class Manager:
         self.deferred_configuration = None
         self.configuration_token = None
         self.configured_keys: set[str] = set()
+        self.start_dispatch_token = None
 
     async def setup(self) -> None:
         await self.load_preferences()
@@ -202,7 +206,8 @@ class Manager:
             "robot": {"vacuum": current.vacuum, "status": current.status, "job": current.job,
                       "error": current.error, "dock_error": current.dock_error,
                       "connected": current.connected, "observed_at": current.observed_at,
-                      "settings": dict(current.settings), "record": dict(current.record or {})},
+                      "settings": dict(current.settings), "record": dict(current.record or {}),
+                      "dock_drying": current.dock_drying},
             "has_saved_plan": isinstance(self.saved_presets, dict) and vacuum in self.saved_presets,
         }
 
@@ -214,6 +219,10 @@ class Manager:
     async def publish(self) -> None:
         data = self.queue.dump()
         if data == self.last_published:
+            if self.robot_state != self.last_robot_published:
+                self.last_robot_published = dict(self.robot_state)
+                for listener in list(self.listeners):
+                    listener()
             return
         # Persist before sending a new physical command or exposing the transition.
         try:
@@ -226,6 +235,7 @@ class Manager:
                 listener()
             return
         self.last_published = data
+        self.last_robot_published = dict(self.robot_state)
         for listener in list(self.listeners):
             listener()
 
@@ -256,6 +266,7 @@ class Manager:
             caps, controls, _, _ = self.manual_capabilities(call.data["vacuum"])
             await async_require_control(self.hass.auth, call.context.user_id, list(controls.values()), POLICY_CONTROL)
             caps["control_version"] = 5
+            caps["execution_version"] = 2
             caps["current_map"] = current_map(self.resolve(call.data["vacuum"])[2])[0]
             caps["saved_preset"] = await self.read_saved_preset(call.data["vacuum"], call.context.user_id)
             caps["saved_plan_revision"] = (caps["saved_preset"] or {}).get("revision", 0)
@@ -524,6 +535,7 @@ class Manager:
         state = self.hass.states.get(vacuum)
         current = snapshot(coordinator, state.state if state else "unavailable")
         current.settings = self.observed_settings(vacuum, state, coordinator)
+        self.robot_state = {"dock_status": current.status, "dock_drying": current.dock_drying}
         return current
 
     def observed_settings(self, vacuum: str, state, coordinator) -> dict:
@@ -645,11 +657,27 @@ class Manager:
                     and self.queue.mode == "manual" and target == str(self.queue.current_index))
         return kind == "vacuum" and bool(self.queue.pending_command)
 
+    async def clear_unsent_start(self, token) -> None:
+        """An interrupted reservation is not an uncertain physical start."""
+        current = (self.queue.run_id, self.queue.current_index, self.queue.command_at)
+        if (token == current and token != self.start_dispatch_token
+                and self.queue.phase in {"attention", "cancelled"}
+                and not self.queue.pending_command and self.queue.not_before):
+            self.queue.confirmed()
+            await self.publish()
+
     async def execute(self, effect: tuple[str, str], parent: Context | None = None) -> None:
         kind, target = effect
+        start_token = (self.queue.run_id, self.queue.current_index, self.queue.command_at)
         if not self.effect_valid(effect):
+            if kind == "manual":
+                await self.clear_unsent_start(start_token)
             return
+        if kind == "manual" and start_token == self.start_dispatch_token:
+            return  # A native start is never retried, including after an exception.
         user_id = parent.user_id if parent is not None else self.queue.owner_user_id
+        attempted = False
+        setting = None
         async def authorize():
             await async_require_control(self.hass.auth, user_id,
                 [self.queue.vacuum, *self.queue.control_entities.values()], POLICY_CONTROL)
@@ -679,12 +707,14 @@ class Manager:
                                % ", ".join(caps["unavailable_controls"]), logging.INFO)
                     if kind == "configure":
                         self.deferred_configuration = (token, effect)
-                    return
+                        return
+                    raise ValueError("Native controls are temporarily unavailable. No start was sent.")
                 validate_stage(self.queue.stage, caps, targets, map_id)
                 if self.control_state(controls) == "waiting":
                     if kind == "configure":
                         self.deferred_configuration = (token, effect)
-                    return
+                        return
+                    raise ValueError("Native controls are temporarily unavailable. No start was sent.")
                 if controls != self.queue.control_entities:
                     raise ValueError("The native manual control entities changed.")
                 if not self.current_snapshot(self.queue.vacuum).ready_for(self.queue.cleaning_mode):
@@ -731,6 +761,8 @@ class Manager:
                             return
                         if not current.ready_for(self.queue.cleaning_mode):
                             raise ValueError("The robot became busy before applying manual settings.")
+                        attempted = True
+                        setting = key
                         if key == "suction":
                             await self.hass.services.async_call("vacuum", "set_fan_speed", {"entity_id": self.queue.vacuum, "fan_speed": value}, blocking=True, context=context)
                         else:
@@ -749,41 +781,71 @@ class Manager:
                     # entity takes "<map>_<room>" ids and ignores other maps, while the
                     # Q-series entities take bare segment ids. `coordinator.api` exists
                     # only for the Q-series classes.
+                    attempted = True
+                    self.start_dispatch_token = start_token
                     await entity.async_clean_segments([area])
                 else:
                     data = {"entity_id": self.queue.vacuum}
                     if area:
                         data["cleaning_area_id"] = [area]
+                    attempted = True
+                    self.start_dispatch_token = start_token
                     await self.hass.services.async_call("vacuum", "clean_area" if area else "start", data, blocking=True, context=context)
             else:
                 current = self.current_snapshot(self.queue.vacuum)
                 self.queue._validate_command_barrier(current, time.time())
                 if not self.queue.validate_control_state(self.queue.pending_command, current):
                     return
+                attempted = True
                 await self.hass.services.async_call("vacuum", target, {"entity_id": self.queue.vacuum}, blocking=True, context=context)
         except PermissionError:
+            if kind == "manual" and not attempted:
+                self.queue.confirmed()  # A reserved start that never reached the native API.
             self.queue.attention("The initiating user can no longer control this cleaning sequence. No further command was sent.")
             await self.publish()
-        except Exception as err:  # noqa: BLE001 - reported, never retried automatically
-            # Native exceptions can contain credentials, map payloads or user data.
-            # Keep the operation and exception type, not the raw payload or traceback.
-            self.event("command-failed", "%s raised %s" % (kind, type(err).__name__), logging.WARNING)
-            self.queue.attention("The command failed or could not be confirmed (%s). Check the robot before retrying; "
-                                 "no automatic retry was sent." % type(err).__name__)
+        except Exception as err:  # noqa: BLE001 - observe uncertain starts, never resend
+            # HA wraps native errors, and its transport may already have fallen back
+            # between local/cloud. Even a rejection cannot prove no earlier attempt
+            # was accepted. Preserve safe cause metadata, never messages/payloads.
+            failure = command_failure_metadata(err, kind if kind != "vacuum" else self.queue.pending_command)
+            failure["attempted"] = attempted
+            failure["time"] = time.time()
+            if setting is not None:
+                failure["setting"] = setting
+            self.queue.command_failure = failure
+            self.event("command-failed", str(failure), logging.WARNING)
+            if kind == "manual" and attempted and self.effect_valid(effect):
+                self.queue.start_uncertain = True
+                self.queue.decision = "The start response is uncertain; watching native status without resending."
+            else:
+                if kind == "manual" and not attempted:
+                    self.queue.confirmed()
+                self.queue.attention("The %s command %s (%s). Check the robot; no automatic retry was sent." % (
+                    "room start" if kind == "manual" else "settings" if kind == "configure" else "robot",
+                    "failed or could not be confirmed" if attempted else "was not sent",
+                    failure["category"]))
             await self.publish()
+        finally:
+            if kind == "manual" and not attempted:
+                await self.clear_unsent_start(start_token)
 
     async def tick(self, _now=None) -> None:
-        if self.closing or not self.queue.vacuum or self.queue.phase not in ACTIVE and not self.queue.pending_command:
+        if self.closing or not self.queue.vacuum:
             return
         async with self.lock:
-            if self.queue.mode == "device":
-                self.observe_device()
-                await self.publish()
-                return
             try:
                 current = self.current_snapshot(self.queue.vacuum)
             except ValueError:
                 current = Snapshot()
+                self.robot_state = {"dock_status": "unavailable", "dock_drying": None}
+            if self.queue.mode == "device":
+                if self.queue.pending_command:
+                    self.observe_device()
+                await self.publish()
+                return
+            if self.queue.phase not in ACTIVE and not self.queue.pending_command:
+                await self.publish()  # Keep native dock care visible after floor completion.
+                return
             self.observe_log(current)
             effect = self.queue.observe(current, time.time())
             await self.publish()

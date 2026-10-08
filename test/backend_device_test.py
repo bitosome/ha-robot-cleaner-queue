@@ -36,15 +36,19 @@ class PolicyTests(unittest.TestCase):
         stages=[{"target":x,"mode":"vacuum","settings":{"mode":"vacuum"}} for x in ["office","kitchen"]]
         q.start_manual("vacuum.robot",["office","kitchen"],{"mode":"vacuum"},stages,{},current,100,"run")
         current.settings={"mode":"vacuum"};current.observed_at=101
-        self.assertEqual(q.observe(current,101),("manual","0"))
-        active=cleaning();active.dock_error="water_empty";active.observed_at=105
-        q.observe(active,105)
-        current.record=record(101,200)
+        self.assertIsNone(q.observe(current,101))
+        current.observed_at=117
+        self.assertEqual(q.observe(current,117),("manual","0"))
+        active=cleaning();active.dock_error="water_empty";active.observed_at=120
+        q.observe(active,120)
+        current.record=record(117,200);current.observed_at=201
         q.observe(current,201)
         self.assertEqual(q.completed,1)
-        self.assertEqual(q.observe(current,202),("configure","1"))
+        self.assertIsNone(q.observe(current,202))
+        current.observed_at=218
+        self.assertEqual(q.observe(current,218),("configure","1"))
         current.dock_error="error"
-        self.assertIsNone(q.observe(current,203));self.assertEqual(q.phase,"attention")
+        self.assertIsNone(q.observe(current,219));self.assertEqual(q.phase,"attention")
 
     def test_stop_clears_future_stages_and_requires_fresh_ack(self):
         q=Queue(mode="manual",phase="running",vacuum="vacuum.robot",targets=["0_1","0_2"],
@@ -188,11 +192,12 @@ class DeviceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WaterManagerTests(unittest.IsolatedAsyncioTestCase):
+    advance = m.ManagerTraceTests.advance
     async def test_vacuum_water_exception_covers_settings_and_final_dispatch(self):
         await m.ManagerTraceTests.asyncSetUp(self)
         self.coordinator.data.status.dock_error_status=38
         await m.ManagerTraceTests.start(self,setup={"mode":"vacuum","suction":"max"})
-        await self.manager.tick()
+        await m.ManagerTraceTests.settle(self)
         self.assertEqual(self.calls[-1][1],"clean_area")
         self.assertEqual(self.calls[0][2]["option"],"vacuum")
         self.assertFalse(any(domain=="button" for domain,_,_ in self.calls))

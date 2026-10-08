@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-ACTIVE = {"preparing", "starting", "running", "paused", "controlling"}
+ACTIVE = {"preparing", "starting", "running", "paused", "controlling", "finishing"}
 READY_STATUS = {"idle", "charging", "charging_complete"}
 CLEANING_STATUS = {
     "cleaning", "spot_cleaning", "segment_cleaning", "zoned_cleaning",
@@ -13,16 +13,20 @@ CLEANING_STATUS = {
     "zoned_mopping", "zoned_clean_mop_cleaning", "zoned_clean_mop_mopping",
 }
 START_STATUS = CLEANING_STATUS | {
-    "starting", "charger_disconnected", "going_to_target", "washing_the_mop",
+    "starting", "charger_disconnected", "going_to_target", "washing_the_mop", "washing_the_mop_2",
     "going_to_wash_the_mop", "back_to_dock_washing_duster", "attaching_the_mop",
     "detaching_the_mop",
 }
 # Post-clean care may begin just after a transient charging observation.
-DOCK_CARE_STATUS = {"emptying_the_bin", "washing_the_mop", "attaching_the_mop",
+DOCK_CARE_STATUS = {"emptying_the_bin", "washing_the_mop", "washing_the_mop_2", "attaching_the_mop",
                     "detaching_the_mop", "air_drying_stopping"}
 SUCCESS_REASONS = {52, 54, 55, 56, 57}
 ACK_SECONDS = 60
 FINISH_SECONDS = 180
+# Docking can briefly report charging before dust emptying/mop care starts. Require
+# both elapsed ready time and a later native observation, never repeated cached ticks.
+READY_SETTLE_SECONDS = 15
+DOCK_FINISH_SECONDS = 1800
 # A dispatched routine can take minutes to become visible. Immediately after a
 # completed room the robot may still be washing or drying its mop, emptying dust or
 # topping up its battery, and it ignores a routine until that servicing ends. A real
@@ -51,6 +55,7 @@ class Snapshot:
     record: dict[str, Any] | None = None
     observed_at: float = 0
     settings: dict[str, str] = field(default_factory=dict)
+    dock_drying: bool | None = None
 
     @property
     def robot_healthy(self) -> bool:
@@ -107,6 +112,11 @@ class Queue:
     not_before: float = 0
     barrier_window: float = 0
     settings_sent_at: float = 0
+    ready_since: float = 0
+    ready_observed_at: float = 0
+    dock_finish_at: float = 0
+    command_failure: dict[str, Any] = field(default_factory=dict)
+    start_uncertain: bool = False
     decision: str = ""
     address: str = ""
     owner_user_id: str | None = None
@@ -132,12 +142,35 @@ class Queue:
         self.error = message
         self.pending_command = ""
         self.next_pending = False
+        self.start_uncertain = False
+        self._reset_ready()
 
     def confirmed(self) -> None:
         """The outstanding command was observed, so nothing about it is uncertain."""
         self.pending_command = ""
         self.not_before = 0
         self.barrier_window = 0
+        self.start_uncertain = False
+
+    def _reset_ready(self) -> None:
+        self.ready_since = self.ready_observed_at = 0
+
+    def _ready_settled(self, snapshot: Snapshot, now: float, after: float = 0) -> bool:
+        """Only fresh observations spanning the settle window can authorize a step."""
+        if not snapshot.ready_for(self.cleaning_mode):
+            self._reset_ready()
+            return False
+        if after > self.ready_since:
+            self._reset_ready()
+        if snapshot.observed_at <= 0 or snapshot.observed_at < after:
+            return False
+        if not self.ready_since:
+            self.ready_since = now
+            self.ready_observed_at = snapshot.observed_at
+            return False
+        return (now >= self.ready_since + READY_SETTLE_SECONDS
+                and snapshot.observed_at >= self.ready_since + READY_SETTLE_SECONDS
+                and snapshot.observed_at > self.ready_observed_at)
 
     def ack_window(self) -> float:
         """How long a dispatched command may take to become observable."""
@@ -201,7 +234,8 @@ class Queue:
         self.current_index = self.completed = 0
         self.next_pending = self.seen_job = False
         self.pending_command, self.error = "", ""
-        self.barrier_window = 0
+        self.start_uncertain = False
+        self._reset_ready()
         self.started_at = now
         return self._observe_finish(snapshot, now)
 
@@ -227,7 +261,7 @@ class Queue:
             elif now - self.command_at >= ACK_SECONDS:
                 self.attention("Cleaning sequence cancelled, but the robot did not confirm finishing. Check it; no retry was sent.")
             return None
-        servicing = snapshot.status in {"washing_the_mop", "attaching_the_mop", "detaching_the_mop", "emptying_the_bin"}
+        servicing = snapshot.status in DOCK_CARE_STATUS
         if servicing or snapshot.vacuum == "returning":
             return None  # Do not interrupt dock care or issue duplicate home commands.
         if snapshot.vacuum == "docked" and snapshot.job == "off":
@@ -269,6 +303,9 @@ class Queue:
         self.seen_job = self.next_pending = False
         self.not_before = self.barrier_window = 0
         self.error = ""
+        self.command_failure = {}
+        self.start_uncertain = False
+        self._reset_ready()
         self.pending_command, self.command_at = command, now
         return "vacuum", {"pause": "pause", "resume": "start", "return_to_dock": "return_to_base", "stop": "stop"}[command]
 
@@ -327,7 +364,7 @@ class Queue:
         self.control_entities = dict(control_entities)
         self.current_index = self.completed = 0
         self.error = ""
-        self.not_before = self.barrier_window = 0
+        self.not_before = self.barrier_window = self.dock_finish_at = 0
         return self._dispatch(snapshot, now)
 
     @property
@@ -335,18 +372,24 @@ class Queue:
         """The mode of the job being dispatched, not the plan's first setting."""
         if self.mode != "manual":
             return "vacuum"
+        if self.stages and self.completed == len(self.stages):
+            return self.stages[-1].get("mode") or "vacuum"
         return self.stage.get("mode") or self.setup.get("mode") or "vacuum"
 
     @property
     def stage(self) -> dict:
-        return self.stages[self.current_index] if self.mode == "manual" and self.current_index < len(self.stages) else {}
+        return self.stages[self.current_index] if self.mode == "manual" and 0 <= self.current_index < len(self.stages) else {}
 
     def _dispatch(self, snapshot: Snapshot, now: float) -> tuple[str, str]:
         """Every plan applies its stage settings first and then starts that room."""
         self.phase = "preparing"
         self.pending_command = "configure"
         self.command_at = now
+        self.settings_sent_at = 0
         self.next_pending = False
+        self.command_failure = {}
+        self.start_uncertain = False
+        self._reset_ready()
         return "configure", str(self.current_index)
 
     def _start_job(self, snapshot: Snapshot, now: float) -> tuple[str, str]:
@@ -373,6 +416,8 @@ class Queue:
             return "vacuum", "stop"
         if command == "cancel":
             self._preserve_command_barrier()
+            self.start_uncertain = False
+            self._reset_ready()
             self.phase = "cancelled"
             self.pending_command = ""
             self.next_pending = False
@@ -403,6 +448,7 @@ class Queue:
                 raise ValueError("The queue is not ready to pause.")
             if self.next_pending:
                 self.phase = "paused"
+                self._reset_ready()
                 return None
             if not snapshot.robot_healthy or snapshot.status not in CLEANING_STATUS | {"returning_home", "docking"}:
                 raise ValueError("Pause is available while cleaning or returning; wait for mop servicing to finish.")
@@ -416,7 +462,9 @@ class Queue:
             if self.next_pending:
                 if not snapshot.ready_for(self.cleaning_mode):
                     raise ValueError("The robot is not ready for the next room.")
-                return self._dispatch(snapshot, now)
+                self.phase = "running"
+                self._reset_ready()
+                return None  # Fresh settled readiness is checked by observe before dispatch.
             if not snapshot.healthy_for(self.cleaning_mode) or snapshot.vacuum != "paused" or snapshot.status != "paused" or snapshot.job != "on":
                 raise ValueError("The robot must confirm a paused, unfinished cleaning job before resuming.")
             self.phase = "starting"
@@ -424,6 +472,26 @@ class Queue:
             self.command_at = now
             return "vacuum", "start"
         raise ValueError("Unknown queue command.")
+
+    def _observe_dock_completion(self, snapshot: Snapshot, now: float) -> None:
+        """Observe native return/care after the last floor pass; never send motion."""
+        if now - self.dock_finish_at >= DOCK_FINISH_SECONDS:
+            self.attention("Floor cleaning finished, but return and dock care were not confirmed within 30 minutes. Check the robot; no command was sent.")
+            return
+        if snapshot.job == "on" or snapshot.status in CLEANING_STATUS:
+            self.attention("Another cleaning job appeared after the final pass. Check the robot; no further command was sent.")
+            return
+        if snapshot.status == "paused" or snapshot.vacuum == "paused":
+            self.attention("The robot paused before final docking was confirmed. Check the robot; no further command was sent.")
+            return
+        if snapshot.vacuum == "docked" and self._ready_settled(snapshot, now, self.dock_finish_at):
+            self.phase = "completed"
+            self.decision = "floor cleaning and final docking confirmed"
+            return
+        if snapshot.vacuum != "docked" or not snapshot.ready_for(self.cleaning_mode):
+            self._reset_ready()
+        self.decision = ("floor cleaning finished; waiting for final return and dock care "
+                         "(vacuum=%s status=%s job=%s)" % (snapshot.vacuum, snapshot.status, snapshot.job))
 
     def observe(self, snapshot: Snapshot, now: float) -> tuple[str, str] | None:
         if self.mode == "finish":
@@ -453,8 +521,12 @@ class Queue:
             self.decision = "stopped: robot, dock or telemetry unhealthy (vacuum=%s status=%s job=%s error=%s dock=%s connected=%s)" % (
                 snapshot.vacuum, snapshot.status, snapshot.job, snapshot.error, snapshot.dock_error, snapshot.connected)
             return None
+        if self.phase == "finishing":
+            self._observe_dock_completion(snapshot, now)
+            return None
         if self.pending_command == "configure":
             if snapshot.servicing_for(self.cleaning_mode):
+                self._reset_ready()
                 self.decision = "waiting for dock care before applying manual settings: %s" % snapshot.status
                 if now - self.command_at >= CONFIGURE_SECONDS:
                     self.attention("Dock care did not finish within %d minutes while preparing the next pass. No cleaning was started."
@@ -463,11 +535,16 @@ class Queue:
                 self.attention("The robot became busy while manual settings were being applied. No cleaning was started.")
                 self.decision = "stopped: robot left the ready state while applying settings (vacuum=%s status=%s job=%s)" % (
                     snapshot.vacuum, snapshot.status, snapshot.job)
-            elif snapshot.observed_at >= self.command_at and all(
+            elif snapshot.observed_at >= max(self.command_at, self.settings_sent_at) and all(
                 snapshot.settings.get(key) == value for key, value in self.stage.get("settings", {}).items()
             ):
-                return self._start_job(snapshot, now)
+                if self._ready_settled(snapshot, now, max(self.command_at, self.settings_sent_at)):
+                    return self._start_job(snapshot, now)
+                self.decision = "manual settings confirmed; waiting for settled readiness and a fresh robot update"
+                if now - self.command_at >= CONFIGURE_SECONDS:
+                    self.attention("The robot did not remain ready with fresh settings within 10 minutes. No cleaning was started.")
             else:
+                self._reset_ready()
                 missing = sorted(key for key, value in self.stage.get("settings", {}).items()
                                  if snapshot.settings.get(key) != value)
                 self.decision = "waiting for manual settings readback: %s (observed settings %s)" % (
@@ -512,13 +589,15 @@ class Queue:
             self.phase = "paused"
             return None
         if self.next_pending:
-            if snapshot.job == "on":
+            if now - self.finish_wait_at >= DOCK_FINISH_SECONDS:
+                self.attention("The robot did not confirm settled readiness for the next pass within 30 minutes. No further cleaning was started.")
+            elif snapshot.job == "on":
                 self.attention("Another job started before the next queued room. The queue was stopped.")
                 self.decision = "stopped: another job started before the next room (status=%s)" % snapshot.status
-            elif snapshot.ready_for(self.cleaning_mode):
+            elif self._ready_settled(snapshot, now, self.finish_wait_at):
                 return self._dispatch(snapshot, now)
             else:
-                self.decision = "waiting for the robot to be ready for the next room (vacuum=%s status=%s job=%s dock=%s)" % (
+                self.decision = "waiting for settled readiness before the next pass (vacuum=%s status=%s job=%s dock=%s)" % (
                     snapshot.vacuum, snapshot.status, snapshot.job, snapshot.dock_error)
             return None
         if snapshot.job == "on":
@@ -555,10 +634,14 @@ class Queue:
             self.attention("The cleaning job was interrupted, failed, or did not report successful completion. No next room was started.")
             return None
         self.completed += 1
-        if self.completed == len(self.stages):
-            self.phase = "completed"
-            return None
         self.current_index += 1
+        self._reset_ready()
+        if self.completed == len(self.stages):
+            self.phase = "finishing"
+            self.dock_finish_at = now
+            self.decision = "floor cleaning finished; waiting for final return and dock care"
+            return None
+        self.finish_wait_at = now
         self.next_pending = True
         # Deliberately wait for the next observation and for dock/idle readiness.
         return None

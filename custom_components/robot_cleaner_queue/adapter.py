@@ -37,6 +37,8 @@ def snapshot(coordinator: Any, vacuum_state: str) -> Snapshot:
         dock_error="ok" if dock_error in (None, 0) else "water_empty" if dock_error == 38 else
                    (getattr(getattr(status, "dock_error_status", None), "name", None) or "error"),
         connected=bool(getattr(coordinator, "last_update_success", False)),
+        dock_drying=(None if getattr(status, "dry_status", None) is None
+                     else bool(getattr(status, "dry_status"))),
         record=clean_record(getattr(getattr(data, "clean_summary", None), "last_clean_record", None)),
         observed_at=(getattr(coordinator, "_last_update_success_time", None).timestamp()
                      if getattr(coordinator, "_last_update_success_time", None) is not None else 0),

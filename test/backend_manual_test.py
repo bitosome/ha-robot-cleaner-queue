@@ -289,15 +289,25 @@ class ManualEngineTests(unittest.TestCase):
         mismatch = self.configured(queue)
         mismatch.settings["suction"] = "quiet"
         self.assertIsNone(queue.observe(mismatch, 115))
-        self.assertEqual(queue.observe(self.configured(queue), 120), ("manual", "0"))
-        queue.observe(cleaning(), 125)
-        queue.observe(ready(record(120, 200)), 210)
-        self.assertEqual(queue.observe(ready(record(120, 200)), 220), ("configure", "1"))
+        self.assertIsNone(queue.observe(self.configured(queue, 120), 120))
+        self.assertEqual(queue.observe(self.configured(queue, 136), 136), ("manual", "0"))
+        queue.observe(cleaning(), 140)
+        done = ready(record(136, 200)); done.observed_at = 210
+        queue.observe(done, 210)
+        self.assertIsNone(queue.observe(done, 210))
+        done.observed_at = 226
+        self.assertEqual(queue.observe(done, 226), ("configure", "1"))
         self.assertEqual(queue.stage["mode"], "mop")
-        self.assertEqual(queue.observe(self.configured(queue, 225), 230), ("manual", "1"))
-        queue.observe(cleaning(), 235)
-        queue.observe(ready(record(230, 300)), 310)
-        self.assertEqual((queue.phase, queue.completed), ("completed", 2))
+        self.assertIsNone(queue.observe(self.configured(queue, 230), 230))
+        self.assertEqual(queue.observe(self.configured(queue, 246), 246), ("manual", "1"))
+        queue.observe(cleaning(), 250)
+        done = ready(record(246, 300)); done.observed_at = 310
+        queue.observe(done, 310)
+        self.assertEqual((queue.phase, queue.completed), ("finishing", 2))
+        self.assertIsNone(queue.observe(done, 310))
+        done.observed_at = 326
+        queue.observe(done, 326)
+        self.assertEqual(queue.phase, "completed")
 
     def test_prepare_timeout_busy_robot_cancel_restart_no_cleaning(self):
         for outcome in ["timeout", "busy", "cancel", "restart"]:
@@ -316,8 +326,9 @@ class ManualEngineTests(unittest.TestCase):
     def test_failed_vacuum_pass_never_starts_mop(self):
         queue = self.plan()
         queue.observe(self.configured(queue), 110)
-        queue.observe(cleaning(), 120)
-        queue.observe(ready(record(110, 200, complete=0, finish_reason=21)), 210)
+        queue.observe(self.configured(queue, 126), 126)
+        queue.observe(cleaning(), 130)
+        queue.observe(ready(record(126, 200, complete=0, finish_reason=21)), 210)
         self.assertEqual((queue.phase, queue.completed, queue.current_index), ("attention", 0, 0))
 
     def test_active_plan_cannot_be_replaced_by_another(self):
@@ -352,6 +363,7 @@ def manager_class():
     definition = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Manager")
     env = dict(asyncio=asyncio, time=time, logging=logging, deque=deque, uuid4=uuid4, Store=FakeStore,
                Queue=Queue, Snapshot=Snapshot, ACTIVE=load("engine").ACTIVE,
+               command_failure_metadata=load("errors").command_failure_metadata,
                ACK_SECONDS=60, CONTROLS=device.CONTROLS, DOCK=device.DOCK, device_entities=device.device_entities, device_command=device.device_command,
                DOMAIN="robot_cleaner_queue", HomeAssistant=object, ServiceCall=object, Context=FakeContext, callback=lambda f:f,
                ar=NS(async_get=lambda hass: hass.areas), ServiceValidationError=ServiceError, Unauthorized=ServiceError,
@@ -366,6 +378,7 @@ def manager_class():
 
 class ManagerTraceTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        self.clock = float(int(time.time()))
         self.vacuum, self.coordinator, self.entries, self.states, self.areas, self.registry = fixture()
         self.calls = []
         self.allowed = {e.entity_id for e in self.entries}
@@ -393,7 +406,7 @@ class ManagerTraceTests(unittest.IsolatedAsyncioTestCase):
             elif service == "set_fan_speed":
                 status.fan_speed_name = data["fan_speed"]
                 self.states["vacuum.robot"].attributes["fan_speed"] = data["fan_speed"]
-            self.coordinator._last_update_success_time = datetime.now(timezone.utc)
+            self.coordinator._last_update_success_time = datetime.fromtimestamp(self.clock, timezone.utc)
             if getattr(self, "interrupt_after", None) == len(self.calls):
                 self.manager.queue.attention("External command")
             if getattr(self, "revoke_after", None) == len(self.calls):
@@ -409,7 +422,19 @@ class ManagerTraceTests(unittest.IsolatedAsyncioTestCase):
                        services=NS(async_call=call), async_create_task=asyncio.create_task,
                        data={"vacuum": NS(get_entity=lambda entity_id: self.vacuum_entity)})
         self.manager = manager_class()(self.hass)
+        self.manager.execute.__func__.__globals__["time"] = NS(time=lambda: self.clock, strftime=time.strftime)
+        self.coordinator._last_update_success_time = datetime.fromtimestamp(self.clock, timezone.utc)
         self.manager.resolve = lambda vacuum: (self.registry, self.vacuum, self.coordinator)
+
+    async def advance(self, seconds=16):
+        """Advance both wall time and the native observation; cached ticks are insufficient."""
+        self.clock += seconds
+        self.coordinator._last_update_success_time = datetime.fromtimestamp(self.clock, timezone.utc)
+        await self.manager.tick()
+
+    async def settle(self):
+        await self.manager.tick()
+        await self.advance()
 
     async def start(self, rooms=None, setup=None):
         await self.manager.control(NS(context=FakeContext("user"), data={"command": "start_manual", "vacuum": "vacuum.robot", "presets": [],
@@ -428,7 +453,7 @@ class ManagerTraceTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ServiceError):
             await self.start()
         self.assertEqual(self.manager.queue.dump(), before)
-        await self.manager.tick()
+        await self.settle()
         self.assertEqual(self.segment_calls, [["0_1"]])
         self.assertFalse(any(service == "clean_area" for _, service, _ in self.calls))
 
@@ -455,7 +480,7 @@ class ManagerTraceTests(unittest.IsolatedAsyncioTestCase):
         await self.manager.tick()
         self.assertEqual(len(self.calls), 4)
         self.assertEqual(sum(data.get("entity_id") == "select.renamed_mode" for _, _, data in self.calls), 1)
-        await self.manager.tick()
+        await self.settle()
         self.assertEqual(self.calls[-1][1], "clean_area")
         await self.manager.tick()
         self.assertEqual(sum(service == "clean_area" for _, service, _ in self.calls), 1)
@@ -470,19 +495,18 @@ class ManagerTraceTests(unittest.IsolatedAsyncioTestCase):
         self.hass.services.async_call = dock_race
         await self.start(rooms=[{"id":"0_1","mode":"vacuum_then_mop","suction":"max","water":"high","route":"standard"},
                                 {"id":"0_3","mode":"vacuum","suction":"max"}])
-        await self.manager.tick()
+        await self.settle()
         self.assertEqual(self.segment_calls, [["0_1"]])
         status.state_name, status.in_cleaning = "segment_cleaning", 1
         self.states["vacuum.robot"].state = "cleaning"
-        self.coordinator._last_update_success_time = datetime.now(timezone.utc)
-        await self.manager.tick()  # Start acknowledgement.
+        await self.advance(1)  # Fresh start acknowledgement.
         await self.manager.tick()  # Observe the active job.
         started = self.manager.queue.started_at
         status.state_name, status.in_cleaning = "charging", 0
         self.states["vacuum.robot"].state = "docked"
         self.coordinator.data.clean_summary.last_clean_record = NS(**record(started, started + 1))
-        await self.manager.tick()  # Completion, then a separate observation to configure.
-        await self.manager.tick()
+        await self.advance(2)  # Completion, then fresh settled readiness to configure.
+        await self.settle()
         self.assertEqual(self.manager.queue.current_index, 1)
         self.assertEqual(self.manager.queue.phase, "preparing")
         self.assertEqual(self.manager.configured_keys, {"mode"})
@@ -492,8 +516,8 @@ class ManagerTraceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.calls), sent, "Do not write settings during dock care")
         self.assertEqual(self.segment_calls, [["0_1"]])
         status.state_name = "charging"
-        await self.manager.tick()  # Resume only water and route; never repeat mode.
-        await self.manager.tick()
+        await self.advance(30)  # Resume only water and route; never repeat mode.
+        await self.settle()
         self.assertEqual(self.segment_calls, [["0_1"], ["0_1"]])
         self.assertEqual(sum(data.get("option") == "mop" for _, _, data in self.calls), 1)
         self.assertEqual(self.states["select.renamed_water"].state, "high")
@@ -658,7 +682,7 @@ class ManagerTraceTests(unittest.IsolatedAsyncioTestCase):
         self.coordinator.data.status.dock_error_status = 38      # water empty: vacuuming may proceed
         await self.manager.control(NS(context=FakeContext("user"), data={"command":"toggle_saved", "vacuum":"vacuum.robot"}))
         self.assertEqual(self.manager.queue.address, "room")
-        await self.manager.tick()
+        await self.settle()
         # The native entity is called with the room's own id: the V1 entity parses
         # "<map>_<room>" and ignores other maps, the Q-series take bare segment ids.
         self.assertEqual(self.segment_calls, [["0_1"]])
@@ -760,14 +784,14 @@ class ManagerTraceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([(d,s) for d,s,_ in self.calls], [("select", "select_option"), ("vacuum", "set_fan_speed"), ("select", "select_option"), ("select", "select_option")])
         self.assertEqual(self.calls[0][2]["option"], "vac_and_mop")
         self.assertEqual(self.manager.queue.phase, "preparing")
-        await self.manager.tick()
+        await self.settle()
         self.assertEqual(self.calls[-1], ("vacuum", "clean_area", {"entity_id": "vacuum.robot", "cleaning_area_id": ["kitchen"]}))
         self.assertEqual(self.manager.queue.pending_command, "start")
         self.assertFalse(any(domain == "button" for domain, _, _ in self.calls))
 
     async def test_whole_home_uses_native_start_and_saved_settings(self):
         await self.start(rooms=[], setup={"mode": "vacuum", "suction": "max", "repeat": 2})
-        await self.manager.tick()
+        await self.settle()
         self.assertEqual(self.calls[-1], ("vacuum", "start", {"entity_id": "vacuum.robot"}))
         self.assertEqual(len(self.manager.queue.stages), 2)
         self.assertEqual(self.manager.store.saved[-1]["owner_user_id"], "user")
@@ -792,7 +816,7 @@ class ManagerTraceTests(unittest.IsolatedAsyncioTestCase):
     async def test_map_change_between_settings_and_start_never_starts(self):
         await self.start()
         self.coordinator.properties_api.maps.current_map = 1
-        await self.manager.tick()
+        await self.settle()
         self.assertEqual(self.manager.queue.phase, "attention")
         self.assertFalse(any(service in {"start", "clean_area"} for _, service, _ in self.calls))
 
@@ -823,6 +847,141 @@ class ManagerTraceTests(unittest.IsolatedAsyncioTestCase):
         self.manager.external_command(event)
         self.assertEqual(self.manager.queue.phase, "attention")
         await asyncio.sleep(0)
+
+    async def test_start_exception_observes_late_success_without_resending(self):
+        self.fail_service = "clean_area"
+        await self.start()
+        await self.settle()
+        queue = self.manager.queue
+        self.assertEqual((queue.phase, queue.pending_command, queue.start_uncertain), ("starting", "start", True))
+        self.assertEqual(queue.command_failure["attempted"], True)
+        self.assertNotIn("Sensitive", str(queue.dump()))
+        original_command_at = queue.command_at
+        await self.advance(30)
+        self.assertEqual(queue.command_at, original_command_at)
+        self.assertEqual(sum(service == "clean_area" for _, service, _ in self.calls), 1)
+        self.states["vacuum.robot"].state = "cleaning"
+        status = self.coordinator.properties_api.status
+        status.state_name, status.in_cleaning = "segment_cleaning", 1
+        await self.advance()
+        self.assertEqual((queue.phase, queue.start_uncertain), ("running", False))
+        self.assertEqual(queue.pending_command, "")
+        self.assertEqual(sum(service == "clean_area" for _, service, _ in self.calls), 1)
+
+    async def test_uncertain_start_times_out_at_original_deadline_and_survives_restart(self):
+        self.fail_service = "start"
+        await self.start(rooms=[], setup={"mode":"vacuum"})
+        await self.settle()
+        queue = self.manager.queue
+        self.assertTrue(queue.start_uncertain)
+        restored = Queue.restore(queue.dump())
+        self.assertEqual(restored.phase, "attention")
+        self.assertEqual(restored.command_failure, queue.command_failure)
+        self.assertGreater(restored.not_before, self.clock)
+        await self.advance(901)
+        self.assertEqual(queue.phase, "attention")
+        self.assertIn("did not start", queue.error)
+        self.assertEqual(sum(service == "start" for _, service, _ in self.calls), 1)
+
+    async def test_pre_dispatch_validation_failure_does_not_create_motion_barrier(self):
+        await self.start()
+        self.coordinator.properties_api.maps.current_map = 1
+        await self.settle()
+        queue = self.manager.queue
+        self.assertEqual(queue.phase, "attention")
+        self.assertFalse(queue.command_failure["attempted"])
+        self.assertEqual(queue.not_before, 0)
+        self.assertIn("was not sent", queue.error)
+        self.assertFalse(any(service in {"start", "clean_area"} for _, service, _ in self.calls))
+
+    async def test_post_clean_drying_updates_without_writes_or_motion(self):
+        queue = self.manager.queue
+        queue.vacuum, queue.phase = "vacuum.robot", "completed"
+        await self.manager.publish()
+        notifications = []
+        self.manager.subscribe(lambda: notifications.append(dict(self.manager.robot_state)))
+        before = len(self.manager.store.saved)
+        self.coordinator.properties_api.status.dry_status = 1
+        await self.manager.tick()
+        self.assertEqual(notifications[-1], {"dock_status":"charging", "dock_drying":True})
+        self.coordinator.properties_api.status.dry_status = 0
+        await self.advance()
+        self.assertEqual(notifications[-1]["dock_drying"], False)
+        self.assertEqual(len(self.manager.store.saved), before)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.segment_calls, [])
+
+    async def test_completed_device_reservation_still_reports_native_dock_care(self):
+        queue = self.manager.queue
+        queue.vacuum, queue.mode, queue.phase = "vacuum.robot", "device", "idle"
+        queue.command_at = self.clock - 120
+        self.coordinator.properties_api.status.state_name = "washing_the_mop"
+        await self.manager.tick()
+        self.assertEqual(queue.phase, "idle")
+        self.assertEqual(self.manager.robot_state["dock_status"], "washing_the_mop")
+        self.assertEqual(self.calls, [])
+
+    async def test_setting_error_keeps_safe_setting_and_cause_metadata(self):
+        self.fail_service = "set_fan_speed"
+        await self.start()
+        queue = self.manager.queue
+        self.assertEqual(queue.command_failure["operation"], "configure")
+        self.assertEqual(queue.command_failure["setting"], "suction")
+        self.assertFalse(queue.start_uncertain)
+        self.assertEqual(queue.phase, "attention")
+        self.assertEqual(Queue.restore(queue.dump()).command_failure, queue.command_failure)
+        self.assertGreater(queue.not_before, self.clock)
+        self.assertLessEqual(queue.not_before - self.clock, 60)
+
+    async def test_native_room_start_retains_wrapped_robot_code_without_resending(self):
+        native_error = type("RoborockInvalidStatus", (Exception,), {"__module__":"roborock.exceptions"})
+        wrapper = type("HomeAssistantError", (Exception,), {"__module__":"homeassistant.exceptions"})
+        async def fail_start(ids):
+            self.segment_calls.append(list(ids))
+            error = wrapper("SECRET native payload")
+            error.translation_domain, error.translation_key = "roborock", "command_failed"
+            raise error from native_error({"code":-10007, "message":"SECRET device data"})
+        self.vacuum_entity.async_clean_segments = fail_start
+        await self.start(rooms=[{"id":"0_1", "mode":"mop"}])
+        await self.settle()
+        queue = self.manager.queue
+        self.assertEqual(queue.command_failure["codes"], [-10007])
+        self.assertTrue(queue.start_uncertain, "A native rejection may follow an earlier accepted transport attempt")
+        self.assertNotIn("SECRET", str(queue.dump()))
+        await self.manager.execute(("manual", "0"))
+        await self.advance(30)
+        self.assertEqual(self.segment_calls, [["0_1"]])
+        self.assertEqual(queue.phase, "starting")
+
+    async def test_interruption_before_native_call_clears_only_unsent_reservation(self):
+        await self.start()
+        original = self.hass.auth.async_get_user
+        async def interrupt(user):
+            if self.manager.queue.phase == "starting":
+                self.manager.queue.attention("An external controller interrupted before dispatch")
+            return await original(user)
+        self.hass.auth.async_get_user = interrupt
+        await self.settle()
+        queue = self.manager.queue
+        self.assertEqual(queue.phase, "attention")
+        self.assertEqual(queue.not_before, 0)
+        self.assertFalse(any(service == "clean_area" for _, service, _ in self.calls))
+
+    async def test_unavailable_controls_after_reservation_do_not_fake_a_dispatched_start(self):
+        await self.start()
+        original = self.manager.manual_capabilities
+        def missing(vacuum):
+            caps, controls, targets, map_id = original(vacuum)
+            if self.manager.queue.pending_command == "start":
+                caps = {**caps, "unavailable_controls":["water"]}
+            return caps, controls, targets, map_id
+        self.manager.manual_capabilities = missing
+        await self.settle()
+        queue = self.manager.queue
+        self.assertEqual(queue.phase, "attention")
+        self.assertFalse(queue.command_failure["attempted"])
+        self.assertEqual(queue.not_before, 0)
+        self.assertFalse(any(service == "clean_area" for _, service, _ in self.calls))
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

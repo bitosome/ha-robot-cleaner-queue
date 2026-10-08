@@ -213,3 +213,40 @@ all effective settings, including defaults, so later robot setting changes canno
 alter the wall-switch plan. Area plans retain `source: manual`; native room plans use
 `source: rooms`. Unreadable plan or preference storage is preserved and cannot be
 overwritten by a subsequent save.
+
+
+### Readiness, finishing and uncertain starts (v0.10.0)
+
+After each floor pass, the next stage waits for healthy, job-off readiness to hold
+for at least 15 seconds and be confirmed by a newer native observation. Settings
+readback uses the same gate after the latest settings write. Repeated ticks over
+one cached state cannot qualify. Observed dock care resets the gate; passive mop
+drying does not block another clean. Dock readiness waits are bounded and do not
+send a cleaning command while waiting.
+
+The last successful floor record enters `finishing`, an active phase with all
+stages complete. Native return, mop washing and dust emptying remain visible;
+`completed` requires fresh settled docking/job-off readiness. This observes dock
+care rather than forcing it or claiming that every possible dock action ran.
+Drying remains visible independently after completion. A 30-minute failure to
+confirm final docking requires attention. Restart never resumes a sequence.
+
+`get_capabilities.execution_version: 2` and the queue sensor's matching attribute
+identify this contract. Sensor attributes include `floor_cleaning_complete`,
+`dock_status`, nullable `dock_drying`, `start_uncertain`, and `command_failure`.
+Dock telemetry continues to update when the floor sequence is inactive without
+persisting unchanged queue state on every native poll.
+
+A failure after entering the native room-start API leaves the original start
+under observation, without resending or extending its acknowledgement deadline.
+A late native acknowledgement can continue the sequence; timeout still requires
+attention. Native transports may fall back internally, and HA may fail while
+refreshing after a successful send, so even a rejection code does not prove that
+no earlier attempt was accepted. Validation or interruption before dispatch does
+not create a motion uncertainty barrier.
+
+Failure metadata survives restart in the queue store. It contains bounded,
+allowlisted exception types, numeric error codes, translation keys, operation,
+setting key where applicable, attempt flag and timestamp. Raw error messages,
+service payloads, traceback contents, credentials and placeholders are excluded.
+Categories are diagnostic only and never authorize a retry.
