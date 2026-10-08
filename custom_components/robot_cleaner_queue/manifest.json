@@ -1,7 +1,7 @@
 {
   "domain": "robot_cleaner_queue",
   "name": "Robot Cleaner Queue",
-  "version": "0.5.4",
+  "version": "0.6.0",
   "documentation": "https://github.com/bitosome/ha-robot-cleaner-queue/blob/main/docs/queue-backend.md",
   "issue_tracker": "https://github.com/bitosome/ha-robot-cleaner-queue/issues",
   "codeowners": [

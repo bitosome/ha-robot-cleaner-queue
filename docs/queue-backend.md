@@ -124,6 +124,25 @@ v0.3.0 retains the native dock fault identity. Roborock V1 `water_empty` (code 3
 Dock starts require a docked idle robot with no unfinished job. Washing requires a healthy dock; emptying/drying may proceed with the specific water-empty warning. Turning an already-running dock action off does not require water. Native robot/dock firmware remains authoritative. `locate` plays a sound and does not adopt or advance any cleaning plan. Map images and maintenance values are read-only.
 
 
+## Diagnosing a stopped sequence
+
+Every step is logged under the `custom_components.robot_cleaner_queue` logger, and the queue keeps the last 100 steps in memory:
+
+- **DEBUG** — each observation that differs from the previous one: robot state, status, job flag, fault, dock state, observation time, the cleaning record, and the engine's own reason for the current state (`decision`).
+- **INFO** — every received command with its caller, the dispatch of each room, and deferrals such as *"native setting entities are unavailable: water; waiting"*.
+- **WARNING** — a refusal or a failed command, with the full traceback in the log. The sensor only names the exception type, so no private payload reaches an attribute.
+
+```yaml
+action: robot_cleaner_queue.get_diagnostics
+data:
+  vacuum: vacuum.robot
+response_variable: diagnostics
+```
+
+The response contains the persisted `queue`, the `robot` observation, the saved preset keys, and up to 100 `events` with time, kind, detail, phase, decision, pending command, room index and completed count — enough to reconstruct what a stopped sequence was waiting for without reading the log.
+
+A dock that is servicing hides the native setting entities for a while. That is not a plan change: a manual stage waits for them (logging the deferral) instead of stopping, and the settings readback window is 10 minutes because writing settings is not motion. A sequence that does stop keeps the real cause in the log while the sensor stays sanitised.
+
 ## Persisted preset — v0.4.0
 
 `save_preset` stores one validated plan per vacuum in the separate version-1 HA store `robot_cleaner_queue_presets`. Writes share the controller lock, and the new plan is published to memory only after durable save. Saving requires control permissions and never writes robot settings. `get_capabilities` exposes the authorized saved plan, current map and control_version 4. `toggle_saved` chooses finish/start atomically; only its idle branch reads the saved plan, then normal start validation and dispatch permissions apply. Manual plans retain map identity and are revalidated against current area mappings/settings. A supplied routine list is used only if no saved plan exists. Storage survives queue clearing and restarts without triggering a run.

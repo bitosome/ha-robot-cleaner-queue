@@ -32,6 +32,9 @@ START_SECONDS = 900
 # Preparation is measured from the dispatch, and a slow start may consume the whole
 # start window before the job itself turns on.
 PREPARE_SECONDS = START_SECONDS + 600
+# Writing settings is not motion, and a servicing dock can hide the native setting
+# entities for minutes, so the readback is awaited patiently rather than abandoned.
+CONFIGURE_SECONDS = 600
 
 
 @dataclass
@@ -95,6 +98,7 @@ class Queue:
     run_id: str = ""
     not_before: float = 0
     barrier_window: float = 0
+    decision: str = ""
     owner_user_id: str | None = None
 
     def dump(self) -> dict[str, Any]:
@@ -330,6 +334,7 @@ class Queue:
         return self._start_job(snapshot, now)
 
     def _start_job(self, snapshot: Snapshot, now: float) -> tuple[str, str]:
+        self.decision = "dispatching room %d" % (self.current_index + 1)
         self.phase = "starting"
         self.pending_command = "start"
         self.command_at = self.started_at = now
@@ -419,23 +424,36 @@ class Queue:
             fresh = snapshot.observed_at == 0 or snapshot.observed_at >= self.command_at
             if fresh and snapshot.vacuum in {"docked", "returning"}:
                 self.confirmed()
-            elif not snapshot.robot_healthy or now - self.command_at >= ACK_SECONDS:
-                self.attention("Return to dock was not confirmed. The remaining queue has been cleared; check the robot.")
+                self.decision = "return to dock confirmed"
+            else:
+                self.decision = "waiting for the dock command to be confirmed (%ds)" % int(now - self.command_at)
+                if not snapshot.robot_healthy or now - self.command_at >= ACK_SECONDS:
+                    self.attention("Return to dock was not confirmed. The remaining queue has been cleared; check the robot.")
             return None
         if self.phase not in ACTIVE:
             return None
         if not snapshot.healthy_for(self.cleaning_mode):
             self.attention("The robot or dock has a fault, or telemetry is unavailable. The queue is stopped for review.")
+            self.decision = "stopped: robot, dock or telemetry unhealthy (vacuum=%s status=%s job=%s error=%s dock=%s connected=%s)" % (
+                snapshot.vacuum, snapshot.status, snapshot.job, snapshot.error, snapshot.dock_error, snapshot.connected)
             return None
         if self.pending_command == "configure":
             if not snapshot.ready_for(self.cleaning_mode):
                 self.attention("The robot became busy while manual settings were being applied. No cleaning was started.")
+                self.decision = "stopped: robot left the ready state while applying settings (vacuum=%s status=%s job=%s)" % (
+                    snapshot.vacuum, snapshot.status, snapshot.job)
             elif snapshot.observed_at >= self.command_at and all(
                 snapshot.settings.get(key) == value for key, value in self.stage.get("settings", {}).items()
             ):
                 return self._start_job(snapshot, now)
-            elif now - self.command_at >= ACK_SECONDS:
-                self.attention("The robot did not confirm the manual settings within 60 seconds. No cleaning was started.")
+            else:
+                missing = sorted(key for key, value in self.stage.get("settings", {}).items()
+                                 if snapshot.settings.get(key) != value)
+                self.decision = "waiting for manual settings readback: %s (observed settings %s)" % (
+                    ", ".join("%s=%s" % (k, self.stage["settings"][k]) for k in missing), snapshot.settings)
+                if now - self.command_at >= CONFIGURE_SECONDS:
+                    self.attention("The robot did not confirm the manual settings within %d minutes. No cleaning was started."
+                                   % (CONFIGURE_SECONDS // 60))
             return None
         if self.pending_command:
             # Confirming against telemetry older than the command would let a state the
@@ -452,14 +470,22 @@ class Queue:
                 if self.pending_command != "pause":
                     self.phase = "running"
                     self.seen_job = self.seen_job or snapshot.job == "on"
+                self.decision = "%s acknowledged by the robot" % self.pending_command
                 self.confirmed()
-            elif now - self.command_at >= self.ack_window():
-                self.attention(self.ack_timeout_message())
+            else:
+                self.decision = "waiting for the %s to be acknowledged (%ds of %ds; vacuum=%s status=%s job=%s)" % (
+                    self.pending_command, int(now - self.command_at), int(self.ack_window()),
+                    snapshot.vacuum, snapshot.status, snapshot.job)
+                if now - self.command_at >= self.ack_window():
+                    self.attention(self.ack_timeout_message())
             return None
         if self.phase == "paused":
             # App/manual resume does not silently restart an unattended queue.
+            self.decision = "paused"
             if snapshot.vacuum != "paused" and not self.next_pending:
                 self.attention("The robot changed state outside this queue while paused. Review its current job.")
+                self.decision = "stopped: the robot left the paused state outside this queue (vacuum=%s status=%s)" % (
+                    snapshot.vacuum, snapshot.status)
             return None
         if snapshot.vacuum == "paused" or snapshot.status == "paused":
             self.phase = "paused"
@@ -467,25 +493,37 @@ class Queue:
         if self.next_pending:
             if snapshot.job == "on":
                 self.attention("Another job started before the next queued room. The queue was stopped.")
+                self.decision = "stopped: another job started before the next room (status=%s)" % snapshot.status
             elif snapshot.ready_for(self.cleaning_mode):
                 return self._dispatch(snapshot, now)
+            else:
+                self.decision = "waiting for the robot to be ready for the next room (vacuum=%s status=%s job=%s dock=%s)" % (
+                    snapshot.vacuum, snapshot.status, snapshot.job, snapshot.dock_error)
             return None
         if snapshot.job == "on":
             self.seen_job = True
             self.finish_wait_at = 0
+            self.decision = "cleaning (job active, status=%s)" % snapshot.status
             return None  # Includes low-battery breaks and mop washing.
         if not self.seen_job:
             # A routine can acknowledge by washing its mops before in_cleaning
             # turns on. Preparation is not completion, and never advances rooms.
             if snapshot.status in START_STATUS and now - self.started_at < PREPARE_SECONDS:
+                self.decision = "waiting for the job to start (status=%s, %ds of %ds)" % (
+                    snapshot.status, int(now - self.started_at), int(PREPARE_SECONDS))
                 return None
             self.attention("No active cleaning job was observed after preparation. Completion cannot be confirmed.")
+            self.decision = "stopped: no active job was ever observed after preparation (status=%s after %ds)" % (
+                snapshot.status, int(now - self.started_at))
             return None
         record = snapshot.record or {}
         end = float(record.get("end") or 0)
         begin = float(record.get("begin") or 0)
         fresh = end > self.baseline_end and begin >= self.started_at - 3 and end >= begin
         if not fresh:
+            self.decision = "waiting for a completion record (record begin=%s end=%s complete=%s error=%s; baseline end=%s, started=%s)" % (
+                record.get("begin"), record.get("end"), record.get("complete"), record.get("error"),
+                self.baseline_end, self.started_at)
             if not self.finish_wait_at:
                 self.finish_wait_at = now
             elif now - self.finish_wait_at >= FINISH_SECONDS:

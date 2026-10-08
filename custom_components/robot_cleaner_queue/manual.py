@@ -35,6 +35,27 @@ def controls(entries, vacuum_entry, coordinator, states) -> dict[str, str]:
     return result
 
 
+def unavailable_controls(entries, vacuum_entry, coordinator, states) -> list[str]:
+    """Native setting entities that exist but cannot be read or written right now.
+
+    The Roborock integration marks setting entities unavailable while the dock
+    services. The plan itself is unchanged, so a queue should wait for them instead
+    of treating an unreadable select as an unsupported setting.
+    """
+    keys = set()
+    for entry in entries:
+        if (entry.platform != "roborock" or entry.domain != "select" or getattr(entry, "disabled_by", None)
+                or entry.device_id != vacuum_entry.device_id
+                or entry.config_entry_id != vacuum_entry.config_entry_id):
+            continue
+        for key, native in SELECT_KEYS.items():
+            if entry.unique_id == f"{native}_{coordinator.duid_slug}":
+                state = states.get(entry.entity_id)
+                if state is None or state.state in {"unknown", "unavailable"}:
+                    keys.add(key)
+    return sorted(keys)
+
+
 def current_map(coordinator) -> tuple[int | None, set[str]]:
     api = getattr(coordinator, "properties_api", None)
     flag = getattr(getattr(api, "maps", None), "current_map", None)
@@ -211,7 +232,9 @@ def capabilities(vacuum_entry, coordinator, entries, states, area_registry) -> t
         if valid_routes:
             standard = next((r for r in valid_routes if r.strip().lower() == "standard"), None)
             defaults["route"] = standard if standard is not None else valid_routes[0]
-    result = {"supported": supported, "modes": [{"value": v, "label": LABELS[v]} for v in offered],
+    unavailable = unavailable_controls(entries, vacuum_entry, coordinator, states)
+    result = {"supported": supported, "unavailable_controls": unavailable,
+              "modes": [{"value": v, "label": LABELS[v]} for v in offered],
               "suction": suction, "water": water, "routes": routes, "routes_by_mode": routes_by_mode,
               "repeats": [1, 2], "area_cleaning": area_cleaning, "room_targets": [{k: t[k] for k in ("id", "name", "icon") if k in t} for t in targets.values()], "defaults": defaults}
     report = room_report(vacuum_entry, coordinator, area_registry)

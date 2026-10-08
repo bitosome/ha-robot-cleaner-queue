@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from datetime import timedelta
 import logging
 import time
@@ -59,6 +60,9 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     hass.services.async_register(DOMAIN, "get_capabilities", manager.get_capabilities,
                                  schema=vol.Schema({vol.Required("vacuum"): cv.entity_id}),
                                  supports_response=SupportsResponse.ONLY)
+    hass.services.async_register(DOMAIN, "get_diagnostics", manager.get_diagnostics,
+                                 schema=vol.Schema({vol.Required("vacuum"): cv.entity_id}),
+                                 supports_response=SupportsResponse.ONLY)
     hass.services.async_register(DOMAIN, "device_control", manager.device_control,
         schema=vol.Schema({vol.Required("vacuum"): cv.entity_id,
                            vol.Required("control"): vol.In([*CONTROLS, "locate"]),
@@ -82,6 +86,8 @@ class Manager:
         self.coordinator = None
         self.coordinator_unsub = None
         self.last_published = None
+        self.events: deque = deque(maxlen=100)
+        self.last_observation: dict = {}
 
     async def setup(self) -> None:
         try:
@@ -103,6 +109,75 @@ class Manager:
             self.hass.bus.async_listen(EVENT_CALL_SERVICE, self.external_command),
             self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, self.shutdown),
         ])
+
+    def control_state(self, controls: dict) -> str:
+        """Whether the frozen native controls are intact, changed, or merely unavailable.
+
+        The Roborock integration marks setting entities unavailable while the dock
+        services. That is temporary, so the queue waits for them instead of abandoning
+        a plan the user selected.
+        """
+        frozen = self.queue.control_entities
+        if controls == frozen:
+            return "ok"
+        if any(key in controls and controls[key] != frozen.get(key) for key in frozen):
+            return "changed"
+        missing = sorted(set(frozen) - set(controls))
+        if missing:
+            self.event("settings-deferred",
+                       "native controls temporarily unavailable: %s" % ", ".join(missing), logging.INFO)
+            return "waiting"
+        return "changed"
+
+    def event(self, kind: str, detail: str, level: int = logging.DEBUG) -> None:
+        """Record and log what the queue is doing, so a failure can be explained."""
+        entry = {"time": time.strftime("%Y-%m-%dT%H:%M:%S"), "kind": kind, "detail": detail,
+                 "phase": self.queue.phase, "decision": self.queue.decision,
+                 "pending": self.queue.pending_command, "index": self.queue.current_index,
+                 "completed": self.queue.completed}
+        self.events.append(entry)
+        _LOGGER.log(level, "%s | phase=%s pending=%s room=%s/%s decision=%s | %s",
+                    kind, entry["phase"], entry["pending"] or "-", entry["index"] + 1,
+                    len(self.queue.presets) if self.queue.mode == "preset" else len(self.queue.stages),
+                    entry["decision"] or "-", detail)
+
+    def observe_log(self, current) -> None:
+        """Log every observation that differs from the previous one."""
+        record = current.record or {}
+        observation = {
+            "vacuum": current.vacuum, "status": current.status, "job": current.job,
+            "error": current.error, "dock": current.dock_error, "connected": current.connected,
+            "observed_at": round(current.observed_at or 0), "phase": self.queue.phase,
+            "decision": self.queue.decision, "pending": self.queue.pending_command,
+            "index": self.queue.current_index, "completed": self.queue.completed,
+            "record": "%s-%s complete=%s error=%s reason=%s" % (
+                record.get("begin"), record.get("end"), record.get("complete"),
+                record.get("error"), record.get("finish_reason")),
+        }
+        if observation == self.last_observation:
+            return
+        changed = [key for key, value in observation.items() if self.last_observation.get(key) != value]
+        self.last_observation = observation
+        self.event("observation", "changed: %s" % ", ".join(
+            "%s=%s" % (key, observation[key]) for key in changed), logging.DEBUG)
+
+    async def get_diagnostics(self, call: ServiceCall) -> dict:
+        """Read-only explanation of the current queue and the last 100 steps."""
+        vacuum = call.data["vacuum"]
+        try:
+            await async_require_control(self.hass.auth, call.context.user_id, [vacuum], POLICY_CONTROL)
+        except PermissionError as err:
+            raise Unauthorized(context=call.context, permission=POLICY_CONTROL) from err
+        current = self.current_snapshot(vacuum)
+        return {
+            "queue": self.queue.dump(),
+            "events": list(self.events),
+            "robot": {"vacuum": current.vacuum, "status": current.status, "job": current.job,
+                      "error": current.error, "dock_error": current.dock_error,
+                      "connected": current.connected, "observed_at": current.observed_at,
+                      "settings": dict(current.settings), "record": dict(current.record or {})},
+            "saved_presets": sorted(self.saved_presets) if isinstance(self.saved_presets, dict) else [],
+        }
 
     @callback
     def subscribe(self, listener):
@@ -343,6 +418,9 @@ class Manager:
             if self.closing:
                 raise ServiceValidationError("Home Assistant is stopping.")
             data = dict(call.data)
+            self.event("command", "received command=%s vacuum=%s user=%s presets=%s rooms=%s" % (
+                data.get("command"), data.get("vacuum") or self.queue.vacuum,
+                call.context.user_id or "system", data.get("presets") or [], data.get("rooms") or []), logging.INFO)
             command = data["command"]
             vacuum = data.get("vacuum") or self.queue.vacuum
             saved_plan = None
@@ -453,7 +531,13 @@ class Manager:
                 self.contexts = {context.id}
             if kind in {"manual", "configure"}:
                 caps, controls, targets, map_id = self.manual_capabilities(self.queue.vacuum)
+                if caps.get("unavailable_controls"):
+                    self.event("settings-deferred", "native setting entities are unavailable: %s; waiting"
+                               % ", ".join(caps["unavailable_controls"]), logging.INFO)
+                    return
                 validate_stage(self.queue.stage, caps, targets, map_id)
+                if self.control_state(controls) == "waiting":
+                    return
                 if controls != self.queue.control_entities:
                     raise ValueError("The native manual control entities changed.")
                 if not self.current_snapshot(self.queue.vacuum).ready_for(self.queue.cleaning_mode):
@@ -472,6 +556,8 @@ class Manager:
                             raise ValueError("The robot became busy while applying manual settings.")
                         latest_caps, latest_controls, latest_targets, latest_map = self.manual_capabilities(self.queue.vacuum)
                         validate_stage(self.queue.stage, latest_caps, latest_targets, latest_map)
+                        if self.control_state(latest_controls) == "waiting":
+                            return
                         if latest_controls != self.queue.control_entities:
                             raise ValueError("Manual control entities changed during setup.")
                         value = self.queue.stage["settings"][key]
@@ -506,11 +592,14 @@ class Manager:
         except PermissionError:
             self.queue.attention("The initiating user can no longer control this cleaning sequence. No further command was sent.")
             await self.publish()
-        except Exception:
-            # Raw integration errors can contain private payloads; never expose them.
-            self.queue.attention("The command failed or could not be confirmed. Check the robot before retrying; no automatic retry was sent.")
+        except Exception as err:  # noqa: BLE001 - reported, never retried automatically
+            # The log keeps the real cause; the sensor only names the exception type, so
+            # a private payload can never reach an attribute or a service response.
+            _LOGGER.exception("Robot queue command %s failed for %s: %s", effect, self.queue.vacuum, err)
+            self.event("command-failed", "%s raised %s: %s" % (effect, type(err).__name__, err), logging.WARNING)
+            self.queue.attention("The command failed or could not be confirmed (%s). Check the robot before retrying; "
+                                 "no automatic retry was sent." % type(err).__name__)
             await self.publish()
-            _LOGGER.warning("Robot queue command failed; queue stopped without retry")
 
     async def tick(self, _now=None) -> None:
         if self.closing or not self.queue.vacuum or self.queue.phase not in ACTIVE and not self.queue.pending_command:
@@ -524,6 +613,7 @@ class Manager:
                 current = self.current_snapshot(self.queue.vacuum)
             except ValueError:
                 current = Snapshot()
+            self.observe_log(current)
             effect = self.queue.observe(current, time.time())
             await self.publish()
             if effect:

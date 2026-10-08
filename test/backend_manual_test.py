@@ -2,6 +2,7 @@
 import __future__
 import ast
 import asyncio
+from collections import deque
 from datetime import datetime, timezone
 import logging
 from pathlib import Path
@@ -243,7 +244,7 @@ class ManualEngineTests(unittest.TestCase):
         for outcome in ["timeout", "busy", "cancel", "restart"]:
             queue = self.plan()
             if outcome == "timeout":
-                queue.observe(ready(), 161)
+                queue.observe(ready(), 701)   # the settings readback window is 600s
             elif outcome == "busy":
                 queue.observe(cleaning(), 110)
             elif outcome == "cancel":
@@ -287,7 +288,8 @@ def manager_class():
     source = Path(__file__).resolve().parents[1] / "custom_components/robot_cleaner_queue/__init__.py"
     tree = ast.parse(source.read_text())
     definition = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Manager")
-    env = dict(asyncio=asyncio, time=time, uuid4=uuid4, Store=FakeStore, Queue=Queue, Snapshot=Snapshot, ACTIVE=load("engine").ACTIVE,
+    env = dict(asyncio=asyncio, time=time, logging=logging, deque=deque, uuid4=uuid4, Store=FakeStore,
+               Queue=Queue, Snapshot=Snapshot, ACTIVE=load("engine").ACTIVE,
                ACK_SECONDS=60, CONTROLS=device.CONTROLS, DOCK=device.DOCK, device_entities=device.device_entities, device_command=device.device_command,
                DOMAIN="robot_cleaner_queue", HomeAssistant=object, ServiceCall=object, Context=FakeContext, callback=lambda f:f,
                ar=NS(async_get=lambda hass: hass.areas), ServiceValidationError=ServiceError, Unauthorized=ServiceError,
@@ -486,6 +488,27 @@ class ManagerTraceTests(unittest.IsolatedAsyncioTestCase):
         await self.manager.tick()
         self.assertEqual(self.manager.queue.phase, "attention")
         self.assertFalse(any(service in {"start", "clean_area"} for _, service, _ in self.calls))
+
+    async def test_unavailable_native_controls_defer_instead_of_abandoning_the_plan(self):
+        """The dock marks setting entities unavailable while it services; wait, do not stop."""
+        await self.start()
+        self.assertTrue(self.manager.queue.stage)          # a manual plan is configuring
+        sent = len(self.calls)
+        self.states["select.renamed_water"].state = "unavailable"
+        await self.manager.tick()
+        self.assertNotEqual(self.manager.queue.phase, "attention")
+        self.assertEqual(len(self.calls), sent, "No setting may be written while an entity is unavailable")
+        self.states["select.renamed_water"].state = "medium"
+        await self.manager.tick()
+        self.assertIn(("select", "select_option"), [(domain, service) for domain, service, _ in self.calls])
+
+    async def test_diagnostics_explain_the_last_steps(self):
+        await self.start()
+        result = await self.manager.get_diagnostics(NS(data={"vacuum": "vacuum.robot"}, context=NS(user_id=None, id="diag")))
+        self.assertIn("queue", result)
+        self.assertTrue(result["events"], "Expected recorded events")
+        self.assertTrue(any(event["kind"] == "command" for event in result["events"]))
+        self.assertIn("status", result["robot"])
 
     async def test_external_setting_and_map_controls_interrupt_queue(self):
         await self.start()

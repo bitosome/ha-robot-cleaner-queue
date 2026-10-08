@@ -91,6 +91,10 @@ One area may cover several robot rooms: a `Kitchen` area mapped to two segments 
 - [Queue backend: contract, completion rules, recovery](docs/queue-backend.md)
 - [Manual cleaning: areas, modes, settings, compatibility](docs/manual-cleaning.md)
 
+## Diagnosing a stopped sequence
+
+Set the `custom_components.robot_cleaner_queue` logger to `debug` for a step-by-step account of every observation, command, deferral and refusal. `robot_cleaner_queue.get_diagnostics` returns the persisted queue, the current robot observation and the last 100 recorded steps, so a stopped sequence can be explained without reading the log.
+
 ## Tests
 
 ```sh
