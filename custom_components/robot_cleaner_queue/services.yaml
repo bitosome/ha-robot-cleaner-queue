@@ -113,3 +113,33 @@ get_diagnostics:
         entity:
           domain: vacuum
           integration: roborock
+
+save_preferences:
+  name: Save shared room settings
+  description: Persist defaults and current-map room preferences for all users. Does not change the robot or saved wall-switch plan. Concurrent stale saves are rejected.
+  fields:
+    vacuum:
+      required: true
+      selector:
+        entity:
+          domain: vacuum
+    revision:
+      required: true
+      selector:
+        number:
+          min: 0
+          mode: box
+    map_id:
+      required: true
+      selector:
+        number:
+          min: 0
+          mode: box
+    defaults:
+      required: true
+      selector:
+        object:
+    rooms:
+      required: true
+      selector:
+        object:

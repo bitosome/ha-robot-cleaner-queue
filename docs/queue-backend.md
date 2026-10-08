@@ -61,7 +61,7 @@ Other commands:
 
 The card contract is `control_version: 5`. Version 0.2.2 can pause/resume/dock an app-started job with an explicit vacuum. It stores `mode: external` without targets or stages; acknowledgement returns it to idle and cannot advance an old plan. Resume requires a paused, unfinished job. Active, attention and uncertain commands cannot be bypassed by controlling a different robot.
 
-For non-start commands, pass the same `vacuum` to protect against a card configured for another robot. An `attention` queue must be cleared with `cancel` before a new queue can start. Clearing an unacknowledged command preserves a safety barrier: another start requires that command's window to expire — fifteen minutes for a start or resume, ten minutes while settings are being applied, sixty seconds for a control command — and a new native poll after that window confirming idle/job-off. The barrier is released as soon as the robot is observed confirming that command, so a stop the robot has already acknowledged never delays docking. Cancelling cannot reuse a stale docked state to send a duplicate job. Only an idle/docked robot with no unfinished job can start a new sequence. Starts cannot replace an existing queue or unfinished job.
+For non-start commands, pass the same `vacuum` to protect against a card configured for another robot. An `attention` queue must be cleared with `cancel` before a new queue can start. Clearing an unacknowledged command preserves a safety barrier: another start requires that command's window to expire — fifteen minutes for a start or resume, sixty seconds for settings or a control command — and a new native poll after that window confirming idle/job-off. The barrier is released as soon as the robot is observed confirming that command, so a stop the robot has already acknowledged never delays docking. Cancelling cannot reuse a stale docked state to send a duplicate job. Only an idle/docked robot with no unfinished job can start a new sequence. Starts cannot replace an existing queue or unfinished job.
 
 `start_manual` accepts either a list of room requests (`{"id": "0_12", "mode": ..., "suction": ..., "water": ..., "route": ..., "repeat": ...}`) or the legacy list of Home Assistant area IDs (`["kitchen"]`). Room ids come from `get_capabilities.robot_rooms` and must exist on the robot's current map. Each room's settings fall back to the request's `setup` defaults, and a plan may hold 1–32 rooms and at most 128 stages. Rooms cannot repeat. Area-shaped requests keep working for plans saved before rooms existed.
 
@@ -99,7 +99,7 @@ The initiating Home Assistant user's control permission is checked on the vacuum
 
 No automatic retries are sent. Faults and lost telemetry stop progression for review. HA commands from other controls stop this queue to avoid competing writers, and so does a Roborock app routine or schedule that starts its own job. App/device interruption is caught by the cleaning record's completion/finish reason; changes that produce indistinguishable successful records cannot be attributed to a particular caller.
 
-Pause and return-to-dock also require observed acknowledgement within 60 seconds; a start or resume gets the 15-minute window and settings get the ten-minute window described above. Queued rooms and position are persisted in HA's storage before dispatch. An HA restart or shutdown preserves the sequence for inspection and changes it to `attention`; it never resumes cleaning automatically. Clear and reselect the desired remaining rooms after checking the robot. Cancelling or docking clears progression before sending another robot action.
+Pause and return-to-dock also require observed acknowledgement within 60 seconds; a start or resume gets the 15-minute window and settings preparation may wait ten minutes, but cancelling settings retains only a sixty-second update barrier. Queued rooms and position are persisted in HA's storage before dispatch. An HA restart or shutdown preserves the sequence for inspection and changes it to `attention`; it never resumes cleaning automatically. Clear and reselect the desired remaining rooms after checking the robot. Cancelling or docking clears progression before sending another robot action.
 
 ## Compatibility and validation
 
@@ -175,3 +175,24 @@ settings not yet successfully sent resume when the dock is ready, and fresh
 readback must match before cleaning starts. This wait retains the ten-minute
 configuration deadline. A competing job, unknown state, fault, cancellation or
 uncertain service failure still stops the sequence; no command is retried.
+
+## Shared room preferences — v0.9.0
+
+`save_preferences` stores `{vacuum, revision, map_id, defaults, rooms}` separately
+from the saved switch plan. `rooms` is a dictionary of current-map room IDs to
+complete settings; omission removes an override on that floor only. Every write
+validates native capabilities and the current map, checks the caller’s control
+permissions, and compares the revision. A stale revision is rejected instead of
+overwriting another user’s changes. Storage succeeds before publishing the new
+revision; no robot commands are sent.
+
+Profiles are keyed by vacuum, never by user, in Home Assistant’s
+`.storage/robot_cleaner_queue_preferences`. Defaults and other-floor overrides
+survive restarts. `get_capabilities.preferences` returns the shared profile and
+`sensor.robot_cleaner_queue.preferences_revisions` notifies dashboards to refresh.
+Saved switch plans and active queues remain frozen and independent of preferences.
+
+Settings-only cancellation uses a 60-second barrier from the latest possible
+settings write plus a fresh native poll. It no longer inherits the ten-minute
+configuration deadline. Older stored ten-minute settings barriers migrate on
+restart; fifteen-minute start/resume barriers are unchanged.

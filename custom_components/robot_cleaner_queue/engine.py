@@ -106,6 +106,7 @@ class Queue:
     run_id: str = ""
     not_before: float = 0
     barrier_window: float = 0
+    settings_sent_at: float = 0
     decision: str = ""
     address: str = ""
     owner_user_id: str | None = None
@@ -118,6 +119,11 @@ class Queue:
         queue = cls(**{k: v for k, v in (data or {}).items() if k in cls.__dataclass_fields__})
         if queue.phase in ACTIVE or queue.pending_command:
             queue.attention("Home Assistant restarted. The saved queue was interrupted; clear it and select a new sequence when the robot is idle.")
+        # v0.8.1 used the ten-minute setup deadline as a settings-only barrier.
+        # No motion command uses that duration; shorten only that legacy case.
+        if queue.barrier_window == CONFIGURE_SECONDS:
+            queue.not_before = min(queue.not_before, queue.command_at + ACK_SECONDS)
+            queue.barrier_window = ACK_SECONDS
         return queue
 
     def attention(self, message: str) -> None:
@@ -138,7 +144,9 @@ class Queue:
         if self.pending_command in {"start", "resume"}:
             return START_SECONDS
         if self.pending_command == "configure":
-            return CONFIGURE_SECONDS
+            # Settings cannot launch cleaning. Allow one native update window for
+            # a late write, independently of the longer preparation deadline.
+            return ACK_SECONDS
         return ACK_SECONDS
 
     def ack_timeout_message(self) -> str:
@@ -153,8 +161,9 @@ class Queue:
             # Clearing the UI must not permit another start on that stale state, so the
             # barrier lasts as long as that command may still be acknowledged.
             window = self.ack_window()
-            if self.command_at + window > self.not_before:
-                self.not_before, self.barrier_window = self.command_at + window, window
+            sent_at = max(self.command_at, self.settings_sent_at) if self.pending_command == "configure" else self.command_at
+            if sent_at + window > self.not_before:
+                self.not_before, self.barrier_window = sent_at + window, window
 
     def _validate_start(self, snapshot: Snapshot, now: float, mode: str = "vacuum") -> None:
         if self.phase in ACTIVE or self.phase == "attention" or self.pending_command:

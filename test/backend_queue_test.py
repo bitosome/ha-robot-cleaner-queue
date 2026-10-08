@@ -131,6 +131,21 @@ class QueueTests(unittest.TestCase):
                 self.assertIsNone(q.observe(current, 120))
                 self.assertEqual(q.phase, "attention")
 
+    def test_cancelled_settings_use_short_barrier_and_legacy_store_is_migrated(self):
+        q = self.start()
+        q.command("cancel", ready(), 110)
+        self.assertEqual(q.not_before, 160)
+        self.assertEqual(q.barrier_window, 60)
+        current = ready()
+        current.observed_at = 161
+        rooms, stages = self.plan()
+        self.assertEqual(q.start_manual("vacuum.robot", rooms, {}, stages, {}, current, 161, "new"), ("configure","0"))
+        old = {"phase":"cancelled", "command_at":100, "not_before":700, "barrier_window":600}
+        self.assertEqual(Queue.restore(old).not_before, 160)
+        # Motion uncertainty is unchanged by the settings-only migration.
+        old["not_before"], old["barrier_window"] = 1000, 900
+        self.assertEqual(Queue.restore(old).not_before, 1000)
+
     def test_preparation_that_never_starts_a_job_stops_after_timeout(self):
         q = self.acknowledged()
         wash = Snapshot("docked", "washing_the_mop", "off", "none", "ok", True)
@@ -272,7 +287,7 @@ class QueueTests(unittest.TestCase):
             q = self.start()
             q.command(command, ready(), 101)
             self.assertEqual(q.phase, "cancelled")
-            self.assertEqual(q.not_before, 700)          # the settings readback window
+            self.assertEqual(q.not_before, 160)          # settings-only update window
             for timestamp in [102, 701]:
                 with self.assertRaises(ValueError):
                     _, stages = self.plan(["0_1"])
@@ -298,7 +313,7 @@ class QueueTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             q.start_manual("vacuum.robot", ["0_1"], {}, stages, {}, ready(), 1003, "new")
         restored = Queue.restore(q.dump())
-        self.assertEqual(restored.not_before, 700)
+        self.assertEqual(restored.not_before, 160)
         with self.assertRaises(ValueError):
             restored.start_manual("vacuum.robot", ["0_1"], {}, stages, {}, ready(), 1010, "new")
 

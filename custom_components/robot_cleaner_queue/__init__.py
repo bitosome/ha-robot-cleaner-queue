@@ -80,6 +80,12 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         schema=vol.Schema({vol.Required("vacuum"): cv.entity_id,
                            vol.Required("control"): vol.In([*CONTROLS, "locate"]),
                            vol.Optional("value", default=""): vol.Any(str, int, float)}))
+    hass.services.async_register(DOMAIN, "save_preferences", manager.save_preferences,
+        schema=vol.Schema({vol.Required("vacuum"): cv.entity_id,
+                           vol.Required("revision"): vol.All(int, vol.Range(min=0)),
+                           vol.Required("map_id"): int,
+                           vol.Required("defaults"): dict,
+                           vol.Required("rooms"): dict}))
     await async_load_platform(hass, "sensor", DOMAIN, {}, config)
     return True
 
@@ -91,6 +97,9 @@ class Manager:
         self.store = Store(hass, 1, DOMAIN)
         self.preset_store = Store(hass, 1, DOMAIN + "_presets")
         self.saved_presets: dict = {}
+        self.preferences_store = Store(hass, 1, DOMAIN + "_preferences")
+        self.preferences: dict = {}
+        self.preferences_load_failed = False
         self.lock = asyncio.Lock()
         self.listeners = []
         self.unsubs = []
@@ -108,6 +117,7 @@ class Manager:
         self.configured_keys: set[str] = set()
 
     async def setup(self) -> None:
+        await self.load_preferences()
         try:
             loaded_presets = await self.preset_store.async_load()
             self.saved_presets = loaded_presets if isinstance(loaded_presets, dict) else {}
@@ -251,6 +261,7 @@ class Manager:
             caps["control_version"] = 5
             caps["current_map"] = current_map(self.resolve(call.data["vacuum"])[2])[0]
             caps["saved_preset"] = await self.read_saved_preset(call.data["vacuum"], call.context.user_id)
+            caps["preferences"] = self.preference_profile(call.data["vacuum"])
             caps["device_entities"] = {}
             for key, entity_id in self.device_entities(call.data["vacuum"]).items():
                 try:
@@ -268,6 +279,60 @@ class Manager:
                     "repeats": [], "area_cleaning": False, "room_targets": [], "robot_maps": [], "robot_rooms": [],
                     "unmapped_areas": [], "rooms_complete": False, "defaults": {},
                     "error": "Manual cleaning is unavailable. Check the native Roborock integration and area mapping."}
+
+    async def load_preferences(self):
+        try:
+            data = await self.preferences_store.async_load()
+            if data is not None and (not isinstance(data, dict) or any(
+                not isinstance(value, dict) or not isinstance(value.get("revision"), int)
+                or not isinstance(value.get("defaults"), dict) or not isinstance(value.get("rooms"), dict)
+                for value in data.values())):
+                raise ValueError("Invalid preference storage")
+            self.preferences = data or {}
+        except Exception:
+            self.preferences_load_failed = True
+            _LOGGER.error("Room preference storage could not be read; saving is disabled to preserve it")
+
+    def preference_profile(self, vacuum):
+        if self.preferences_load_failed:
+            raise ServiceValidationError("Room settings could not be read. Restore preference storage before saving.")
+        return self.preferences.get(vacuum, {"revision": 0, "defaults": {}, "rooms": {}})
+
+    async def save_preferences(self, call):
+        """Shared durable preferences, separate from the frozen wall-switch plan."""
+        async with self.lock:
+            if self.closing:
+                raise ServiceValidationError("Home Assistant is stopping.")
+            vacuum = call.data["vacuum"]
+            try:
+                await async_require_control(self.hass.auth, call.context.user_id, [vacuum], POLICY_CONTROL)
+                current = self.preference_profile(vacuum)
+                if call.data["revision"] != current["revision"]:
+                    raise ValueError("Another user saved room settings. Reload shared settings before saving your changes.")
+                caps, controls, _, map_id = self.manual_capabilities(vacuum)
+                await async_require_control(self.hass.auth, call.context.user_id, list(controls.values()), POLICY_CONTROL)
+                if map_id is None or call.data["map_id"] != map_id:
+                    raise ValueError("The robot map changed. Reload shared settings before saving.")
+                defaults, _ = build_plan([], call.data["defaults"], caps, {}, map_id)
+                targets = robot_targets(self.resolve(vacuum)[2], map_id)
+                requests = call.data["rooms"]
+                if len(requests) > 128 or any(key not in targets for key in requests):
+                    raise ValueError("Room settings must belong to existing rooms on the current map.")
+                # Replace this floor only; retain preferences for other floors.
+                rooms = {key: value for key, value in current["rooms"].items()
+                         if not key.startswith(str(map_id) + "_")}
+                for key, setup in requests.items():
+                    rooms[key], _ = build_plan([], setup, caps, {}, map_id)
+                profile = {"revision": current["revision"] + 1, "defaults": defaults, "rooms": rooms}
+                updated = {**self.preferences, vacuum: profile}
+                await self.preferences_store.async_save(updated)
+                self.preferences = updated
+                for listener in list(self.listeners):
+                    listener()
+            except PermissionError as err:
+                raise Unauthorized(context=call.context, permission=POLICY_CONTROL) from err
+            except ValueError as err:
+                raise ServiceValidationError(str(err)) from err
 
     async def read_saved_preset(self, vacuum, user_id):
         plan = self.saved_presets.get(vacuum)
@@ -613,6 +678,16 @@ class Manager:
                         if latest_controls != self.queue.control_entities:
                             raise ValueError("Manual control entities changed during setup.")
                         value = self.queue.stage["settings"][key]
+                        self.queue.settings_sent_at = time.time()
+                        await self.publish()  # Retain the latest possible write time across restart.
+                        if not self.effect_valid(effect):
+                            return
+                        current = self.current_snapshot(self.queue.vacuum)
+                        if current.servicing_for(self.queue.cleaning_mode):
+                            self.deferred_configuration = (token, effect)
+                            return
+                        if not current.ready_for(self.queue.cleaning_mode):
+                            raise ValueError("The robot became busy before applying manual settings.")
                         if key == "suction":
                             await self.hass.services.async_call("vacuum", "set_fan_speed", {"entity_id": self.queue.vacuum, "fan_speed": value}, blocking=True, context=context)
                         else:

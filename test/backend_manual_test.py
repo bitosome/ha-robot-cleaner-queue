@@ -341,7 +341,8 @@ class FakeContext:
         self.user_id, self.parent_id, self.id = user_id, parent_id, uuid4().hex
 
 class ServiceError(Exception):
-    pass
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args)
 
 
 def manager_class():
@@ -497,6 +498,60 @@ class ManagerTraceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sum(data.get("option") == "mop" for _, _, data in self.calls), 1)
         self.assertEqual(self.states["select.renamed_water"].state, "high")
         self.assertEqual(self.manager.queue.stages[2]["target"], "0_3")
+
+    async def save_preferences(self, revision=0, **overrides):
+        data = {"vacuum":"vacuum.robot", "revision":revision, "map_id":0,
+                "defaults":{"mode":"vacuum", "suction":"max", "repeat":1},
+                "rooms":{"0_1":{"mode":"mop", "water":"high", "route":"deep", "repeat":2}}, **overrides}
+        await self.manager.save_preferences(NS(context=FakeContext("user"), data=data))
+
+    async def test_shared_preferences_survive_reload_and_do_not_change_saved_plan_or_queue(self):
+        await self.save_rooms()
+        queue_before = self.manager.queue.dump()
+        plan_before = dict(self.manager.saved_presets)
+        await self.save_preferences()
+        stored = self.manager.preferences_store.saved[-1]
+        self.assertEqual(stored["vacuum.robot"]["revision"], 1)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.manager.queue.dump(), queue_before)
+        self.assertEqual(self.manager.saved_presets, plan_before)
+        fresh = manager_class()(self.hass)
+        async def load(): return stored
+        fresh.preferences_store.async_load = load
+        await fresh.load_preferences()
+        self.assertEqual(fresh.preference_profile("vacuum.robot"), stored["vacuum.robot"])
+        self.assertNotIn("user", fresh.preferences)
+
+    async def test_preferences_conflict_invalid_room_map_and_permission_preserve_storage(self):
+        await self.save_preferences()
+        before = dict(self.manager.preferences)
+        for changes in [{"revision":0}, {"revision":1,"map_id":1},
+                        {"revision":1,"rooms":{"0_99":{"mode":"vacuum"}}},
+                        {"revision":1,"defaults":{"mode":"mop","water":"imaginary"}}]:
+            with self.assertRaises(ServiceError): await self.save_preferences(**changes)
+            self.assertEqual(self.manager.preferences, before)
+        self.allowed.clear()
+        with self.assertRaises(ServiceError): await self.save_preferences(revision=1)
+        self.assertEqual(self.manager.preferences, before)
+        self.assertEqual(self.calls, [])
+
+    async def test_preferences_reset_current_floor_preserves_other_floor_and_storage_failure(self):
+        self.manager.preferences = {"vacuum.robot":{"revision":2,"defaults":{},
+                                   "rooms":{"1_1":{"mode":"vacuum","repeat":1},"0_1":{"mode":"vacuum","repeat":1}}}}
+        await self.save_preferences(revision=2, rooms={})
+        self.assertEqual(list(self.manager.preferences["vacuum.robot"]["rooms"]), ["1_1"])
+        before = dict(self.manager.preferences)
+        async def fail(_): raise OSError("Disk full")
+        self.manager.preferences_store.async_save = fail
+        with self.assertRaises(OSError): await self.save_preferences(revision=3)
+        self.assertEqual(self.manager.preferences, before)
+
+    async def test_bad_preference_storage_cannot_be_overwritten(self):
+        async def bad_load(): return {"vacuum.robot":"damaged"}
+        self.manager.preferences_store.async_load = bad_load
+        await self.manager.load_preferences()
+        with self.assertRaises(ServiceError): await self.save_preferences()
+        self.assertEqual(self.manager.preferences_store.saved, [])
 
     async def test_command_failure_never_leaks_payload_into_diagnostics(self):
         self.fail_service = "set_fan_speed"
