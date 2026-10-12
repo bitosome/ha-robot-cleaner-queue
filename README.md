@@ -123,3 +123,10 @@ Temporarily unavailable dock setting entities can defer configuration. Only sett
 Retired saved Roborock routine plans are rejected with instructions to save a new room plan. `toggle_saved` never guesses a whole-house fallback. The service name `save_preset` and existing storage key are retained for compatibility. No routine buttons are pressed.
 
 Device discovery now includes map selection, optional off-peak charging/times, and read-only attachment, tank, drying and cleaning-history sensors. Disabled native entities remain disabled. Map changes are rejected during unfinished jobs. The frontend README contains the supported-feature matrix and explicit Roborock-app-only limitations.
+
+## Integration icon
+
+Home Assistant 2026.3 and later displays the bundled integration icon from
+`custom_components/robot_cleaner_queue/brand/`. The editable artwork and export
+instructions are in [branding/](branding/README.md). Earlier Home Assistant
+versions retain their usual fallback icon.
