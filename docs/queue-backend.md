@@ -274,3 +274,89 @@ states when HA reports unknown. It never overrides unavailable/error/disconnecte
 states or guesses an unrecognized code. robot_activity, robot_connected and
 robot_observed_at let the card apply the same narrowly scoped display fallback.
 No new polling, protocol commands or physical retries are introduced.
+
+## Persistent sequence activity
+
+Activity is separate from executable queue state. `last_run`, `previous_runs` and
+`history_revision` are persisted in the existing `robot_cleaner_queue` Store before
+commands or published transitions. They are shared by every authorized user, survive
+HA restarts and remain intact when direct robot controls replace the execution object.
+Only an accepted new manual plan archives the previous run; rejected starts and no-op
+controls do not change history. At most five previous runs are retained, newest first.
+Saved plan/default preferences are separate and are not modified by activity recording.
+
+The queue sensor exposes `run_history_version: 1`, a monotonically increasing
+`history_revision`, and small `last_run` / `previous_runs` summaries. Each summary
+contains `run_id`, `vacuum`, `state`, `assigned_at`, `updated_at`, `finished_at`,
+`stage_count`, `completed_count`, and `room_count`. Full frozen plan details are
+read through the response-only `robot_cleaner_queue.get_history` action:
+
+```yaml
+action: robot_cleaner_queue.get_history
+data:
+  vacuum: vacuum.robot
+response_variable: cleaning_history
+```
+
+The response is `{run_history_version, history_revision, last_run, previous_runs}`.
+The action requires control permission on the requested vacuum, returns only that
+vacuum's records, and sends no robot commands. Frontends should refresh when the
+revision changes and reject stale responses after switching robots. Each full run has:
+
+- Identity and outcome: `run_id`, `vacuum`, `state`, `assigned_at`, `updated_at`,
+  `finished_at` (sequence completion/cancellation time, not a native room end time).
+- `rooms`: frozen `{id, name, setup}` in assignment order. Names do not depend on the
+  current map still containing the room. A whole-home target has id `""` and name
+  `Whole home`; it is not fabricated as individually observed room completions.
+- `stages`: ordered `{index, target, mode, room_index, pass_index, repeat_index,
+  settings, state, started_at, finished_at, confirmed_at, reason, evidence_source}`.
+  Every repeated pass and vacuum-then-mop pass remains distinct.
+- `interruptions`: up to twelve `{at, reason}` events. These record the queue's
+  interruption observation, not an invented native fault onset time.
+
+Times are Unix seconds or `null` when unknown. Before completion, stage `started_at`
+is the first fresh native observation of actual floor cleaning, never the start
+request or preparatory mop washing. A stage becomes `completed` only on the engine's
+existing successful matching cleaning-record check; its actual native `begin` and
+`end` become `started_at` and `finished_at`, and `confirmed_at` is when the queue
+accepted that evidence. A successful record from another later job cannot complete
+a stopped/archive stage. No detached background observation resumes execution or
+guesses what happened after the queue lost ownership.
+
+Stage states are `pending`, `preparing`, `starting`, `running`, `paused`, `attention`,
+`completed`, or `cancelled`. Future unattempted stages remain `pending` even when
+their parent sequence is stopped or cancelled; the frontend should describe these as
+not started, not as failed or actively waiting to launch. Completing all floor passes
+can leave the parent in `finishing` or `attention` if docking/care is not confirmed.
+That does not erase successful floor passes or claim that dock care finished.
+
+Existing queues migrate with their completed count intact and unknown historical
+timestamps (`evidence_source: legacy_queue`). New verified records use
+`evidence_source: native_record`; incomplete observations use `queue`. Damaged
+history entries are discarded independently of queue command barriers. Restored
+active queues still require review, and archived active-looking entries are demoted
+to unconfirmed `attention` rather than appearing to keep cleaning forever.
+
+To keep Recorder below its 16 KiB state-attribute limit, the sensor's existing
+`setup` and `stages` attributes are marked unrecorded; they remain available in live
+state for backward-compatible cards. The durable Store and `get_history` own full
+activity detail, while Recorder retains small run summaries and control state.
+A transient Store failure stops execution and retries persistence on later ticks;
+it cannot silently mark unsaved history as durable.
+
+### Evidence-only recovery from older Recorder data
+
+`history.from_queue(queue)` builds an allowlisted read-only journal from an old queue
+snapshot, including legacy completed counts but no invented timestamps.
+`history.normalize(run)` validates a journal and removes non-public/internal fields.
+An operator recovering pre-upgrade evidence may set `assigned_at` from an observed
+accepted start, `interruptions[].at` from the recorded transition, and stage
+`confirmed_at` from a recorded increase in the completed count. Set the relevant
+stage's `evidence_source` to `recorder`. Leave native `started_at`/`finished_at` null
+unless the actual matching native cleaning record is available; a state transition
+does not prove the robot's exact physical start/end time.
+
+Recovery must update only `last_run`, `previous_runs` (bounded/deduplicated by run id)
+and `history_revision` in a backed-up Store while HA is stopped, preserving every
+executable queue field and command barrier byte-for-byte. There is deliberately no
+public action to import/replay journal entries as cleaning commands.

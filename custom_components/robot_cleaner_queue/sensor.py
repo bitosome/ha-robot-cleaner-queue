@@ -1,6 +1,7 @@
 """Frontend-readable state of the single server-owned robot queue."""
 from homeassistant.components.sensor import SensorEntity
 from . import DOMAIN
+from . import history
 
 
 async def async_setup_platform(hass, _config, async_add_entities, discovery_info=None):
@@ -12,6 +13,9 @@ class QueueSensor(SensorEntity):
     _attr_unique_id = "robot_cleaner_queue"
     _attr_icon = "mdi:format-list-numbered"
     _attr_should_poll = False
+    # The durable queue Store owns these large, frozen plan details. Keep them in
+    # live state for existing cards without exceeding Recorder's 16 KiB limit.
+    _unrecorded_attributes = frozenset({"setup", "stages"})
 
     def __init__(self, manager):
         self.manager = manager
@@ -29,6 +33,10 @@ class QueueSensor(SensorEntity):
         return {
             "control_version": 5,
             "execution_version": 3,
+            "run_history_version": history.VERSION,
+            "history_revision": queue.history_revision,
+            "last_run": history.summary(queue.last_run),
+            "previous_runs": [history.summary(run) for run in queue.previous_runs],
             "floor_cleaning_complete": bool(queue.stages) and queue.completed == len(queue.stages),
             "start_uncertain": queue.start_uncertain,
             "command_failure": dict(queue.command_failure),

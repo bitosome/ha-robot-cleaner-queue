@@ -109,6 +109,16 @@ save_preset:
     setup:
       selector:
         object: {}
+get_history:
+  name: Get cleaning sequence history
+  description: Read the last assigned sequence and up to five previous sequences for the authorized robot. Includes per-pass observed status and completion times. Sends no robot commands.
+  fields:
+    vacuum:
+      required: true
+      selector:
+        entity:
+          domain: vacuum
+          integration: roborock
 get_diagnostics:
   name: Get queue diagnostics
   description: Read the queue and recent controller events for the authorized robot.

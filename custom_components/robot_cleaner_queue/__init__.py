@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from copy import deepcopy
 from datetime import timedelta
 import logging
 import time
@@ -22,6 +23,7 @@ from .adapter import is_competing_command, routine_matches, snapshot
 from .engine import ACTIVE, ACK_SECONDS, Queue, Snapshot
 from .device import CONTROLS, DOCK, device_entities, device_command
 from .errors import command_failure_metadata
+from . import history
 from .permissions import async_require_control
 from .manual import build_plan, build_room_plan, cached_settings, capabilities, current_map, robot_targets, validate_stage
 
@@ -78,6 +80,9 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     hass.services.async_register(DOMAIN, "get_diagnostics", manager.get_diagnostics,
                                  schema=vol.Schema({vol.Required("vacuum"): cv.entity_id}),
                                  supports_response=SupportsResponse.ONLY)
+    hass.services.async_register(DOMAIN, "get_history", manager.get_history,
+                                 schema=vol.Schema({vol.Required("vacuum"): cv.entity_id}),
+                                 supports_response=SupportsResponse.ONLY)
     hass.services.async_register(DOMAIN, "device_control", manager.device_control,
         schema=vol.Schema({vol.Required("vacuum"): cv.entity_id,
                            vol.Required("control"): vol.In([*CONTROLS, "locate"]),
@@ -132,6 +137,7 @@ class Manager:
             _LOGGER.exception("The stored queue could not be read; starting from an empty queue")
             self.queue = Queue()
             self.queue.attention("The stored sequence could not be read. Check the robot before starting a new one.")
+        history.sync(self.queue, time.time())
         await self.store.async_save(self.queue.dump())
         self.unsubs.extend([
             async_track_time_interval(self.hass, self.tick, timedelta(seconds=5)),
@@ -211,12 +217,23 @@ class Manager:
             "has_saved_plan": isinstance(self.saved_presets, dict) and vacuum in self.saved_presets,
         }
 
+    async def get_history(self, call: ServiceCall) -> dict:
+        """Read persisted execution evidence for one explicitly authorized vacuum."""
+        vacuum = call.data["vacuum"]
+        try:
+            await async_require_control(self.hass.auth, call.context.user_id, [vacuum], POLICY_CONTROL)
+        except PermissionError as err:
+            raise Unauthorized(context=call.context, permission=POLICY_CONTROL) from err
+        async with self.lock:
+            return history.response(self.queue, vacuum)
+
     @callback
     def subscribe(self, listener):
         self.listeners.append(listener)
         return lambda: self.listeners.remove(listener)
 
     async def publish(self) -> None:
+        history.sync(self.queue, time.time())
         data = self.queue.dump()
         if data == self.last_published:
             if self.robot_state != self.last_robot_published:
@@ -230,7 +247,9 @@ class Manager:
         except Exception:  # noqa: BLE001 - never leave an undispatched command looking active
             _LOGGER.exception("Queue state could not be saved; stopping the queue for review")
             self.queue.attention("The queue state could not be saved. Check the robot before starting a new sequence.")
-            self.last_published = self.queue.dump()
+            history.sync(self.queue, time.time())
+            # Keep the last *durable* snapshot so the next no-motion tick retries
+            # a transient storage failure instead of silently losing this history.
             for listener in list(self.listeners):
                 listener()
             return
@@ -468,9 +487,12 @@ class Manager:
                 state = self.hass.states.get(entity_id)
                 if self.device_value_matches(state.state, expected, domain):
                     return
+                history.sync(self.queue, time.time())
+                last_run, previous_runs, history_revision = deepcopy(self.queue.last_run), deepcopy(self.queue.previous_runs), self.queue.history_revision
                 self.queue = Queue(mode="device", phase="controlling", vacuum=vacuum, run_id=uuid4().hex,
                     setup={"control": key, "value": expected, "domain": domain}, control_entities={"device": entity_id},
-                    pending_command="device", command_at=time.time(), owner_user_id=call.context.user_id)
+                    pending_command="device", command_at=time.time(), owner_user_id=call.context.user_id,
+                    last_run=last_run, previous_runs=previous_runs, history_revision=history_revision)
                 reservation = self.queue.run_id
                 await self.publish()
                 # Persisted reservation blocks starts while native telemetry catches up.
@@ -648,7 +670,8 @@ class Manager:
                         except PermissionError as err:
                             raise Unauthorized(context=call.context, permission=POLICY_CONTROL) from err
                         address = "room" if requests and all(isinstance(item, dict) for item in requests) else "area"
-                        effect = self.queue.start_manual(vacuum, data["rooms"], setup, stages, controls, current, time.time(), uuid4().hex)
+                        effect = self.queue.start_manual(vacuum, data["rooms"], setup, stages, controls, current, time.time(), uuid4().hex,
+                            room_names={key: value["name"] for key, value in targets.items()})
                         self.queue.address = address
                         self.queue.owner_user_id = call.context.user_id
                     elif standalone:

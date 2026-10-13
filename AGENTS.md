@@ -21,6 +21,7 @@ python3 -B test/backend_queue_test.py
 python3 -B test/backend_manual_test.py
 python3 -B test/backend_controls_test.py
 python3 -B test/backend_device_test.py
+python3 -B test/backend_history_test.py
 ```
 
 Source changes alone do not authorize production installation or an actual cleaning run.

@@ -62,6 +62,7 @@ Installation and restart send no robot command. Afterwards, `sensor.robot_cleane
 | `robot_cleaner_queue.save_preset` | Store one validated plan per vacuum |
 | `robot_cleaner_queue.get_capabilities` | Read-only capabilities, manual options, native control discovery and zones-and-areas report |
 | `robot_cleaner_queue.get_diagnostics` | Authorized robot’s queue and recent controller events |
+| `robot_cleaner_queue.get_history` | Persisted last sequence and up to five previous sequences, with per-pass completion evidence |
 
 ```yaml
 action: robot_cleaner_queue.control
@@ -97,6 +98,18 @@ One Home Assistant area may cover several robot rooms: a `Kitchen` area mapped t
 
 Set the `custom_components.robot_cleaner_queue` logger to `debug` for a step-by-step account of every observation, command, deferral and refusal. `robot_cleaner_queue.get_diagnostics` returns the persisted queue, the current robot observation and the last 100 recorded steps, so a stopped sequence can be explained without reading the log.
 
+Every accepted cleaning plan also keeps an independent, shared activity record. Water faults,
+pause/resume, cancellation, dock/settings controls and Home Assistant restarts do not erase
+the assigned rooms or their verified results. Starting another plan retains the previous
+sequence in a bounded history of five previous runs. History never restarts old work.
+
+The record preserves each room's name and settings and every vacuum/mop pass, including
+repeats. A successful native cleaning record supplies the actual start/end times; a separate
+confirmation time shows when Home Assistant observed it. Older stored queues retain their
+completed counts with unknown timestamps. Unstarted passes remain pending, and an interrupted
+pass is never presented as successfully cleaned. Details are available from `get_history`;
+the sensor publishes small summaries and a revision for frontend updates.
+
 ## Tests
 
 ```sh
@@ -106,6 +119,7 @@ python3 -B test/backend_queue_test.py
 python3 -B test/backend_manual_test.py
 python3 -B test/backend_controls_test.py
 python3 -B test/backend_device_test.py
+python3 -B test/backend_history_test.py
 ```
 
 These are offline event traces against the production transition code with simulated Home Assistant states. They send no robot commands and do not prove physical operation.

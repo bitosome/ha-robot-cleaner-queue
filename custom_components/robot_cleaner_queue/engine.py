@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from copy import deepcopy
 from typing import Any
+
+from . import history
 
 ACTIVE = {"preparing", "starting", "running", "paused", "controlling", "finishing"}
 READY_STATUS = {"idle", "charging", "charging_complete"}
@@ -121,6 +124,9 @@ class Queue:
     decision: str = ""
     address: str = ""
     owner_user_id: str | None = None
+    last_run: dict[str, Any] | None = None
+    previous_runs: list[dict[str, Any]] = field(default_factory=list)
+    history_revision: int = 0
 
     def dump(self) -> dict[str, Any]:
         return asdict(self)
@@ -128,6 +134,7 @@ class Queue:
     @classmethod
     def restore(cls, data: dict[str, Any] | None) -> Queue:
         queue = cls(**{k: v for k, v in (data or {}).items() if k in cls.__dataclass_fields__})
+        history.restore(queue)
         if queue.phase in ACTIVE or queue.pending_command:
             queue.attention("Home Assistant restarted. The saved queue was interrupted; clear it and select a new sequence when the robot is idle.")
         # v0.8.1 used the ten-minute setup deadline as a settings-only barrier.
@@ -135,6 +142,7 @@ class Queue:
         if queue.barrier_window == CONFIGURE_SECONDS:
             queue.not_before = min(queue.not_before, queue.command_at + ACK_SECONDS)
             queue.barrier_window = ACK_SECONDS
+        history.sync(queue)
         return queue
 
     def attention(self, message: str) -> None:
@@ -145,6 +153,7 @@ class Queue:
         self.next_pending = False
         self.start_uncertain = False
         self._reset_ready()
+        history.sync(self)
 
     def confirmed(self) -> None:
         """The outstanding command was observed, so nothing about it is uncertain."""
@@ -259,6 +268,7 @@ class Queue:
         # readback it is waiting for, so refuse instead of losing that uncertainty.
         if self.mode == "device" and self.phase == "controlling":
             raise ValueError("A dock or settings command is still being confirmed. Wait for it before finishing.")
+        history.cancel_before_detach(self, now)
         self._preserve_command_barrier()
         self.mode, self.phase = "finish", "controlling"
         self.vacuum, self.run_id = vacuum, run_id
@@ -332,6 +342,7 @@ class Queue:
             self._validate_recovery_observation(snapshot, now)
         if not self.validate_control_state(command, snapshot):
             return None
+        history.sync(self, now)
         # A terminal sequence is historical, not a job to resume. Discard all
         # stage bookkeeping so no observation can advance its old stages.
         self.mode, self.phase = "external", "controlling"
@@ -390,7 +401,8 @@ class Queue:
             self.attention("The robot did not acknowledge the command within 60 seconds. No retry was sent.")
 
     def start_manual(self, vacuum: str, targets: list[str], setup: dict, stages: list[dict],
-                     control_entities: dict[str, str], snapshot: Snapshot, now: float, run_id: str) -> tuple[str, str]:
+                     control_entities: dict[str, str], snapshot: Snapshot, now: float, run_id: str,
+                     room_names: dict[str, str] | None = None) -> tuple[str, str]:
         if not stages or len(stages) > 128:
             raise ValueError("The cleaning plan has no supported stages or exceeds 128 stages.")
         if self.phase == "attention" and self.vacuum and self.vacuum != vacuum:
@@ -399,17 +411,22 @@ class Queue:
         # room plan without one is judged by the room it starts with.
         plan_mode = setup.get("mode") or stages[0].get("mode") or "vacuum"
         self._validate_start(snapshot, now, plan_mode)
+        history.sync(self, now)
         self.mode = "manual"
         self.vacuum, self.run_id = vacuum, run_id
-        self.targets, self.setup = list(targets), dict(setup)
-        self.stages = [dict(stage) for stage in stages]
+        self.targets, self.setup = list(targets), deepcopy(setup)
+        self.stages = deepcopy(stages)
         self.control_entities = dict(control_entities)
         self.current_index = self.completed = 0
         self.started_at = self.baseline_end = self.finish_wait_at = 0
         self.seen_job = False
         self.error = ""
         self.not_before = self.barrier_window = self.dock_finish_at = 0
-        return self._dispatch(snapshot, now)
+        self.phase = "preparing"
+        history.begin(self, now, room_names)
+        effect = self._dispatch(snapshot, now)
+        history.sync(self, now)
+        return effect
 
     @property
     def cleaning_mode(self) -> str:
@@ -449,6 +466,11 @@ class Queue:
         return "manual", str(self.current_index)
 
     def command(self, command: str, snapshot: Snapshot, now: float) -> tuple[str, str] | None:
+        effect = self._command(command, snapshot, now)
+        history.sync(self, now)
+        return effect
+
+    def _command(self, command: str, snapshot: Snapshot, now: float) -> tuple[str, str] | None:
         if command == "stop":
             self._validate_command_barrier(snapshot, now)
             if self.pending_command:
@@ -541,6 +563,14 @@ class Queue:
                          "(vacuum=%s status=%s job=%s)" % (snapshot.vacuum, snapshot.status, snapshot.job))
 
     def observe(self, snapshot: Snapshot, now: float) -> tuple[str, str] | None:
+        if self.phase not in ACTIVE and not self.pending_command:
+            return None  # Historical evidence cannot adopt a later native job.
+        history.observe_running(self, snapshot, now, CLEANING_STATUS)
+        effect = self._observe(snapshot, now)
+        history.sync(self, now)
+        return effect
+
+    def _observe(self, snapshot: Snapshot, now: float) -> tuple[str, str] | None:
         if self.mode == "finish":
             return self._observe_finish(snapshot, now)
         if self.mode == "external":
@@ -680,6 +710,7 @@ class Queue:
         if complete != 1 or error != 0 or (reason is not None and reason not in SUCCESS_REASONS):
             self.attention("The cleaning job was interrupted, failed, or did not report successful completion. No next room was started.")
             return None
+        history.complete_stage(self, record, now)
         self.completed += 1
         self.current_index += 1
         self._reset_ready()
