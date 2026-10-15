@@ -31,3 +31,11 @@ Validate package changes with actual Home Assistant package merging and script v
 `python3 -B test/backend_package_test.py` (Python 3.14; dependencies in
 `test/requirements-homeassistant.txt`). A successful `ha core check` alone does not
 prove individual script entities loaded; verify the wrapper entity and its fields after reload.
+
+## Publishing
+
+Commit and push every change. A change a user can see - card behaviour, integration
+code, entity or service contracts - also gets a version bump and an annotated
+`v<version>` tag, because HACS installs from releases: do not wait to be asked for a
+release. Docs-only changes are pushed without a release. After pushing a tag, confirm
+the release workflow succeeded and that the asset is attached.
