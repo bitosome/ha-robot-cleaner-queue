@@ -124,6 +124,19 @@ python3 -B test/backend_history_test.py
 
 These are offline event traces against the production transition code with simulated Home Assistant states. They send no robot commands and do not prove physical operation.
 
+The package regression test additionally uses Home Assistant itself (Python 3.14):
+
+```sh
+python3 -m pip install -r test/requirements-homeassistant.txt
+python3 -B test/backend_package_test.py
+```
+
+It validates the wrapper after Home Assistant merges packages, including selector
+types and continuation fields. Release CI requires this check. Package-only script
+fixes can be applied by replacing the wrapper and reloading scripts; no robot action
+or Home Assistant restart is needed.
+
+
 ## License
 
 MIT

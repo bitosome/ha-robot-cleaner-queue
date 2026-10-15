@@ -28,7 +28,7 @@ script:
       run_id:
         description: Current queue run_id for explicit continuation.
         selector:
-          text: {}
+          text: null
       current_index:
         description: Current queue pass index for explicit continuation.
         selector:
@@ -38,7 +38,7 @@ script:
       water_refilled:
         description: Confirm the clean-water tank was refilled for this interrupted pass.
         selector:
-          boolean: {}
+          boolean: null
       rooms:
         description: Ordered native room objects or mapped-area IDs.
         selector:

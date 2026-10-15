@@ -33,3 +33,12 @@ jobs:
           assert pathlib.Path('custom_components/robot_cleaner_queue/services.yaml').is_file()
           print('manifest ok:', manifest['domain'], manifest['version'])
           PY
+  package_check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - run: pip install -r test/requirements-homeassistant.txt
+      - run: python3 -B test/backend_package_test.py

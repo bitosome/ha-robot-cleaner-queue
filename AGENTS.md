@@ -26,3 +26,8 @@ python3 -B test/backend_recovery_test.py
 ```
 
 Source changes alone do not authorize production installation or an actual cleaning run.
+
+Validate package changes with actual Home Assistant package merging and script validation:
+`python3 -B test/backend_package_test.py` (Python 3.14; dependencies in
+`test/requirements-homeassistant.txt`). A successful `ha core check` alone does not
+prove individual script entities loaded; verify the wrapper entity and its fields after reload.
