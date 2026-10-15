@@ -8,7 +8,7 @@ from __future__ import annotations
 
 MAX_EXCEPTION_NODES = 16
 MAX_CODE = 2**31 - 1
-OPERATIONS = frozenset({"configure", "manual", "start", "resume", "pause", "stop",
+OPERATIONS = frozenset({"configure", "manual", "start", "resume", "resume_now", "pause", "stop",
                         "return_to_dock", "device"})
 TRANSLATION_DOMAINS = frozenset({"roborock", "homeassistant", "vacuum", "select"})
 TRANSLATION_KEYS = frozenset({"command_failed", "update_options_failed", "option_not_valid",

@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass, field
 from copy import deepcopy
 from typing import Any
 
-from . import history
+from . import history, recovery
 
 ACTIVE = {"preparing", "starting", "running", "paused", "controlling", "finishing"}
 READY_STATUS = {"idle", "charging", "charging_complete"}
@@ -60,6 +60,10 @@ class Snapshot:
     observed_at: float = 0
     settings: dict[str, str] = field(default_factory=dict)
     dock_drying: bool | None = None
+    job_type: int | None = None
+    in_returning: int | None = None
+    battery: int | float | None = None
+    clean_time: int | float | None = None
 
     @property
     def robot_healthy(self) -> bool:
@@ -127,6 +131,15 @@ class Queue:
     last_run: dict[str, Any] | None = None
     previous_runs: list[dict[str, Any]] = field(default_factory=list)
     history_revision: int = 0
+    # Continuity is evidence for an explicit recovery, never an auto-resume flag.
+    native_job_type: int | None = None
+    native_job_discontinuous: bool = False
+    native_clean_time: int | float | None = None
+    native_job_observed_at: float = 0
+    continuation_context: str = ""
+    interrupted_next_pending: bool = False
+    water_refilled_index: int = -1
+    resume_owned_job: bool = False
 
     def dump(self) -> dict[str, Any]:
         return asdict(self)
@@ -135,8 +148,12 @@ class Queue:
     def restore(cls, data: dict[str, Any] | None) -> Queue:
         queue = cls(**{k: v for k, v in (data or {}).items() if k in cls.__dataclass_fields__})
         history.restore(queue)
+        # A process gap cannot establish continuity of an unfinished native job.
+        queue.continuation_context = ""
+        queue.water_refilled_index = -1
+        queue.resume_owned_job = False
         if queue.phase in ACTIVE or queue.pending_command:
-            queue.attention("Home Assistant restarted. The saved queue was interrupted; clear it and select a new sequence when the robot is idle.")
+            queue.attention("Home Assistant restarted. The saved queue was interrupted; review its retained progress before continuing when the robot is idle.")
         # v0.8.1 used the ten-minute setup deadline as a settings-only barrier.
         # No motion command uses that duration; shorten only that legacy case.
         if queue.barrier_window == CONFIGURE_SECONDS:
@@ -145,7 +162,11 @@ class Queue:
         history.sync(queue)
         return queue
 
-    def attention(self, message: str) -> None:
+    def attention(self, message: str, *, recoverable_fault: bool = False) -> None:
+        self.water_refilled_index = -1
+        self.resume_owned_job = False
+        self.continuation_context = "device_fault" if recoverable_fault else ""
+        self.interrupted_next_pending = self.next_pending
         self._preserve_command_barrier()
         self.phase = "attention"
         self.error = message
@@ -161,6 +182,7 @@ class Queue:
         self.not_before = 0
         self.barrier_window = 0
         self.start_uncertain = False
+        self.resume_owned_job = False
 
     def _reset_ready(self) -> None:
         self.ready_since = self.ready_observed_at = 0
@@ -184,7 +206,7 @@ class Queue:
 
     def ack_window(self) -> float:
         """How long a dispatched command may take to become observable."""
-        if self.pending_command in {"start", "resume"}:
+        if self.pending_command in {"start", "resume", "resume_now"}:
             return START_SECONDS
         if self.pending_command == "configure":
             # Settings cannot launch cleaning. Allow one native update window for
@@ -193,13 +215,13 @@ class Queue:
         return ACK_SECONDS
 
     def ack_timeout_message(self) -> str:
-        if self.pending_command in {"start", "resume"}:
+        if self.pending_command in {"start", "resume", "resume_now"}:
             return ("The robot did not start the room within %d minutes. No retry was sent."
                     % (START_SECONDS // 60))
         return "The robot did not acknowledge the command within 60 seconds. No retry was sent."
 
     def _preserve_command_barrier(self) -> None:
-        if self.pending_command in {"start", "configure", "pause", "resume", "return_to_dock", "stop", "device"}:
+        if self.pending_command in {"start", "configure", "pause", "resume", "resume_now", "return_to_dock", "stop", "device"}:
             # A cloud command may have been accepted before telemetry catches up.
             # Clearing the UI must not permit another start on that stale state, so the
             # barrier lasts as long as that command may still be acknowledged.
@@ -270,6 +292,9 @@ class Queue:
             raise ValueError("A dock or settings command is still being confirmed. Wait for it before finishing.")
         history.cancel_before_detach(self, now)
         self._preserve_command_barrier()
+        self.water_refilled_index = -1
+        self.resume_owned_job = False
+        self.continuation_context = ""
         self.mode, self.phase = "finish", "controlling"
         self.vacuum, self.run_id = vacuum, run_id
         self.targets, self.stages = [], []
@@ -345,6 +370,9 @@ class Queue:
         history.sync(self, now)
         # A terminal sequence is historical, not a job to resume. Discard all
         # stage bookkeeping so no observation can advance its old stages.
+        self.water_refilled_index = -1
+        self.resume_owned_job = False
+        self.continuation_context = ""
         self.mode, self.phase = "external", "controlling"
         self.vacuum, self.run_id = vacuum, run_id
         self.targets, self.stages = [], []
@@ -413,6 +441,8 @@ class Queue:
         self._validate_start(snapshot, now, plan_mode)
         history.sync(self, now)
         self.mode = "manual"
+        self.water_refilled_index = -1
+        self.resume_owned_job = False
         self.vacuum, self.run_id = vacuum, run_id
         self.targets, self.setup = list(targets), deepcopy(setup)
         self.stages = deepcopy(stages)
@@ -423,6 +453,11 @@ class Queue:
         self.error = ""
         self.not_before = self.barrier_window = self.dock_finish_at = 0
         self.phase = "preparing"
+        self.native_job_discontinuous = False
+        self.native_job_type = self.native_clean_time = None
+        self.native_job_observed_at = 0
+        self.continuation_context = ""
+        self.interrupted_next_pending = False
         history.begin(self, now, room_names)
         effect = self._dispatch(snapshot, now)
         history.sync(self, now)
@@ -461,6 +496,11 @@ class Queue:
         self.command_at = self.started_at = now
         self.baseline_end = float((snapshot.record or {}).get("end") or 0)
         self.seen_job = False
+        self.native_job_discontinuous = False
+        self.native_job_type = self.native_clean_time = None
+        self.native_job_observed_at = 0
+        self.continuation_context = ""
+        self.interrupted_next_pending = False
         self.finish_wait_at = 0
         self.next_pending = False
         return "manual", str(self.current_index)
@@ -471,6 +511,13 @@ class Queue:
         return effect
 
     def _command(self, command: str, snapshot: Snapshot, now: float) -> tuple[str, str] | None:
+        if command == "continue_sequence":
+            return recovery.continue_sequence(self, snapshot, now)
+        if command == "resume_now":
+            recovery.validate_resume_now(self, snapshot, now)
+            self.resume_owned_job = True
+            self.phase, self.pending_command, self.command_at = "starting", "resume_now", now
+            return "vacuum", "start"
         if command == "stop":
             self._validate_command_barrier(snapshot, now)
             if self.pending_command:
@@ -484,6 +531,8 @@ class Queue:
         if command == "cancel":
             self._preserve_command_barrier()
             self.start_uncertain = False
+            self.water_refilled_index = -1
+            self.continuation_context = ""
             self._reset_ready()
             self.phase = "cancelled"
             self.pending_command = ""
@@ -562,11 +611,15 @@ class Queue:
         self.decision = ("floor cleaning finished; waiting for final return and dock care "
                          "(vacuum=%s status=%s job=%s)" % (snapshot.vacuum, snapshot.status, snapshot.job))
 
+    def execution_snapshot(self, snapshot: Snapshot) -> Snapshot:
+        return recovery.effective_snapshot(self, snapshot)
+
     def observe(self, snapshot: Snapshot, now: float) -> tuple[str, str] | None:
         if self.phase not in ACTIVE and not self.pending_command:
             return None  # Historical evidence cannot adopt a later native job.
+        recovery.observe_job(self, snapshot, now)
         history.observe_running(self, snapshot, now, CLEANING_STATUS)
-        effect = self._observe(snapshot, now)
+        effect = self._observe(self.execution_snapshot(snapshot), now)
         history.sync(self, now)
         return effect
 
@@ -594,7 +647,8 @@ class Queue:
         if self.phase not in ACTIVE:
             return None
         if not snapshot.healthy_for(self.cleaning_mode):
-            self.attention("The robot or dock has a fault, or telemetry is unavailable. The queue is stopped for review.")
+            self.attention("The robot or dock has a fault, or telemetry is unavailable. The sequence is retained for review.",
+                           recoverable_fault=snapshot.connected and snapshot.job in {"on", "off"})
             self.decision = "stopped: robot, dock or telemetry unhealthy (vacuum=%s status=%s job=%s error=%s dock=%s connected=%s)" % (
                 snapshot.vacuum, snapshot.status, snapshot.job, snapshot.error, snapshot.dock_error, snapshot.connected)
             return None
@@ -638,7 +692,8 @@ class Queue:
             fresh = snapshot.observed_at == 0 or snapshot.observed_at >= self.command_at
             ack = fresh and (
                 (self.pending_command == "pause" and snapshot.vacuum == snapshot.status == "paused") or (
-                    self.pending_command in {"start", "resume"} and snapshot.status in START_STATUS
+                    self.pending_command in {"start", "resume", "resume_now"} and snapshot.status in START_STATUS
+                    and (not self.resume_owned_job or recovery.matches_owned_job(self, snapshot))
                 )
             )
             if ack:
@@ -680,7 +735,7 @@ class Queue:
         if snapshot.job == "on":
             self.seen_job = True
             self.finish_wait_at = 0
-            self.decision = "cleaning (job active, status=%s)" % snapshot.status
+            self.decision = "%s (job active, status=%s)" % (recovery.execution_status(self, snapshot), snapshot.status)
             return None  # Includes low-battery breaks and mop washing.
         if not self.seen_job:
             # A job can acknowledge by washing its mops before in_cleaning turns on.

@@ -59,6 +59,13 @@ class ServiceSchemaTests(unittest.TestCase):
         ):
             self.assertTrue(self.accepts(payload), payload)
 
+    def test_explicit_continuation_contract_validates_stale_guard_and_ack_fields(self):
+        for command in ["continue_sequence", "resume_now"]:
+            self.assertTrue(self.accepts({"command": command, "vacuum": "vacuum.robot",
+                "run_id": "existing-run", "current_index": 2, "water_refilled": True}))
+        self.assertFalse(self.accepts({"command": "continue_sequence", "current_index": -1}))
+        self.assertFalse(self.accepts({"command": "continue_sequence", "water_refilled": "yes"}))
+
     def test_legacy_area_plans_still_validate(self):
         self.assertTrue(self.accepts({"command": "start_manual", "vacuum": "vacuum.robot",
                                       "rooms": ["kitchen"], "setup": {"mode": "vacuum"}}))

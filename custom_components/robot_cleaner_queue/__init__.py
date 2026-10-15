@@ -23,7 +23,7 @@ from .adapter import is_competing_command, routine_matches, snapshot
 from .engine import ACTIVE, ACK_SECONDS, Queue, Snapshot
 from .device import CONTROLS, DOCK, device_entities, device_command
 from .errors import command_failure_metadata
-from . import history
+from . import history, recovery
 from .permissions import async_require_control
 from .manual import build_plan, build_room_plan, cached_settings, capabilities, current_map, robot_targets, validate_stage
 
@@ -42,8 +42,11 @@ ROOM_SCHEMA = vol.Schema({
 })
 PLAN_ROOMS = vol.All(cv.ensure_list, [vol.Any(str, ROOM_SCHEMA)])
 SERVICE_SCHEMA = vol.Schema({
-    vol.Required("command"): vol.In(["start_manual", "pause", "resume", "cancel", "return_to_dock", "stop", "toggle", "toggle_saved"]),
+    vol.Required("command"): vol.In(["start_manual", "pause", "resume", "cancel", "return_to_dock", "stop", "toggle", "toggle_saved", "continue_sequence", "resume_now"]),
     vol.Optional("vacuum", default=""): str,
+    vol.Optional("run_id"): str,
+    vol.Optional("current_index"): vol.All(int, vol.Range(min=0)),
+    vol.Optional("water_refilled", default=False): bool,
     vol.Optional("rooms", default=[]): PLAN_ROOMS,
     # Plan defaults; each room may override any of them, and a room plan without
     # defaults is valid because every room can carry its own mode.
@@ -284,8 +287,8 @@ class Manager:
         try:
             caps, controls, _, _ = self.manual_capabilities(call.data["vacuum"])
             await async_require_control(self.hass.auth, call.context.user_id, list(controls.values()), POLICY_CONTROL)
-            caps["control_version"] = 5
-            caps["execution_version"] = 3
+            caps["control_version"] = 6
+            caps["execution_version"] = 4
             caps["current_map"] = current_map(self.resolve(call.data["vacuum"])[2])[0]
             caps["saved_preset"] = await self.read_saved_preset(call.data["vacuum"], call.context.user_id)
             caps["saved_plan_revision"] = (caps["saved_preset"] or {}).get("revision", 0)
@@ -565,7 +568,9 @@ class Manager:
         current.settings = self.observed_settings(vacuum, state, coordinator)
         self.robot_state = {"dock_status": current.status, "dock_drying": current.dock_drying,
                             "robot_observed_at": current.observed_at, "robot_activity": current.vacuum,
-                            "robot_connected": current.connected, **self.recovery_state(current)}
+                            "robot_connected": current.connected, "robot_job": current.job,
+                            "robot_battery": current.battery, **self.recovery_state(current),
+                            **self.continuation_state(current)}
         return current
 
     def recovery_state(self, current: Snapshot) -> dict:
@@ -575,6 +580,30 @@ class Manager:
         except ValueError as err:
             return {"recovery_ready": False, "recovery_reason": str(err)}
         return {"recovery_ready": True, "recovery_reason": ""}
+
+    def validate_continuation_plan(self, vacuum: str) -> None:
+        """Revalidate the frozen rooms/settings without rebuilding or replacing them."""
+        if self.queue.completed == len(self.queue.stages):
+            return
+        caps, controls, targets, map_id = self.manual_capabilities(vacuum)
+        if self.queue.address == "room":
+            targets = robot_targets(self.resolve(vacuum)[2], map_id)
+        if controls != self.queue.control_entities or caps.get("unavailable_controls"):
+            raise ValueError("The native cleaning controls are unavailable or changed. Restore them before continuing.")
+        for stage in self.queue.stages[self.queue.current_index:]:
+            validate_stage(stage, caps, targets, map_id)
+
+    def continuation_state(self, current: Snapshot) -> dict:
+        result = recovery.state(self.queue, current, time.time())
+        if result["continuation_ready"] or result["resume_now_ready"]:
+            try:
+                self.validate_continuation_plan(self.queue.vacuum)
+            except ValueError as err:
+                if result["continuation_ready"]:
+                    result.update(continuation_ready=False, continuation_reason=str(err))
+                if result["resume_now_ready"]:
+                    result.update(resume_now_ready=False, resume_now_reason=str(err))
+        return result
 
     def observed_settings(self, vacuum: str, state, coordinator) -> dict:
         """Prefer the native select states: they hold exactly the strings select_option accepts."""
@@ -674,6 +703,25 @@ class Manager:
                             room_names={key: value["name"] for key, value in targets.items()})
                         self.queue.address = address
                         self.queue.owner_user_id = call.context.user_id
+                    elif command in {"continue_sequence", "resume_now"}:
+                        if data.get("run_id") != self.queue.run_id or data.get("current_index") != self.queue.current_index:
+                            raise ValueError("The sequence changed. Refresh its progress before continuing.")
+                        self.validate_continuation_plan(vacuum)
+                        try:
+                            await async_require_control(self.hass.auth, call.context.user_id,
+                                list(self.queue.control_entities.values()), POLICY_CONTROL)
+                        except PermissionError as err:
+                            raise Unauthorized(context=call.context, permission=POLICY_CONTROL) from err
+                        # Authorization awaits may overlap a native update or an
+                        # external command. A read-only rejoin needs this recheck too.
+                        current = self.current_snapshot(vacuum)
+                        self.validate_continuation_plan(vacuum)
+                        if command == "continue_sequence":
+                            effect = recovery.continue_sequence(self.queue, current, time.time(),
+                                water_refilled=data.get("water_refilled", False))
+                        else:
+                            effect = self.queue.command(command, current, time.time())
+                        self.queue.owner_user_id = call.context.user_id
                     elif standalone:
                         effect = self.queue.external_control(command, vacuum, current, time.time(), uuid4().hex)
                         if effect:
@@ -683,6 +731,8 @@ class Manager:
             except ValueError as err:
                 # Rejected starts must not interrupt an existing valid queue.
                 raise ServiceValidationError(str(err)) from err
+            if command in {"continue_sequence", "resume_now"}:
+                self.current_snapshot(vacuum)
             await self.publish()
             if effect:
                 await self.execute(effect, call.context)
@@ -722,7 +772,7 @@ class Manager:
         async def authorize():
             await async_require_control(self.hass.auth, user_id,
                 [self.queue.vacuum, *(self.queue.control_entities.values()
-                                     if kind in {"configure", "manual"} else [])], POLICY_CONTROL)
+                                     if kind in {"configure", "manual"} or self.queue.resume_owned_job else [])], POLICY_CONTROL)
         try:
             await authorize()
             if not self.effect_valid(effect):
@@ -759,7 +809,7 @@ class Manager:
                     raise ValueError("Native controls are temporarily unavailable. No start was sent.")
                 if controls != self.queue.control_entities:
                     raise ValueError("The native manual control entities changed.")
-                current = self.current_snapshot(self.queue.vacuum)
+                current = self.queue.execution_snapshot(self.current_snapshot(self.queue.vacuum))
                 self.queue.validate_fresh_observation(current, time.time())
                 if not current.ready_for(self.queue.cleaning_mode):
                     raise ValueError("The robot is no longer ready to start a manual job.")
@@ -773,7 +823,7 @@ class Manager:
                             return
                         # A native-app start can appear during an awaited settings
                         # refresh without a Home Assistant service event.
-                        current = self.current_snapshot(self.queue.vacuum)
+                        current = self.queue.execution_snapshot(self.current_snapshot(self.queue.vacuum))
                         if current.servicing_for(self.queue.cleaning_mode):
                             # A successful earlier write is retained. Resume only the
                             # unsent settings after normal post-clean dock care ends.
@@ -799,7 +849,7 @@ class Manager:
                         await self.publish()  # Retain the latest possible write time across restart.
                         if not self.effect_valid(effect):
                             return
-                        current = self.current_snapshot(self.queue.vacuum)
+                        current = self.queue.execution_snapshot(self.current_snapshot(self.queue.vacuum))
                         if current.servicing_for(self.queue.cleaning_mode):
                             self.deferred_configuration = (token, effect)
                             return
@@ -815,7 +865,7 @@ class Manager:
                         self.configured_keys.add(key)
                     # Tick uses freshly observed settings before issuing any start.
                     return
-                current = self.current_snapshot(self.queue.vacuum)
+                current = self.queue.execution_snapshot(self.current_snapshot(self.queue.vacuum))
                 self.queue.validate_fresh_observation(current, time.time())
                 if not all(current.settings.get(key) == value for key, value in self.queue.stage["settings"].items()):
                     raise ValueError("Manual settings changed before the start command.")
@@ -838,14 +888,23 @@ class Manager:
                     self.start_dispatch_token = start_token
                     await self.hass.services.async_call("vacuum", "clean_area" if area else "start", data, blocking=True, context=context)
             else:
-                current = self.current_snapshot(self.queue.vacuum)
+                current = self.queue.execution_snapshot(self.current_snapshot(self.queue.vacuum))
                 self.queue.validate_fresh_observation(current, time.time())
                 self.queue._validate_command_barrier(current, time.time())
-                if not self.queue.validate_control_state(self.queue.pending_command, current):
+                if self.queue.resume_owned_job:
+                    self.validate_continuation_plan(self.queue.vacuum)
+                    recovery.validate_native_resume(self.queue, current)
+                elif not self.queue.validate_control_state(self.queue.pending_command, current):
                     return
+                data = {"entity_id": self.queue.vacuum}
+                if self.queue.resume_owned_job:
+                    target = "send_command"
+                    data["command"] = recovery.RESUME_COMMANDS[current.job_type]
                 attempted = True
-                await self.hass.services.async_call("vacuum", target, {"entity_id": self.queue.vacuum}, blocking=True, context=context)
+                await self.hass.services.async_call("vacuum", target, data, blocking=True, context=context)
         except PermissionError:
+            if self.queue.resume_owned_job and not attempted:
+                self.queue.confirmed()
             if kind == "manual" and not attempted:
                 self.queue.confirmed()  # A reserved start that never reached the native API.
             self.queue.attention("The initiating user can no longer control this cleaning sequence. No further command was sent.")
@@ -861,10 +920,13 @@ class Manager:
                 failure["setting"] = setting
             self.queue.command_failure = failure
             self.event("command-failed", str(failure), logging.WARNING)
-            if kind == "manual" and attempted and self.effect_valid(effect):
+            if (kind == "manual" or self.queue.resume_owned_job) and attempted and self.effect_valid(effect):
                 self.queue.start_uncertain = True
-                self.queue.decision = "The start response is uncertain; watching native status without resending."
+                self.queue.decision = "The %s response is uncertain; watching native status without resending." % (
+                    "resume" if self.queue.resume_owned_job else "start")
             else:
+                if self.queue.resume_owned_job and not attempted:
+                    self.queue.confirmed()
                 if kind == "manual" and not attempted:
                     self.queue.confirmed()
                 self.queue.attention("The %s command %s (%s). Check the robot; no automatic retry was sent." % (
@@ -894,10 +956,13 @@ class Manager:
                 await self.publish()
                 return
             if self.queue.phase not in ACTIVE and not self.queue.pending_command:
+                recovery.observe_job(self.queue, current, time.time())
+                self.robot_state.update(self.continuation_state(current))
                 await self.publish()  # Keep native dock care visible after floor completion.
                 return
             self.observe_log(current)
             effect = self.queue.observe(current, time.time())
+            self.robot_state.update(self.continuation_state(current))
             await self.publish()
             if effect:
                 await self.execute(effect)
@@ -911,7 +976,8 @@ class Manager:
 
     @callback
     def external_command(self, event) -> None:
-        if self.closing or self.queue.phase not in ACTIVE or event.context.id in self.contexts:
+        if (self.closing or (self.queue.phase not in ACTIVE and self.queue.phase != "attention")
+                or event.context.id in self.contexts):
             return
         domain, service = event.data.get("domain"), event.data.get("service")
         data = event.data.get("service_data", {})

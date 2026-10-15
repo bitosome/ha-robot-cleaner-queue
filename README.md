@@ -51,13 +51,13 @@ Installation and restart send no robot command. Afterwards, `sensor.robot_cleane
 
 - One robot and one queue per Home Assistant instance.
 - Other robot platforms and Roborock protocols are not implicitly supported.
-- The robot must be idle and docked with no unfinished job before a sequence starts, and an `attention` queue must be cleared before another one can begin.
+- A new sequence requires a fresh idle/docked robot with no unfinished job. An interrupted sequence keeps its progress and offers explicit continuation or retry of its unconfirmed pass; it never resumes automatically.
 
 ## Services
 
 | Action | Purpose |
 | --- | --- |
-| `robot_cleaner_queue.control` | `start_manual`, `pause`, `resume`, `cancel`, `return_to_dock`, `stop`, `toggle`, `toggle_saved` |
+| `robot_cleaner_queue.control` | `start_manual`, `pause`, `resume`, `cancel`, `return_to_dock`, `stop`, `toggle`, `toggle_saved`, `continue_sequence`, `resume_now` |
 | `robot_cleaner_queue.device_control` | Allowlisted dock and robot settings (mop washing, child lock, DND, volume, …) |
 | `robot_cleaner_queue.save_preset` | Store one validated plan per vacuum |
 | `robot_cleaner_queue.get_capabilities` | Read-only capabilities, manual options, native control discovery and zones-and-areas report |
@@ -144,3 +144,28 @@ Home Assistant 2026.3 and later displays the bundled integration icon from
 `custom_components/robot_cleaner_queue/brand/`. The editable artwork and export
 instructions are in [branding/](branding/README.md). Earlier Home Assistant
 versions retain their usual fallback icon.
+
+
+## Continue after a water fault or charging break
+
+The card keeps the same room sequence and all confirmed passes when a fault stops
+queue progression. **Continue sequence** resumes a retained paused room job, or
+rejoins observation if that same job is already cleaning. If the native job ended
+without confirmed success, **Retry current pass** repeats only that unconfirmed
+pass, then continues the remaining sequence. An available matching successful
+native record is reconciled before deciding whether a retry is needed.
+
+During an unfinished native charging break, the card shows **Charging to continue** and may
+offer **Continue now**. This sends the explicit native segment/zone resume command through HA;
+firmware still decides whether the battery is sufficient. It never starts a full
+clean in place of the retained room job.
+
+A water-empty warning can remain latched after a refill. Explicitly confirming
+**I refilled the clean-water tank** acknowledges only that known warning for the
+current interrupted pass. Other faults remain blocking, and the acknowledgement
+ends on a healthy dock report, a pass transition, cancellation or HA restart.
+
+The queue cannot prove active-job continuity across a Home Assistant restart or a
+native telemetry gap. It retains the complete plan and progress, but waits until
+the native job is finished/stopped before offering an explicit retry of unconfirmed
+work. No physical action is sent by restarting, refreshing, or reading history.

@@ -16,11 +16,27 @@ control:
           - stop
           - toggle
           - toggle_saved
+          - continue_sequence
+          - resume_now
     vacuum:
       selector:
         entity:
           domain: vacuum
           integration: roborock
+    run_id:
+      description: Required for continue_sequence and resume_now; current sensor run_id.
+      selector:
+        text: {}
+    current_index:
+      description: Required for continuation; current sensor pass index guards stale controls.
+      selector:
+        number:
+          min: 0
+          mode: box
+    water_refilled:
+      description: Explicit acknowledgement that clean water was refilled. Only continue_sequence can use it, for the interrupted pass with the known water-empty fault.
+      selector:
+        boolean: {}
     rooms:
       description: Ordered room objects with id and per-room settings, or legacy mapped-area
         IDs. An explicitly empty list through this API cleans the current map.

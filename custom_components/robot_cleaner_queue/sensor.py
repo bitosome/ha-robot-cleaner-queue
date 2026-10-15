@@ -31,8 +31,8 @@ class QueueSensor(SensorEntity):
     def extra_state_attributes(self):
         queue = self.manager.queue
         return {
-            "control_version": 5,
-            "execution_version": 3,
+            "control_version": 6,
+            "execution_version": 4,
             "run_history_version": history.VERSION,
             "history_revision": queue.history_revision,
             "last_run": history.summary(queue.last_run),

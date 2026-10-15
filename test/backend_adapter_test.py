@@ -129,6 +129,16 @@ class NativeActivityTests(unittest.TestCase):
         current = cached_native(NativeState.segment_mopping, vacuum="paused", job=3)
         self.assertEqual(current.vacuum, "paused")
 
+    def test_cached_native_resume_flags_and_battery_are_numeric_and_not_coerced(self):
+        native = NativeStatus(NativeState.segment_mopping, job=3)
+        native.in_returning, native.battery, native.clean_time = 0, 29, 582
+        coordinator = NS(data=NS(status=native, clean_summary=NS(last_clean_record=None)), last_update_success=True)
+        current = adapter.snapshot(coordinator, "docked")
+        self.assertEqual((current.job_type, current.in_returning, current.battery, current.clean_time), (3, 0, 29, 582))
+        native.in_returning, native.battery, native.clean_time = "0", True, None
+        current = adapter.snapshot(coordinator, "docked")
+        self.assertEqual((current.in_returning, current.battery, current.clean_time), (None, None, None))
+
     def test_unrecognized_and_missing_native_codes_fail_closed(self):
         for code in [0, 8, 9999, None, True, "25"]:
             with self.subTest(code=code):

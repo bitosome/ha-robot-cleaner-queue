@@ -59,7 +59,7 @@ Other commands:
 | `cancel` | Clear the remaining queue only. The current robot operation continues. |
 | `return_to_dock` | Clear the remaining queue first, then request docking when the robot's state permits it. Mop servicing and uncertain states are not interrupted. |
 
-The card contract is `control_version: 5`. Version 0.2.2 can pause/resume/dock an app-started job with an explicit vacuum. It stores `mode: external` without targets or stages; acknowledgement returns it to idle and cannot advance an old plan. Resume requires a paused, unfinished job. Active, attention and uncertain commands cannot be bypassed by controlling a different robot.
+The current card contract is `control_version: 6` and `execution_version: 4`. Version 0.2.2 can pause/resume/dock an app-started job with an explicit vacuum. It stores `mode: external` without targets or stages; acknowledgement returns it to idle and cannot advance an old plan. Resume requires a paused, unfinished job. Active, attention and uncertain commands cannot be bypassed by controlling a different robot.
 
 For non-start commands, pass the same `vacuum` to protect against a card configured for another robot. With execution_version 3, an explicit new start can replace historical `attention` after fresh native readiness and uncertainty checks. It starts the requested plan from its beginning, never resumes old stages. `cancel` remains an optional queue-only dismissal, available even when the robot is offline. Clearing an unacknowledged command preserves a safety barrier: another start requires that command's window to expire — fifteen minutes for a start or resume, sixty seconds for settings or a control command — and a new native poll after that window confirming idle/job-off. The barrier is released as soon as the robot is observed confirming that command, so a stop the robot has already acknowledged never delays docking. Cancelling cannot reuse a stale docked state to send a duplicate job. Only an idle/docked robot with no unfinished job can start a new sequence. Starts cannot replace an existing queue or unfinished job.
 
@@ -100,7 +100,7 @@ The initiating Home Assistant user's control permission is checked on the vacuum
 
 No automatic retries are sent. Faults and lost telemetry stop progression for review. HA commands from other controls stop this queue to avoid competing writers, and so does a Roborock app routine or schedule that starts its own job. App/device interruption is caught by the cleaning record's completion/finish reason; changes that produce indistinguishable successful records cannot be attributed to a particular caller.
 
-Pause and return-to-dock also require observed acknowledgement within 60 seconds; a start or resume gets the 15-minute window and settings preparation may wait ten minutes, but cancelling settings retains only a sixty-second update barrier. Queued rooms and position are persisted in HA's storage before dispatch. An HA restart or shutdown preserves the sequence for inspection and changes it to `attention`; it never resumes cleaning automatically. Clear and reselect the desired remaining rooms after checking the robot. Cancelling or docking clears progression before sending another robot action.
+Pause and return-to-dock also require observed acknowledgement within 60 seconds; a start or resume gets the 15-minute window and settings preparation may wait ten minutes, but cancelling settings retains only a sixty-second update barrier. Queued rooms and position are persisted in HA's storage before dispatch. An HA restart or shutdown preserves the sequence for inspection and changes it to `attention`; it never resumes cleaning automatically. Review the retained progress. An explicit continuation can retry the unconfirmed pass once the robot is ready; active-job continuity is not assumed across restart. Cancelling or docking clears progression before sending another robot action.
 
 ## Compatibility and validation
 
@@ -360,3 +360,60 @@ Recovery must update only `last_run`, `previous_runs` (bounded/deduplicated by r
 and `history_revision` in a backed-up Store while HA is stopped, preserving every
 executable queue field and command barrier byte-for-byte. There is deliberately no
 public action to import/replay journal entries as cleaning commands.
+
+
+## Explicit retained-sequence continuation — v0.12.0
+
+`recovery.py` owns read-only eligibility and the explicit transitions. It is separate
+from `history.py`: history never authorizes execution. The service and optional
+script wrapper accept these commands with `vacuum`, the sensor's `run_id`, and its
+zero-based `current_index`. Stale run/pass values are rejected before mutation.
+
+- `continue_sequence` is available only for an interrupted retained manual plan.
+  `continuation_action` identifies `resume_job` (native paused/recharging room),
+  `resume_observation` (same room already cleaning/servicing, no robot command),
+  `retry_stage` (ended unconfirmed pass), `continue_next` (unstarted next pass or a
+  newly reconciled matching successful record), or `finish_docking` (all floor
+  passes already confirmed). Progress, frozen settings, run identity and the
+  confirmed history prefix are retained.
+- `resume_now` requests native resumption of an owned charging break. Native
+  `in_cleaning` must be 2 or 3, and `in_returning` must be 0 immediately before the
+  service call. Dispatch uses HA's `vacuum.send_command` with the verified
+  `resume_segment_clean` or `resume_zoned_clean` command. It never delegates to
+  the generic `vacuum.start` handler, whose later state-based selection could
+  change into whole-home start or return-to-base during a native update race.
+- Optional `water_refilled: true` is an explicit user acknowledgement for native
+  dock error 38 only, scoped to the current unfinished pass. It cannot waive any
+  robot error or another dock error. A healthy dock update, pass transition, new
+  run, cancellation, unrelated fault or restart ends its effect. It does not
+  alter native fault sensors or force firmware to accept a command.
+
+Dynamic sensor attributes include `execution_status`, `robot_job`, `robot_battery`,
+`continuation_ready`, `continuation_action`, `continuation_reason`,
+`continuation_requires_water_ack`, `water_refill_ack_active`, `resume_now_ready`,
+and `resume_now_reason`. `execution_status: recharging` distinguishes a charging
+break in an unfinished job from floor cleaning, and `waiting_for_dock` distinguishes
+between-pass readiness from a retained native job.
+
+The native API has no stable current-job ID. Resume eligibility requires observed
+owned job type, monotonic cleaning counters, unchanged completion baseline,
+unchanged map/settings and no external takeover or lost observation continuity.
+Counter regressions only revoke native-resume eligibility; they do not stop normal
+record-based execution. Returning to wash does not itself end job continuity.
+Temporary missing setting readbacks during care do not discard evidence, but
+explicit continuation still requires current validated controls/settings.
+
+The manager checks fresh state, unchanged map/rooms/settings, permissions and
+uncertainty barriers under the queue lock, then rechecks after awaited authorization
+and immediately before dispatch. A durable store write precedes physical commands.
+Accepted-but-response-lost native resumes keep observing the matching retained job
+without resending; an unacknowledged request eventually stops with its original
+barrier. A failure proven to occur before dispatch adds no false start barrier.
+Restart still never triggers cleaning, and it revokes active-job continuity and
+any water acknowledgement. Cancelled sequences and archived runs remain history.
+
+Offline regressions are in `test/backend_recovery_test.py`, alongside adapter,
+schema, existing manager/engine and history suites. They cover water refill,
+latched warnings, native job resumption/rejoining, partial-pass retry, completed
+prefix preservation, charging, native dispatch flags, unrelated jobs, races,
+storage failure and lost command responses without any robot/network calls.

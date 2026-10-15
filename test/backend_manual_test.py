@@ -363,7 +363,7 @@ def manager_class():
     definition = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Manager")
     from copy import deepcopy
     env = dict(asyncio=asyncio, time=time, logging=logging, deque=deque, uuid4=uuid4, Store=FakeStore,
-               history=load("history"), deepcopy=deepcopy,
+               history=load("history"), recovery=load("recovery"), deepcopy=deepcopy,
                Queue=Queue, Snapshot=Snapshot, ACTIVE=load("engine").ACTIVE,
                command_failure_metadata=load("errors").command_failure_metadata,
                ACK_SECONDS=60, CONTROLS=device.CONTROLS, DOCK=device.DOCK, device_entities=device.device_entities, device_command=device.device_command,
@@ -605,7 +605,7 @@ class ManagerTraceTests(unittest.IsolatedAsyncioTestCase):
         caps = await self.manager.get_capabilities(call)
         self.assertIsNone(caps["saved_preset"])
         self.assertEqual(caps["saved_plan_revision"], 0)
-        self.assertEqual(caps["control_version"], 5)
+        self.assertEqual(caps["control_version"], 6)
         await self.save_manual(revision=caps["saved_plan_revision"])
         caps = await self.manager.get_capabilities(call)
         self.assertEqual(caps["saved_plan_revision"], 1)
@@ -702,7 +702,7 @@ class ManagerTraceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await fresh.read_saved_preset("vacuum.robot", "user"), stored["vacuum.robot"])
         caps = await self.manager.get_capabilities(NS(context=FakeContext("user"), data={"vacuum":"vacuum.robot"}))
         self.assertEqual(caps["saved_preset"], stored["vacuum.robot"])
-        self.assertEqual(caps["control_version"], 5)
+        self.assertEqual(caps["control_version"], 6)
 
     async def test_startup_restores_preset_without_starting_cleaning(self):
         await self.save_manual()

@@ -165,6 +165,8 @@ def sync(queue, now=None):
                 stage["state"] = "pending"
             elif queue.phase in {"preparing", "starting", "running", "paused"} or (queue.phase == "attention" and stage["state"] != "pending"):
                 stage["state"] = queue.phase
+            if queue.phase in {"preparing", "starting", "running", "paused"}:
+                stage["reason"] = ""
             if queue.phase == "attention" and stage["state"] == "attention":
                 stage["reason"] = queue.error
     if queue.phase in {"attention", "cancelled"}:
@@ -187,7 +189,7 @@ def observe_running(queue, snapshot, now, cleaning_status):
     """A request/start acknowledgement is not proof of floor cleaning."""
     ensure(queue)
     if (not _belongs(queue) or queue.phase not in {"starting", "running"} or queue.next_pending
-            or queue.pending_command not in {"", "start", "resume"}
+            or queue.pending_command not in {"", "start", "resume", "resume_now"}
             or snapshot.job != "on" or snapshot.status not in cleaning_status
             or not snapshot.robot_healthy or not queue.started_at <= snapshot.observed_at <= now):
         return
@@ -236,3 +238,16 @@ def response(queue, vacuum):
     return deepcopy({"run_history_version": VERSION, "history_revision": queue.history_revision,
                      "last_run": queue.last_run if queue.last_run and queue.last_run["vacuum"] == vacuum else None,
                      "previous_runs": [run for run in queue.previous_runs if run["vacuum"] == vacuum]})
+
+
+def retry_stage(queue, now):
+    """An explicit retry keeps its interruption evidence but dates the new attempt."""
+    ensure(queue)
+    if not _belongs(queue) or not 0 <= queue.current_index < len(queue.last_run["stages"]):
+        return
+    before = deepcopy(queue.last_run)
+    stage = queue.last_run["stages"][queue.current_index]
+    stage.update(started_at=None, finished_at=None, confirmed_at=None, reason="", evidence_source="queue")
+    queue.last_run["interruptions"].append({"at": timestamp(now), "reason": "The user retried the unconfirmed pass; confirmed passes were retained."})
+    queue.last_run["interruptions"] = queue.last_run["interruptions"][-MAX_INTERRUPTION_EVENTS:]
+    _changed(queue, before, now)

@@ -18,11 +18,27 @@ script:
             - return_to_dock
             - stop
             - toggle_saved
+            - continue_sequence
+            - resume_now
       vacuum:
         selector:
           entity:
             domain: vacuum
             integration: roborock
+      run_id:
+        description: Current queue run_id for explicit continuation.
+        selector:
+          text: {}
+      current_index:
+        description: Current queue pass index for explicit continuation.
+        selector:
+          number:
+            min: 0
+            mode: box
+      water_refilled:
+        description: Confirm the clean-water tank was refilled for this interrupted pass.
+        selector:
+          boolean: {}
       rooms:
         description: Ordered native room objects or mapped-area IDs.
         selector:
@@ -41,6 +57,15 @@ script:
             vacuum: '{{ vacuum }}'
             rooms: '{{ rooms | default([]) }}'
             setup: '{{ setup | default({}) }}'
+      - conditions: '{{ command in [''continue_sequence'', ''resume_now''] }}'
+        sequence:
+        - action: robot_cleaner_queue.control
+          data:
+            command: '{{ command }}'
+            vacuum: '{{ vacuum }}'
+            run_id: '{{ run_id }}'
+            current_index: '{{ current_index }}'
+            water_refilled: '{{ water_refilled | default(false) }}'
       default:
       - action: robot_cleaner_queue.control
         data:
