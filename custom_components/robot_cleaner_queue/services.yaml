@@ -37,6 +37,10 @@ control:
       description: Explicit acknowledgement that clean water was refilled. Only continue_sequence can use it, for the interrupted pass with the known water-empty fault.
       selector:
         boolean: {}
+    recovery_token:
+      description: Confirmation token required to resume the displayed native room job after Home Assistant restarts.
+      selector:
+        text: {}
     rooms:
       description: Ordered room objects with id and per-room settings, or legacy mapped-area
         IDs. An explicitly empty list through this API cleans the current map.

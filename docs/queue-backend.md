@@ -22,7 +22,7 @@ Add `https://github.com/bitosome/ha-robot-cleaner-queue` as a **Custom repositor
    ```
 
    Merge with existing configuration; do not replace another `homeassistant:` or `packages:` section.
-3. Check HA configuration, then restart Home Assistant. Installation and restart do not send a robot command.
+3. Check HA configuration, then restart Home Assistant. Installation starts no cleaning; an existing active sequence reconciles its checkpoint after restart before continuing.
 4. Confirm `sensor.robot_cleaner_queue`, `script.robot_cleaner_queue_control` and the `robot_cleaner_queue.control` action exist. Configure the card's `queue_entity`.
 
 The card is a separate HACS repository and does not install these Python files; add this repository as an integration as above. No Roborock credentials, tokens, new cloud client, extra polling, or native integration modification is required.
@@ -78,7 +78,8 @@ The optional `cleaning_entity`, `status_entity`, `error_entity` and `last_clean_
 - `finishing`: every floor pass succeeded; final return and active dock care are still being observed.
 - `completed`: every stage succeeded and final stable docking was confirmed. Passive drying may continue.
 - `cancelled`: remaining rooms were cleared; the robot may still be active.
-- `attention`: execution stopped because a fault, restart, conflict or uncertain result requires review.
+- `recovering`: the persisted sequence is waiting for fresh native state and bounded completion reconciliation after restart.
+- `attention`: execution stopped because a fault, conflict, missing restart evidence or uncertain result requires review.
 
 Every plan exposes `mode: manual`, ordered `targets` (room ids, or Home Assistant area ids for a legacy plan), `address` (`room` when the robot's own segments are cleaned, `area` when a Home Assistant area is), `setup`, and `stages` (target, cleaning mode, frozen settings, zero-based room/pass/repeat indices). `current_index` and `completed` count stages, while `room_index + 1` preserves the displayed room sequence. A room plan stores its per-room settings under `setup.rooms`. Empty targets represent whole-home cleaning.
 
@@ -100,7 +101,7 @@ The initiating Home Assistant user's control permission is checked on the vacuum
 
 No automatic retries are sent. Faults and lost telemetry stop progression for review. HA commands from other controls stop this queue to avoid competing writers, and so does a Roborock app routine or schedule that starts its own job. App/device interruption is caught by the cleaning record's completion/finish reason; changes that produce indistinguishable successful records cannot be attributed to a particular caller.
 
-Pause and return-to-dock also require observed acknowledgement within 60 seconds; a start or resume gets the 15-minute window and settings preparation may wait ten minutes, but cancelling settings retains only a sixty-second update barrier. Queued rooms and position are persisted in HA's storage before dispatch. An HA restart or shutdown preserves the sequence for inspection and changes it to `attention`; it never resumes cleaning automatically. Review the retained progress. An explicit continuation can retry the unconfirmed pass once the robot is ready; active-job continuity is not assumed across restart. Cancelling or docking clears progression before sending another robot action.
+Pause and return-to-dock also require observed acknowledgement within 60 seconds; a start or resume gets the 15-minute window and settings preparation may wait ten minutes, but cancelling settings retains only a sixty-second update barrier. Queued rooms and position are persisted in HA's storage before dispatch. An HA shutdown preserves execution intent. On startup, a durable checkpoint enters `recovering`, waits for a fresh native poll, and reconciles the interrupted pass before continuing remaining work. Physical starts/resumes already sent are never replayed. Deliberate pauses, faults, cancellations and uncertain commands retain their original intent and barriers. Missing completion evidence allows explicit retry of the unconfirmed pass when the robot is ready. Cancelling or docking clears progression before sending another robot action.
 
 ## Compatibility and validation
 
@@ -334,7 +335,7 @@ Existing queues migrate with their completed count intact and unknown historical
 timestamps (`evidence_source: legacy_queue`). New verified records use
 `evidence_source: native_record`; incomplete observations use `queue`. Damaged
 history entries are discarded independently of queue command barriers. Restored
-active queues still require review, and archived active-looking entries are demoted
+active queues use the separate executable checkpoint, and archived active-looking entries are demoted
 to unconfirmed `attention` rather than appearing to keep cleaning forever.
 
 To keep Recorder below its 16 KiB state-attribute limit, the sensor's existing
@@ -409,11 +410,62 @@ and immediately before dispatch. A durable store write precedes physical command
 Accepted-but-response-lost native resumes keep observing the matching retained job
 without resending; an unacknowledged request eventually stops with its original
 barrier. A failure proven to occur before dispatch adds no false start barrier.
-Restart still never triggers cleaning, and it revokes active-job continuity and
-any water acknowledgement. Cancelled sequences and archived runs remain history.
+Restart revokes seamless active-job continuity and any water acknowledgement.
+The v0.13 checkpoint flow below observes and proves completion before remaining
+stages may continue. Cancelled sequences and archived runs remain history.
 
 Offline regressions are in `test/backend_recovery_test.py`, alongside adapter,
 schema, existing manager/engine and history suites. They cover water refill,
 latched warnings, native job resumption/rejoining, partial-pass retry, completed
 prefix preservation, charging, native dispatch flags, unrelated jobs, races,
 storage failure and lost command responses without any robot/network calls.
+
+
+## Durable restart reconciliation — v0.13.0
+
+`restart.py` owns process-gap recovery, separate from both ordinary uninterrupted
+execution and read-only history. The sensor advertises `control_version: 7` and
+`execution_version: 5`. `restart_recovery` / `restart_recovery_reason` describe
+startup reconciliation; `restart_record_pending` remains true until the restarted
+pass's bounded completion proof is resolved, even after phase returns to `running`.
+
+Graceful shutdown saves the original execution phase. Both graceful restart and
+process-crash restoration inspect the durable checkpoint. Cached observations
+older than Manager setup cannot authorize recovery. Native setup/select entities
+may arrive late; they are awaited without clearing the checkpoint. Changed maps,
+room/control mappings or revoked permissions stop progression for review.
+
+The frozen `restart_record_before` is the last pre-gap observation of an owned job.
+Only a successful record satisfying `started_at - 3 <= begin <= restart_record_before`,
+with an end newer than the original completion baseline, can complete that pass.
+The bound survives repeated restarts and explicit native resumption. A plausible
+active job may be observed across a gap, but its counters alone never grant
+completion. Matching records are cached durably if job-off or subsequent dock care
+has not arrived yet, so a later job's record cannot overwrite proven earlier work.
+A subsequent water fault cannot turn a proven completed pass back into pending work.
+
+Between passes and during settings preparation, the previous completion baseline
+must be unchanged and job-off confirmed; a new settling window precedes any settings
+or next-room dispatch. Already-sent uncertain motion is never replayed. Pending
+pause can be acknowledged from fresh native paused state without replay; pending
+resume retains its earlier owned window and uncertainty barrier for later explicit
+recovery. Deliberate paused/fault checkpoints never automatically request motion.
+Final docking restarts its observation/settling window rather than timing out based
+on the Home Assistant outage duration.
+
+For explicit native resumption after restart, the sensor exposes
+`restart_resume_ready`, `restart_resume_reason`, `restart_resume_token`. The caller
+shows a confirmation, then sends `resume_now` with `run_id`, `current_index` and
+`recovery_token`. The token fingerprints the displayed job type, paused/charging
+state, returning flag, clean-time counter, settings, record and frozen checkpoint;
+battery/observation-time updates do not invalidate it. Server validation repeats
+after authorization and immediately before `resume_segment_clean` or
+`resume_zoned_clean`. Ordinary `resume` and generic `vacuum.start` cannot bypass this
+confirmation. A successful resume still cannot credit an unrelated completion.
+
+`test/backend_restart_test.py` exercises actual Manager setup/shutdown/tick/control
+methods with offline native-shaped fixtures, covering graceful and crash restoration,
+startup availability, repeated restart, per-pass history, ownership bounds, pending
+commands, explicit native confirmation, permissions/map changes, persistence failure,
+and Stop followed by Return to dock. The wrapper's recovery token also goes through
+the real Home Assistant package-merging/script validation regression.

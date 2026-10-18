@@ -28,7 +28,7 @@ PACKAGE = (Path(sys.argv.pop(1)).resolve() if len(sys.argv) > 1 and not sys.argv
            else Path(__file__).resolve().parents[1] / "packages" / "robot_cleaner_queue.yaml")
 EXPECTED_SELECTORS = {
     "command": "select", "vacuum": "entity", "run_id": "text", "current_index": "number",
-    "water_refilled": "boolean", "rooms": "object", "setup": "object",
+    "water_refilled": "boolean", "recovery_token": "text", "rooms": "object", "setup": "object",
 }
 
 
@@ -92,7 +92,7 @@ class PackageTests(unittest.IsolatedAsyncioTestCase):
         for command in ("continue_sequence", "resume_now"):
             for acknowledgement in (None, False, True):
                 with self.subTest(command=command, acknowledgement=acknowledgement):
-                    variables = {"command": command, "vacuum": "vacuum.robot", "run_id": "retained-run", "current_index": 3}
+                    variables = {"command": command, "vacuum": "vacuum.robot", "run_id": "retained-run", "current_index": 3, "recovery_token": "native-job-fingerprint"}
                     if acknowledgement is not None:
                         variables["water_refilled"] = acknowledgement
                     condition = branch["conditions"][0]["value_template"]

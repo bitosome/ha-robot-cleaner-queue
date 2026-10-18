@@ -307,7 +307,7 @@ class QueueTests(unittest.TestCase):
     def test_restart_never_sends_anything(self):
         for q in [self.start(), self.acknowledged()]:
             restored = Queue.restore(q.dump())
-            self.assertEqual(restored.phase, "attention")
+            self.assertEqual(restored.phase, "recovering" if q.phase == "preparing" else "attention")
             self.assertEqual(restored.stages, q.stages)
             self.assertIsNone(restored.observe(ready(record()), 1000))
 
@@ -453,7 +453,7 @@ class QueueTests(unittest.TestCase):
                     self.assertIsNone(q.command("cancel", ready(), 210))
                 elif action == "restart":
                     q = Queue.restore(q.dump())
-                    self.assertEqual(q.phase, "attention")
+                    self.assertEqual(q.phase, "recovering")
                 else:
                     current = ready(self.done())
                     current.status, current.observed_at = "washing_the_mop", 210

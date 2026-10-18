@@ -5,9 +5,9 @@ from dataclasses import asdict, dataclass, field
 from copy import deepcopy
 from typing import Any
 
-from . import history, recovery
+from . import history, recovery, restart
 
-ACTIVE = {"preparing", "starting", "running", "paused", "controlling", "finishing"}
+ACTIVE = {"preparing", "starting", "running", "paused", "controlling", "finishing", "recovering"}
 READY_STATUS = {"idle", "charging", "charging_complete"}
 CLEANING_STATUS = {
     "cleaning", "spot_cleaning", "segment_cleaning", "zoned_cleaning",
@@ -140,6 +140,14 @@ class Queue:
     interrupted_next_pending: bool = False
     water_refilled_index: int = -1
     resume_owned_job: bool = False
+    # This is executable checkpoint evidence, independent of the activity journal.
+    restart_checkpoint: dict[str, Any] = field(default_factory=dict)
+    restart_matched_record: dict[str, Any] = field(default_factory=dict)
+    restart_loaded_at: float = 0
+    restart_resume_guard: str = ""
+    restart_record_before: float = 0
+    checkpoint_observed_at: float = 0
+    checkpoint_record_end: float | None = None
 
     def dump(self) -> dict[str, Any]:
         return asdict(self)
@@ -148,12 +156,7 @@ class Queue:
     def restore(cls, data: dict[str, Any] | None) -> Queue:
         queue = cls(**{k: v for k, v in (data or {}).items() if k in cls.__dataclass_fields__})
         history.restore(queue)
-        # A process gap cannot establish continuity of an unfinished native job.
-        queue.continuation_context = ""
-        queue.water_refilled_index = -1
-        queue.resume_owned_job = False
-        if queue.phase in ACTIVE or queue.pending_command:
-            queue.attention("Home Assistant restarted. The saved queue was interrupted; review its retained progress before continuing when the robot is idle.")
+        restart.restore(queue)
         # v0.8.1 used the ten-minute setup deadline as a settings-only barrier.
         # No motion command uses that duration; shorten only that legacy case.
         if queue.barrier_window == CONFIGURE_SECONDS:
@@ -163,10 +166,12 @@ class Queue:
         return queue
 
     def attention(self, message: str, *, recoverable_fault: bool = False) -> None:
+        self.restart_checkpoint = {}
+        self.restart_resume_guard = ""
         self.water_refilled_index = -1
         self.resume_owned_job = False
         self.continuation_context = "device_fault" if recoverable_fault else ""
-        self.interrupted_next_pending = self.next_pending
+        self.interrupted_next_pending = self.next_pending or self.interrupted_next_pending
         self._preserve_command_barrier()
         self.phase = "attention"
         self.error = message
@@ -183,6 +188,7 @@ class Queue:
         self.barrier_window = 0
         self.start_uncertain = False
         self.resume_owned_job = False
+        self.restart_resume_guard = ""
 
     def _reset_ready(self) -> None:
         self.ready_since = self.ready_observed_at = 0
@@ -290,6 +296,10 @@ class Queue:
         # readback it is waiting for, so refuse instead of losing that uncertainty.
         if self.mode == "device" and self.phase == "controlling":
             raise ValueError("A dock or settings command is still being confirmed. Wait for it before finishing.")
+        self.restart_checkpoint = {}
+        self.restart_record_before = 0
+        self.restart_matched_record = {}
+        self.restart_resume_guard = ""
         history.cancel_before_detach(self, now)
         self._preserve_command_barrier()
         self.water_refilled_index = -1
@@ -373,6 +383,10 @@ class Queue:
         self.water_refilled_index = -1
         self.resume_owned_job = False
         self.continuation_context = ""
+        self.restart_checkpoint = {}
+        self.restart_record_before = 0
+        self.restart_matched_record = {}
+        self.restart_resume_guard = ""
         self.mode, self.phase = "external", "controlling"
         self.vacuum, self.run_id = vacuum, run_id
         self.targets, self.stages = [], []
@@ -441,6 +455,9 @@ class Queue:
         self._validate_start(snapshot, now, plan_mode)
         history.sync(self, now)
         self.mode = "manual"
+        self.restart_checkpoint = {}
+        self.restart_record_before = 0
+        self.restart_matched_record = {}
         self.water_refilled_index = -1
         self.resume_owned_job = False
         self.vacuum, self.run_id = vacuum, run_id
@@ -478,6 +495,10 @@ class Queue:
 
     def _dispatch(self, snapshot: Snapshot, now: float) -> tuple[str, str]:
         """Every plan applies its stage settings first and then starts that room."""
+        self.restart_checkpoint = {}
+        self.restart_record_before = 0
+        self.restart_matched_record = {}
+        restart.remember(self, snapshot)
         self.phase = "preparing"
         self.decision = "applying settings for pass %d" % (self.current_index + 1)
         self.pending_command = "configure"
@@ -490,6 +511,8 @@ class Queue:
         return "configure", str(self.current_index)
 
     def _start_job(self, snapshot: Snapshot, now: float) -> tuple[str, str]:
+        self.restart_record_before = 0
+        self.restart_matched_record = {}
         self.decision = "dispatching room %d" % (self.current_index + 1)
         self.phase = "starting"
         self.pending_command = "start"
@@ -529,6 +552,9 @@ class Queue:
             self.pending_command, self.command_at = "stop", now
             return "vacuum", "stop"
         if command == "cancel":
+            self.restart_checkpoint = {}
+            self.restart_record_before = 0
+            self.restart_matched_record = {}
             self._preserve_command_barrier()
             self.start_uncertain = False
             self.water_refilled_index = -1
@@ -575,6 +601,8 @@ class Queue:
             self.command_at = now
             return "vacuum", "pause"
         if command == "resume":
+            if self.restart_record_before or self.restart_checkpoint:
+                raise ValueError("Review and confirm the retained native job before resuming after restart.")
             if self.phase != "paused" or self.pending_command:
                 raise ValueError("The queue is not paused.")
             if self.next_pending:
@@ -617,6 +645,20 @@ class Queue:
     def observe(self, snapshot: Snapshot, now: float) -> tuple[str, str] | None:
         if self.phase not in ACTIVE and not self.pending_command:
             return None  # Historical evidence cannot adopt a later native job.
+        if self.restart_checkpoint:
+            effect = restart.reconcile(self, snapshot, now)
+            history.sync(self, now)
+            return effect
+        if self.restart_record_before and restart.valid_record(self, snapshot):
+            self.restart_matched_record = dict(snapshot.record)
+        if (self.restart_record_before and self.restart_matched_record and snapshot.job == "off"
+                and not self.pending_command):
+            self.restart_checkpoint = {"phase": self.phase, "observed_at": self.restart_record_before,
+                                       "matched_record": dict(self.restart_matched_record)}
+            restart.reconcile(self, snapshot, now)
+            history.sync(self, now)
+            return None
+        restart.remember(self, snapshot)
         recovery.observe_job(self, snapshot, now)
         history.observe_running(self, snapshot, now, CLEANING_STATUS)
         effect = self._observe(self.execution_snapshot(snapshot), now)
@@ -693,7 +735,8 @@ class Queue:
             ack = fresh and (
                 (self.pending_command == "pause" and snapshot.vacuum == snapshot.status == "paused") or (
                     self.pending_command in {"start", "resume", "resume_now"} and snapshot.status in START_STATUS
-                    and (not self.resume_owned_job or recovery.matches_owned_job(self, snapshot))
+                    and (not self.resume_owned_job or recovery.matches_owned_job(self, snapshot)
+                         or self.restart_resume_guard and restart.active_candidate(self, snapshot))
                 )
             )
             if ack:
@@ -751,7 +794,8 @@ class Queue:
         record = snapshot.record or {}
         end = float(record.get("end") or 0)
         begin = float(record.get("begin") or 0)
-        fresh = end > self.baseline_end and begin >= self.started_at - 3 and end >= begin
+        fresh = (end > self.baseline_end and begin >= self.started_at - 3 and end >= begin
+                 and (not self.restart_record_before or begin <= self.restart_record_before))
         if not fresh:
             self.decision = "waiting for a completion record (record begin=%s end=%s complete=%s error=%s; baseline end=%s, started=%s)" % (
                 record.get("begin"), record.get("end"), record.get("complete"), record.get("error"),
@@ -759,7 +803,7 @@ class Queue:
             if not self.finish_wait_at:
                 self.finish_wait_at = now
             elif now - self.finish_wait_at >= FINISH_SECONDS:
-                self.attention("The job ended without a matching completion record. No next room was started.")
+                self.attention("The job ended without a matching completion record. Continue sequence can retry this unconfirmed pass; completed passes are kept.")
             return None
         complete, error, reason = record.get("complete"), record.get("error"), record.get("finish_reason")
         if complete != 1 or error != 0 or (reason is not None and reason not in SUCCESS_REASONS):

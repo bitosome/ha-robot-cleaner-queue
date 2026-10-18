@@ -39,6 +39,10 @@ script:
         description: Confirm the clean-water tank was refilled for this interrupted pass.
         selector:
           boolean: null
+      recovery_token:
+        description: Confirmation token for the displayed native job after restart.
+        selector:
+          text: null
       rooms:
         description: Ordered native room objects or mapped-area IDs.
         selector:
@@ -66,6 +70,7 @@ script:
             run_id: '{{ run_id }}'
             current_index: '{{ current_index }}'
             water_refilled: '{{ water_refilled | default(false) }}'
+            recovery_token: '{{ recovery_token | default("") }}'
       default:
       - action: robot_cleaner_queue.control
         data:

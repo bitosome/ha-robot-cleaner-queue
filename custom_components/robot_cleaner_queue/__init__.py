@@ -23,7 +23,7 @@ from .adapter import is_competing_command, routine_matches, snapshot
 from .engine import ACTIVE, ACK_SECONDS, Queue, Snapshot
 from .device import CONTROLS, DOCK, device_entities, device_command
 from .errors import command_failure_metadata
-from . import history, recovery
+from . import history, recovery, restart
 from .permissions import async_require_control
 from .manual import build_plan, build_room_plan, cached_settings, capabilities, current_map, robot_targets, validate_stage
 
@@ -47,6 +47,7 @@ SERVICE_SCHEMA = vol.Schema({
     vol.Optional("run_id"): str,
     vol.Optional("current_index"): vol.All(int, vol.Range(min=0)),
     vol.Optional("water_refilled", default=False): bool,
+    vol.Optional("recovery_token"): str,
     vol.Optional("rooms", default=[]): PLAN_ROOMS,
     # Plan defaults; each room may override any of them, and a room plan without
     # defaults is valid because every room can carry its own mode.
@@ -124,7 +125,7 @@ class Manager:
         self.events: deque = deque(maxlen=100)
         self.last_observation: dict = {}
         # Only resume configuration that was explicitly deferred before dispatch.
-        # Never retry a start or an uncertain service call; restarts require review.
+        # Never retry a start or an uncertain service call across a restart.
         self.deferred_configuration = None
         self.configuration_token = None
         self.configured_keys: set[str] = set()
@@ -136,6 +137,7 @@ class Manager:
         try:
             loaded_queue = await self.store.async_load()
             self.queue = Queue.restore(loaded_queue if isinstance(loaded_queue, dict) else None)
+            self.queue.restart_loaded_at = time.time()
         except Exception:  # noqa: BLE001
             _LOGGER.exception("The stored queue could not be read; starting from an empty queue")
             self.queue = Queue()
@@ -287,8 +289,8 @@ class Manager:
         try:
             caps, controls, _, _ = self.manual_capabilities(call.data["vacuum"])
             await async_require_control(self.hass.auth, call.context.user_id, list(controls.values()), POLICY_CONTROL)
-            caps["control_version"] = 6
-            caps["execution_version"] = 4
+            caps["control_version"] = 7
+            caps["execution_version"] = 5
             caps["current_map"] = current_map(self.resolve(call.data["vacuum"])[2])[0]
             caps["saved_preset"] = await self.read_saved_preset(call.data["vacuum"], call.context.user_id)
             caps["saved_plan_revision"] = (caps["saved_preset"] or {}).get("revision", 0)
@@ -595,7 +597,7 @@ class Manager:
 
     def continuation_state(self, current: Snapshot) -> dict:
         result = recovery.state(self.queue, current, time.time())
-        if result["continuation_ready"] or result["resume_now_ready"]:
+        if result["continuation_ready"] or result["resume_now_ready"] or result["restart_resume_ready"]:
             try:
                 self.validate_continuation_plan(self.queue.vacuum)
             except ValueError as err:
@@ -603,6 +605,8 @@ class Manager:
                     result.update(continuation_ready=False, continuation_reason=str(err))
                 if result["resume_now_ready"]:
                     result.update(resume_now_ready=False, resume_now_reason=str(err))
+                if result["restart_resume_ready"]:
+                    result.update(restart_resume_ready=False, restart_resume_reason=str(err), restart_resume_token="")
         return result
 
     def observed_settings(self, vacuum: str, state, coordinator) -> dict:
@@ -719,6 +723,8 @@ class Manager:
                         if command == "continue_sequence":
                             effect = recovery.continue_sequence(self.queue, current, time.time(),
                                 water_refilled=data.get("water_refilled", False))
+                        elif data.get("recovery_token"):
+                            effect = restart.request_resume(self.queue, current, time.time(), data["recovery_token"])
                         else:
                             effect = self.queue.command(command, current, time.time())
                         self.queue.owner_user_id = call.context.user_id
@@ -893,7 +899,10 @@ class Manager:
                 self.queue._validate_command_barrier(current, time.time())
                 if self.queue.resume_owned_job:
                     self.validate_continuation_plan(self.queue.vacuum)
-                    recovery.validate_native_resume(self.queue, current)
+                    if self.queue.restart_resume_guard:
+                        restart.validate_dispatch(self.queue, current, time.time())
+                    else:
+                        recovery.validate_native_resume(self.queue, current)
                 elif not self.queue.validate_control_state(self.queue.pending_command, current):
                     return
                 data = {"entity_id": self.queue.vacuum}
@@ -938,6 +947,39 @@ class Manager:
             if kind == "manual" and not attempted:
                 await self.clear_unsent_start(start_token)
 
+    async def restart_ready(self, current: Snapshot) -> bool:
+        """Native setup can lag this YAML integration; cached startup state is not evidence."""
+        now = time.time()
+        if (not current.connected or current.observed_at < self.queue.restart_loaded_at
+                or not 0 <= now - current.observed_at <= 90
+                or current.vacuum in {"unknown", "unavailable"}
+                or current.job not in {"on", "off"}):
+            self.queue.decision = "Restoring the saved sequence; waiting for a fresh robot update."
+            return False
+        if restart.valid_record(self.queue, current):
+            self.queue.restart_matched_record = dict(current.record)
+            self.queue.restart_checkpoint["matched_record"] = dict(current.record)
+        try:
+            caps, controls, _, map_id = self.manual_capabilities(self.queue.vacuum)
+            if map_id is not None and self.queue.stage and map_id != self.queue.stage.get("map_id"):
+                self.queue.attention("The robot map changed while Home Assistant was offline. Restore the saved map before continuing.")
+                return False
+            if map_id is None or caps.get("unavailable_controls") or self.control_state(controls) == "waiting":
+                self.queue.decision = "Restoring the saved sequence; waiting for native room settings."
+                return False
+            self.validate_continuation_plan(self.queue.vacuum)
+        except ValueError as err:
+            self.queue.attention("The saved room/map settings changed. Restore them before continuing the retained sequence: " + str(err))
+            return False
+        token = (self.queue.run_id, self.queue.current_index, dict(self.queue.restart_checkpoint))
+        try:
+            await async_require_control(self.hass.auth, self.queue.owner_user_id,
+                [self.queue.vacuum, *self.queue.control_entities.values()], POLICY_CONTROL)
+        except PermissionError:
+            self.queue.attention("The initiating user can no longer control this sequence. A permitted user can continue the retained plan.")
+            return False
+        return token == (self.queue.run_id, self.queue.current_index, self.queue.restart_checkpoint)
+
     async def tick(self, _now=None) -> None:
         if self.closing or not self.queue.vacuum:
             return
@@ -950,6 +992,10 @@ class Manager:
                                     "robot_observed_at": 0, "robot_activity": "unavailable", "robot_connected": False,
                                     "recovery_ready": False,
                                     "recovery_reason": "The robot is unavailable."}
+            if self.queue.restart_checkpoint and not await self.restart_ready(current):
+                self.robot_state.update(self.continuation_state(current))
+                await self.publish()
+                return
             if self.queue.mode == "device":
                 if self.queue.pending_command:
                     self.observe_device()
@@ -1013,6 +1059,6 @@ class Manager:
                 unsub()
             if self.coordinator_unsub:
                 self.coordinator_unsub()
-            if self.queue.phase in ACTIVE or self.queue.pending_command:
-                self.queue.attention("Home Assistant stopped. The queue will not restart automatically.")
+            # Preserve execution intent and the last durable native checkpoint.
+            # Startup reconciles it without repeating a physical command.
             await self.publish()

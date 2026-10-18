@@ -28,6 +28,8 @@ def effective_snapshot(queue, snapshot):
 
 def execution_status(queue, snapshot):
     from .engine import DOCK_CARE_STATUS, CLEANING_STATUS
+    if queue.phase == "recovering":
+        return "recovering"
     if queue.phase == "attention":
         return "attention"
     if queue.phase == "finishing":
@@ -65,6 +67,7 @@ def matches_owned_job(queue, snapshot, *, allow_missing_settings=False):
 def observe_job(queue, snapshot, now):
     """Keep narrow continuity evidence while observing an owned active pass."""
     from .engine import MAX_OBSERVATION_AGE
+    from . import restart
     if queue.mode != "manual" or queue.next_pending or not queue.stage:
         return
     if snapshot.dock_error in {"ok", "none"}:
@@ -81,6 +84,11 @@ def observe_job(queue, snapshot, now):
         if snapshot.connected and snapshot.job == "off" and snapshot.observed_at and now - snapshot.observed_at <= MAX_OBSERVATION_AGE:
             queue.continuation_context = "completed_after_fault" if completed_after_fault(queue, snapshot) else "awaiting_completion"
             return
+        if (queue.restart_record_before and queue.continuation_context == "device_fault"
+                and snapshot.connected and snapshot.observed_at >= queue.restart_loaded_at
+                and 0 <= now - snapshot.observed_at <= MAX_OBSERVATION_AGE
+                and restart.active_candidate(queue, snapshot)):
+            return  # May explicitly rejoin observation, never automatic physical resume.
         if (not snapshot.connected or not snapshot.observed_at or now - snapshot.observed_at > MAX_OBSERVATION_AGE
                 or not matches_owned_job(queue, snapshot, allow_missing_settings=True)):
             queue.continuation_context = ""
@@ -116,11 +124,13 @@ def observe_job(queue, snapshot, now):
 def successful_owned_record(queue, snapshot):
     """Match the retained pass's record independently of native trait update order."""
     from .engine import SUCCESS_REASONS
-    record = snapshot.record or {}
+    from . import restart
+    record = restart.completion_record(queue, snapshot) if queue.restart_record_before else snapshot.record or {}
     begin, end = float(record.get("begin") or 0), float(record.get("end") or 0)
-    return (queue.continuation_context in {"device_fault", "awaiting_completion", "completed_after_fault", "completion_pending_idle"}
+    return ((queue.continuation_context in {"device_fault", "awaiting_completion", "completed_after_fault", "completion_pending_idle"}
+             or queue.restart_record_before and restart.valid_record_data(queue, record))
             and queue.seen_job and queue.native_job_observed_at > 0
-            and queue.started_at - 3 <= begin <= queue.native_job_observed_at
+            and queue.started_at - 3 <= begin <= (queue.restart_record_before or queue.native_job_observed_at)
             and end >= begin and end > queue.baseline_end
             and record.get("complete") == 1 and record.get("error") == 0
             and (record.get("finish_reason") is None or record.get("finish_reason") in SUCCESS_REASONS))
@@ -138,12 +148,14 @@ def _validate_common(queue, snapshot, now):
         raise ValueError("Wait for the previous robot command to be confirmed.")
     queue._validate_command_barrier(snapshot, now)
     queue._validate_recovery_observation(snapshot, now)
+    if (queue.restart_record_before or queue.restart_checkpoint) and snapshot.observed_at < queue.restart_loaded_at:
+        raise ValueError("Wait for a fresh robot update after Home Assistant starts.")
     if queue.completed != queue.current_index or not 0 <= queue.current_index <= len(queue.stages):
         raise ValueError("The saved progress is inconsistent. Review the sequence before starting another plan.")
 
 
 def validate_native_resume(queue, snapshot):
-    if not matches_owned_job(queue, snapshot) or snapshot.in_returning != 0:
+    if queue.restart_record_before or not matches_owned_job(queue, snapshot) or snapshot.in_returning != 0:
         raise ValueError("The unfinished job cannot be matched to this pass. Finish or stop the robot's current job before retrying the remaining pass.")
     if not snapshot.healthy_for(queue.cleaning_mode):
         raise ValueError("Resolve the robot or dock fault before continuing this pass.")
@@ -169,6 +181,9 @@ def continuation_action(queue, snapshot, now, *, water_refilled=False):
             raise ValueError("An unfinished robot job must end before final docking can be confirmed.")
         return "finish_docking"
     if snapshot.job == "on":
+        from . import restart
+        if queue.restart_record_before and restart.active_candidate(queue, snapshot):
+            return "resume_observation"  # Resuming actual motion needs separate native-job confirmation.
         if queue.continuation_context != "device_fault":
             raise ValueError("Job continuity was lost. Stop or finish the current robot job before retrying the remaining pass.")
         from .engine import CLEANING_STATUS, START_STATUS, DOCK_CARE_STATUS
@@ -216,7 +231,11 @@ def continue_sequence(queue, snapshot, now, *, water_refilled=False):
         effect = ("vacuum", "start")
     elif action == "continue_next":
         if completed_after_fault(queue, snapshot):
-            history.complete_stage(queue, snapshot.record, now)
+            from . import restart
+            proven_record = restart.completion_record(queue, snapshot) if queue.restart_record_before else snapshot.record
+            history.complete_stage(queue, proven_record, now)
+            queue.restart_record_before = 0
+            queue.restart_matched_record = {}
             queue.current_index += 1
             queue.completed += 1
             queue.water_refilled_index = -1
@@ -242,7 +261,12 @@ def continue_sequence(queue, snapshot, now, *, water_refilled=False):
 
 
 def state(queue, snapshot, now):
+    from . import restart
     result = {"execution_status": execution_status(queue, snapshot),
+              "restart_recovery": bool(queue.restart_checkpoint),
+              "restart_record_pending": bool(queue.restart_record_before),
+              "restart_recovery_reason": queue.decision if queue.restart_checkpoint else "",
+              "restart_resume_ready": False, "restart_resume_reason": "", "restart_resume_token": "",
               "water_refill_ack_active": bool(queue.mode == "manual" and queue.stage
                     and queue.phase in {"preparing", "starting", "running", "paused"}
                     and queue.water_refilled_index == queue.current_index),
@@ -262,4 +286,9 @@ def state(queue, snapshot, now):
             result["resume_now_ready"] = True
         except ValueError as err:
             result["resume_now_reason"] = str(err)
+    if queue.restart_record_before:
+        try:
+            result.update(restart_resume_ready=True, restart_resume_token=restart.resume_token(queue, effective_snapshot(queue, snapshot), now))
+        except ValueError as err:
+            result["restart_resume_reason"] = str(err)
     return result

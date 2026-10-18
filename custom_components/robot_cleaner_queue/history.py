@@ -13,9 +13,9 @@ VERSION = 1
 MAX_PREVIOUS_RUNS = 5
 MAX_STAGES = 128
 MAX_INTERRUPTION_EVENTS = 12
-STATES = {"pending", "preparing", "starting", "running", "paused", "attention", "completed", "cancelled", "finishing"}
+STATES = {"pending", "preparing", "starting", "running", "paused", "attention", "completed", "cancelled", "finishing", "recovering"}
 SETTINGS = {"mode", "suction", "water", "route", "repeat"}
-LIVE_STATES = {"preparing", "starting", "running", "paused", "finishing"}
+LIVE_STATES = {"preparing", "starting", "running", "paused", "finishing", "recovering"}
 
 
 def timestamp(value):

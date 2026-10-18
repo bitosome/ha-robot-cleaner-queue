@@ -31,7 +31,7 @@ Native Roborock area cleaning accepts several areas in one command but does not 
    Merge with any existing `homeassistant:`/`packages:` section rather than replacing it.
 3. Check the configuration, then restart Home Assistant.
 
-Installation and restart send no robot command. Afterwards, `sensor.robot_cleaner_queue`, `script.robot_cleaner_queue_control` and the `robot_cleaner_queue.control` action exist.
+Installation starts no cleaning. After a restart, an existing active sequence reconciles its saved progress before continuing. Afterwards, `sensor.robot_cleaner_queue`, `script.robot_cleaner_queue_control` and the `robot_cleaner_queue.control` action exist.
 
 ## Requirements
 
@@ -120,6 +120,8 @@ python3 -B test/backend_manual_test.py
 python3 -B test/backend_controls_test.py
 python3 -B test/backend_device_test.py
 python3 -B test/backend_history_test.py
+python3 -B test/backend_recovery_test.py
+python3 -B test/backend_restart_test.py
 ```
 
 These are offline event traces against the production transition code with simulated Home Assistant states. They send no robot commands and do not prove physical operation.
@@ -178,7 +180,25 @@ A water-empty warning can remain latched after a refill. Explicitly confirming
 current interrupted pass. Other faults remain blocking, and the acknowledgement
 ends on a healthy dock report, a pass transition, cancellation or HA restart.
 
-The queue cannot prove active-job continuity across a Home Assistant restart or a
-native telemetry gap. It retains the complete plan and progress, but waits until
-the native job is finished/stopped before offering an explicit retry of unconfirmed
-work. No physical action is sent by restarting, refreshing, or reading history.
+## Surviving Home Assistant restarts
+
+The complete sequence, frozen room settings and completed passes survive restart.
+Startup first waits for a fresh native robot update and revalidates the saved map,
+rooms, controls and initiating user's permissions. A robot already cleaning or
+charging is observed without repeating its start command. The queue continues the
+remaining passes after the interrupted pass has a matching successful native record.
+The record's start must be within the original pre-restart ownership window; later
+telemetry and repeated restarts cannot expand that window to include an unrelated job.
+
+Between-pass waiting, final dock care and preparation resume from their checkpoints.
+A deliberately paused sequence stays paused. If its retained native room job is
+paused or charging, **Resume robot** asks for confirmation and sends only the exact
+native room/zone resume command. That confirmation does not waive completion proof
+or battery limits. Faults and unconfirmed commands retain their recovery controls;
+no uncertain start or resume is repeated. If the robot no longer has a matching
+successful record, **Retry current pass** keeps all confirmed passes and retries
+only the unconfirmed work when the robot is ready. Archived/cancelled plans never
+resume automatically.
+
+After **Stop**, **Return to dock** remains available once the robot confirms that
+it is idle and the stop command has completed.

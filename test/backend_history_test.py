@@ -83,7 +83,7 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(queue.last_run["run_id"], "remaining")
         restored = Queue.restore(queue.dump())
         self.assertEqual(restored.previous_runs, queue.previous_runs)
-        self.assertEqual(restored.last_run["state"], "attention")
+        self.assertEqual(restored.last_run["state"], "recovering")
         self.assertIsNone(restored.observe(qtests.ready(observed_at=500), 500))
 
     def test_current_incomplete_pass_keeps_start_observation_but_not_completion(self):
