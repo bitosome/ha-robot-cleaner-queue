@@ -335,5 +335,34 @@ class HistoryDeviceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.calls)
 
 
+class FaultJournalTests(unittest.TestCase):
+    def test_fault_onset_dedup_resolution_and_restore(self):
+        q=start(); q.phase="running"
+        current=qtests.ready(observed_at=150); current.error="error"; current.error_detail="clear_water_box_hoare"
+        history.observe_faults(q,current,150); history.observe_faults(q,current,151)
+        self.assertEqual(len(q.last_run["faults"]),1)
+        self.assertEqual(q.last_run["faults"][0]["message"],"Clean-water tank warning")
+        current.error="none"; current.dock_error="water_empty"; current.observed_at=152
+        history.observe_faults(q,current,152)
+        self.assertEqual(q.last_run["faults"][0]["resolved_at"],152)
+        self.assertEqual(len(q.last_run["faults"]),2)
+        current.dock_error="ok"
+        history.observe_faults(q,current,300)
+        self.assertIsNone(q.last_run["faults"][1]["resolved_at"],"Stale status cannot resolve a fault")
+        current.observed_at=301; history.observe_faults(q,current,301)
+        self.assertEqual(q.last_run["faults"][1]["resolved_at"],301)
+        restored=Queue.restore(q.dump())
+        self.assertEqual(restored.last_run["faults"],q.last_run["faults"])
+
+    def test_fault_journal_is_bounded_and_old_history_migrates(self):
+        q=start();q.phase="running"
+        for n in range(60):
+            current=qtests.ready(observed_at=150+n);current.dock_error="water_empty" if n%2==0 else "ok"
+            history.observe_faults(q,current,150+n)
+        self.assertEqual(len(q.last_run["faults"]),24)
+        old=deepcopy(q.last_run);old.pop("faults")
+        self.assertEqual(history.normalize(old)["faults"],[])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

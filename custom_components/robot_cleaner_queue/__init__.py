@@ -1096,7 +1096,9 @@ class Manager:
                     self.observe_device()
                 await self.publish()
                 return
+            history.observe_faults(self.queue, current, time.time())
             if self.queue.phase not in ACTIVE and not self.queue.pending_command:
+                recovery.reconcile_fault_completion(self.queue, current, time.time())
                 recovery.observe_job(self.queue, current, time.time())
                 self.robot_state.update(self.continuation_state(current))
                 await self.publish()  # Keep native dock care visible after floor completion.

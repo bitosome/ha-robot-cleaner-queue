@@ -297,6 +297,27 @@ class ContinuationManagerTests(unittest.IsolatedAsyncioTestCase):
         return NS(context=manual_tests.FakeContext("user"), data={"command": command,
                   "vacuum": "vacuum.robot", "run_id": "same-run", "current_index": 1, **extra})
 
+    async def test_tick_reconciles_late_final_success_and_persists_without_motion(self):
+        q,status=self.prepare()
+        q.attention("The robot or dock has a fault, or telemetry is unavailable. The sequence is retained for review.",recoverable_fault=True)
+        q.continuation_context=""  # Dock settings reset before clean-summary refresh.
+        begin=q.started_at
+        status.in_cleaning=0;status.state_name="charging"
+        self.states["vacuum.robot"].state="docked"
+        self.coordinator.data.clean_summary.last_clean_record=NS(**record(begin,self.clock-1,finish_reason=56))
+        await self.manager.tick()
+        self.assertEqual((q.phase,q.completed),("finishing",2))
+        self.assertEqual(self.manager.store.saved[-1]["completed"],2)
+        self.assertEqual(self.calls,[])
+        self.clock+=1
+        self.coordinator._last_update_success_time=datetime.fromtimestamp(self.clock,timezone.utc)
+        await self.manager.tick()
+        self.clock+=16
+        self.coordinator._last_update_success_time=datetime.fromtimestamp(self.clock,timezone.utc)
+        await self.manager.tick()
+        self.assertEqual(q.phase,"completed")
+        self.assertEqual(self.calls,[])
+
     async def test_charging_resume_dispatches_explicit_native_resume_once_and_persists_original_progress(self):
         q, _ = self.prepare()
         await asyncio.gather(self.manager.control(self.call("resume_now")),
@@ -467,6 +488,66 @@ class ContinuationManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(q.continuation_context, "")
         self.assertEqual(q.phase, "attention")
         self.assertEqual(self.calls, [])
+
+
+class FaultCompletionTests(unittest.TestCase):
+    def interrupted(self):
+        q = running()
+        q.observe(native(water="water_empty"), 150)
+        rolled = native(now=151)
+        rolled.settings = {"mode": "vac_and_mop"}
+        recovery.observe_job(q, rolled, 151)
+        self.assertEqual(q.continuation_context, "")
+        return q
+
+    def completed(self, begin=100):
+        current = native(job="off", now=160)
+        current.record = record(begin, 159, finish_reason=56)
+        current.settings = {"mode": "vac_and_mop"}
+        return current
+
+    def test_late_success_after_dock_settings_reset_credits_final_pass_without_motion(self):
+        q = self.interrupted()
+        completed_before = deepcopy(q.last_run["stages"][0])
+        self.assertTrue(recovery.reconcile_fault_completion(q, self.completed(), 160))
+        self.assertEqual((q.phase, q.completed, q.current_index, q.pending_command), ("finishing", 2, 2, ""))
+        self.assertEqual(q.last_run["stages"][0], completed_before)
+        self.assertEqual(q.last_run["stages"][1]["finished_at"], 159)
+        self.assertFalse(recovery.reconcile_fault_completion(q, self.completed(), 161))
+
+    def test_remaining_room_requires_explicit_continue_and_is_not_double_credited(self):
+        q = self.interrupted()
+        q.stages.append(stage("0_3")); q.targets.append("0_3")
+        q.last_run = None; history.ensure(q)
+        self.assertTrue(recovery.reconcile_fault_completion(q, self.completed(), 160))
+        self.assertEqual((q.phase, q.completed, q.interrupted_next_pending), ("attention", 2, True))
+        self.assertEqual(recovery.continuation_action(q, self.completed(), 160), "continue_next")
+        self.assertIsNone(recovery.continue_sequence(q, self.completed(), 160))
+        self.assertEqual((q.completed, q.current_index), (2, 2))
+
+    def test_unrelated_failed_stale_or_active_record_never_credits(self):
+        for key, value in [("record",record(151,159)), ("record",record(100,159,error=1)),
+                           ("record",record(100,159,complete=0)), ("record",record(100,159,finish_reason=99)),
+                           ("job","on"), ("connected",False), ("observed_at",1)]:
+            with self.subTest(key=key,value=value):
+                q, current = self.interrupted(), self.completed()
+                setattr(current,key,value)
+                self.assertFalse(recovery.reconcile_fault_completion(q,current,160))
+                self.assertEqual(q.completed,1)
+
+    def test_legacy_fault_migration_and_new_checkpoint_survive_restart(self):
+        for legacy in [False, True]:
+            q = self.interrupted(); saved=q.dump()
+            if legacy: saved.pop("fault_record_before")
+            restored=Queue.restore(saved)
+            self.assertTrue(recovery.reconcile_fault_completion(restored,self.completed(),160))
+            self.assertEqual(restored.completed,2)
+
+    def test_non_fault_attention_cannot_reuse_completion_window(self):
+        q=self.interrupted()
+        q.attention("Another control interrupted this sequence.")
+        self.assertFalse(recovery.reconcile_fault_completion(q,self.completed(),160))
+        self.assertEqual(q.fault_record_before,0)
 
 
 if __name__ == "__main__":

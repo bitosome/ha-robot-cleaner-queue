@@ -17,6 +17,63 @@ RECHARGE_STATUS = {"charging", "charging_complete"}
 # and could otherwise become APP_START or APP_CHARGE after an intervening update.
 RESUME_COMMANDS = {2: "resume_zoned_clean", 3: "resume_segment_clean"}
 
+def fault_window(queue):
+    """Freeze the last owned observation, independently of later dock settings."""
+    upper = queue.restart_record_before or queue.native_job_observed_at
+    return upper if (queue.mode == "manual" and queue.stage and queue.seen_job
+                     and queue.native_job_type in {2, 3}
+                     and isinstance(upper, (int, float)) and not isinstance(upper, bool)
+                     and isfinite(upper) and isinstance(queue.started_at, (int, float))
+                     and not isinstance(queue.started_at, bool) and isfinite(queue.started_at)
+                     and upper >= queue.started_at > 0) else 0
+
+
+def restore_fault_window(queue):
+    value = queue.fault_record_before
+    if (not isinstance(value, (int, float)) or isinstance(value, bool)
+            or not isfinite(value) or value < 0
+            or value and (value > fault_window(queue) or value < queue.started_at)):
+        queue.fault_record_before = 0
+    # v0.14 could discard native-resume continuity when dock settings reset.
+    # Migrate only its exact device-fault state; no cancellation/foreign controls.
+    if (not queue.fault_record_before and queue.phase == "attention"
+            and queue.error == "The robot or dock has a fault, or telemetry is unavailable. The sequence is retained for review."):
+        queue.fault_record_before = fault_window(queue)
+
+
+def reconcile_fault_completion(queue, snapshot, now):
+    """Credit proven floor work without resuming another room or sending commands."""
+    from . import history
+    from .engine import MAX_OBSERVATION_AGE
+    if (queue.phase != "attention" or queue.pending_command or not queue.fault_record_before
+            or not snapshot.connected or not snapshot.observed_at
+            or not 0 <= now - snapshot.observed_at <= MAX_OBSERVATION_AGE
+            or not completed_after_fault(queue, snapshot)):
+        return False
+    from . import restart
+    proven = restart.completion_record(queue, snapshot) if queue.restart_record_before else snapshot.record
+    history.complete_stage(queue, proven, now)
+    queue.completed += 1
+    queue.current_index += 1
+    queue.seen_job = False
+    queue.started_at = 0
+    queue.native_job_observed_at = 0
+    queue.fault_record_before = 0
+    queue.restart_record_before = 0
+    queue.restart_matched_record = {}
+    queue.water_refilled_index = -1
+    queue._reset_ready()
+    queue.interrupted_next_pending = queue.completed < len(queue.stages)
+    queue.continuation_context = "completed_after_fault"
+    queue.error = "The interrupted pass completed successfully. Continue when ready."
+    if queue.completed == len(queue.stages) and snapshot.healthy_for(queue.cleaning_mode):
+        queue.phase, queue.dock_finish_at = "finishing", now
+        queue.error = ""
+        queue.interrupted_next_pending = False
+    queue.decision = "Confirmed the interrupted pass from its successful native record; no cleaning command sent."
+    history.sync(queue, now)
+    return True
+
 
 def effective_snapshot(queue, snapshot):
     """A user's refill acknowledgement belongs only to this unfinished pass."""
@@ -77,6 +134,7 @@ def observe_job(queue, snapshot, now):
             return
         if queue.continuation_context in {"awaiting_completion", "completed_after_fault"} and snapshot.job == "on":
             queue.continuation_context = ""
+            queue.fault_record_before = 0
             return  # The earlier owned job ended; this one cannot be adopted.
         if snapshot.connected and snapshot.job == "on" and successful_owned_record(queue, snapshot):
             queue.continuation_context = "completion_pending_idle"
@@ -128,9 +186,10 @@ def successful_owned_record(queue, snapshot):
     record = restart.completion_record(queue, snapshot) if queue.restart_record_before else snapshot.record or {}
     begin, end = float(record.get("begin") or 0), float(record.get("end") or 0)
     return ((queue.continuation_context in {"device_fault", "awaiting_completion", "completed_after_fault", "completion_pending_idle"}
+             or queue.phase == "attention" and queue.fault_record_before > 0
              or queue.restart_record_before and restart.valid_record_data(queue, record))
             and queue.seen_job and queue.native_job_observed_at > 0
-            and queue.started_at - 3 <= begin <= (queue.restart_record_before or queue.native_job_observed_at)
+            and queue.started_at - 3 <= begin <= (queue.fault_record_before or queue.restart_record_before or queue.native_job_observed_at)
             and end >= begin and end > queue.baseline_end
             and record.get("complete") == 1 and record.get("error") == 0
             and (record.get("finish_reason") is None or record.get("finish_reason") in SUCCESS_REASONS))
@@ -255,6 +314,7 @@ def continue_sequence(queue, snapshot, now, *, water_refilled=False):
         history.retry_stage(queue, now)
         effect = queue._dispatch(snapshot, now)
     queue.continuation_context = ""
+    queue.fault_record_before = 0
     queue.interrupted_next_pending = False
     history.sync(queue, now)
     return effect

@@ -8,6 +8,10 @@ This is the backend half. It is driven by the [Robot Vacuum Cleaner Card](https:
 
 Native Roborock area cleaning accepts several areas in one command but does not promise an order, so it cannot implement "Kitchen → Office → Bedroom". This integration submits one room at a time and only advances when the robot reports a **successful cleaning record** for the room just finished. Pauses, recharge breaks and mop washing stay part of the same job and never count as completion.
 
+### Fault evidence and delayed completion
+
+v0.14.1 stores bounded robot/dock/connection fault events with onset, resolution and affected room in shared sequence history. Native completion proof is kept separately from permission to resume an active job: a dock-settings reset cannot erase a successful completion record for the original pass. A matching late record credits the pass without sending motion commands. Remaining rooms still require explicit continuation after a fault; when all floor work is proven and the robot is healthy, only final dock readiness is observed automatically.
+
 ## Install
 
 ### HACS (recommended)

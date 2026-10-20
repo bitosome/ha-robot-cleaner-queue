@@ -55,6 +55,8 @@ def snapshot(coordinator: Any, vacuum_state: str) -> Snapshot:
         status=getattr(status, "state_name", None) or "unavailable",
         job="unavailable" if job is None else "on" if job else "off",
         error="none" if error == 0 else "unavailable" if error is None else "error",
+        error_detail=str(getattr(getattr(status, "error_code", None), "name", None) or
+                         (f"code_{error}" if error is not None else ""))[:100],
         # Native RoborockDockErrorCode.water_empty == 38 (python-roborock 7.4.2).
         # Only this known water-only fault is eligible for vacuum-only cleaning.
         dock_error="ok" if dock_error in (None, 0) else "water_empty" if dock_error == 38 else

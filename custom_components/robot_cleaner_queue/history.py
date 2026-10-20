@@ -14,6 +14,7 @@ MAX_PREVIOUS_RUNS = 5
 MAX_STAGES = 128
 MAX_INTERRUPTION_EVENTS = 12
 MAX_EDIT_EVENTS = 12
+MAX_FAULT_EVENTS = 24
 STATES = {"pending", "preparing", "starting", "running", "paused", "attention", "completed", "cancelled", "finishing", "recovering"}
 SETTINGS = {"mode", "suction", "water", "route", "repeat"}
 LIVE_STATES = {"preparing", "starting", "running", "paused", "finishing", "recovering"}
@@ -58,7 +59,7 @@ def from_queue(queue, assigned_at=None, room_names=None):
             stage["state"] = queue.phase
     return {"run_id": queue.run_id or "legacy", "vacuum": queue.vacuum, "state": queue.phase,
             "assigned_at": timestamp(assigned_at), "updated_at": timestamp(assigned_at), "finished_at": None,
-            "rooms": rooms, "stages": stages, "interruptions": [], "edits": []}
+            "rooms": rooms, "stages": stages, "interruptions": [], "edits": [], "faults": []}
 
 
 def normalize(value):
@@ -92,7 +93,49 @@ def normalize(value):
     return {"run_id": value["run_id"], "vacuum": value["vacuum"], "state": value["state"],
             **{key: timestamp(value.get(key)) for key in ("assigned_at", "updated_at", "finished_at")},
             "rooms": rooms, "stages": stages, "interruptions": interruptions,
-            "edits": _normalize_edits(value.get("edits"))}
+            "edits": _normalize_edits(value.get("edits")),
+            "faults": normalize_faults(value.get("faults"))}
+
+
+def normalize_faults(value):
+    events = value if isinstance(value, list) else []
+    return [{"at": timestamp(e.get("at")), "resolved_at": timestamp(e.get("resolved_at")),
+             "source": e["source"], "code": str(e.get("code") or "")[:100],
+             "message": str(e.get("message") or "")[:300], "room_id": str(e.get("room_id") or "")[:200],
+             "evidence_source": "recorder" if e.get("evidence_source") == "recorder" else "native"}
+            for e in events[-MAX_FAULT_EVENTS:]
+            if isinstance(e, dict) and isinstance(e.get("source"), str) and e["source"] in {"robot", "dock", "connection"}]
+
+
+def observe_faults(queue, snapshot, now):
+    """Keep fault onset/resolution separate from the queue's retained interruption."""
+    if not _belongs(queue) or not timestamp(now):
+        return
+    if snapshot.connected and (not timestamp(snapshot.observed_at) or not 0 <= now - snapshot.observed_at <= 90):
+        return  # Stale cached values cannot resolve a previously observed fault.
+    before = deepcopy(queue.last_run)
+    events = queue.last_run.setdefault("faults", [])
+    states = {"connection": ("unavailable" if not snapshot.connected else "", "Robot connection unavailable")}
+    if snapshot.connected:
+        if snapshot.error != "unavailable":
+            code = (snapshot.error_detail or snapshot.error) if snapshot.error != "none" else ""
+            message = "Clean-water tank warning" if code == "clear_water_box_hoare" else "Robot: " + code.replace("_", " ")
+            states["robot"] = (code, message)
+        if snapshot.dock_error not in {"unavailable", "unknown"}:
+            code = snapshot.dock_error if snapshot.dock_error not in {"ok", "none"} else ""
+            states["dock"] = (code, "Clean-water tank empty" if code == "water_empty" else "Dock: " + code.replace("_", " "))
+    for source, (code, message) in states.items():
+        unresolved = [e for e in events if e["source"] == source and e.get("resolved_at") is None]
+        if any(e["code"] == code for e in unresolved):
+            continue
+        for event in unresolved:
+            event["resolved_at"] = now
+        if code and queue.phase in LIVE_STATES | {"attention"}:
+            events.append({"at": now, "resolved_at": None, "source": source, "code": code,
+                           "message": message, "room_id": queue.stage.get("target", "") if queue.stage else "",
+                           "evidence_source": "native"})
+    queue.last_run["faults"] = events[-MAX_FAULT_EVENTS:]
+    _changed(queue, before, now)
 
 
 def restore(queue):

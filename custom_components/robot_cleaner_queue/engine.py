@@ -64,6 +64,7 @@ class Snapshot:
     in_returning: int | None = None
     battery: int | float | None = None
     clean_time: int | float | None = None
+    error_detail: str = ""
 
     @property
     def robot_healthy(self) -> bool:
@@ -151,6 +152,8 @@ class Queue:
     queue_revision: int = 0
     queue_edit_signature: str = ""
     edit_pending: bool = False
+    # Completion proof only; never permission to resume native motion.
+    fault_record_before: float = 0
 
     def dump(self) -> dict[str, Any]:
         editing.sync_revision(self)
@@ -160,6 +163,7 @@ class Queue:
     def restore(cls, data: dict[str, Any] | None) -> Queue:
         queue = cls(**{k: v for k, v in (data or {}).items() if k in cls.__dataclass_fields__})
         history.restore(queue)
+        recovery.restore_fault_window(queue)
         restart.restore(queue)
         if queue.edit_pending:
             # The last process may have stopped between persisting an edited
@@ -175,6 +179,7 @@ class Queue:
         return queue
 
     def attention(self, message: str, *, recoverable_fault: bool = False) -> None:
+        self.fault_record_before = recovery.fault_window(self) if recoverable_fault else 0
         self.restart_checkpoint = {}
         self.restart_resume_guard = ""
         self.water_refilled_index = -1
@@ -307,6 +312,7 @@ class Queue:
             raise ValueError("A dock or settings command is still being confirmed. Wait for it before finishing.")
         self.restart_checkpoint = {}
         self.restart_record_before = 0
+        self.fault_record_before = 0
         self.restart_matched_record = {}
         self.restart_resume_guard = ""
         history.cancel_before_detach(self, now)
@@ -394,6 +400,7 @@ class Queue:
         self.continuation_context = ""
         self.restart_checkpoint = {}
         self.restart_record_before = 0
+        self.fault_record_before = 0
         self.restart_matched_record = {}
         self.restart_resume_guard = ""
         self.mode, self.phase = "external", "controlling"
@@ -466,6 +473,7 @@ class Queue:
         self.mode = "manual"
         self.restart_checkpoint = {}
         self.restart_record_before = 0
+        self.fault_record_before = 0
         self.restart_matched_record = {}
         self.water_refilled_index = -1
         self.resume_owned_job = False
@@ -506,6 +514,7 @@ class Queue:
         """Every plan applies its stage settings first and then starts that room."""
         self.restart_checkpoint = {}
         self.restart_record_before = 0
+        self.fault_record_before = 0
         self.restart_matched_record = {}
         restart.remember(self, snapshot)
         self.phase = "preparing"
@@ -521,6 +530,7 @@ class Queue:
 
     def _start_job(self, snapshot: Snapshot, now: float) -> tuple[str, str]:
         self.restart_record_before = 0
+        self.fault_record_before = 0
         self.restart_matched_record = {}
         self.decision = "dispatching room %d" % (self.current_index + 1)
         self.phase = "starting"
@@ -563,6 +573,7 @@ class Queue:
         if command == "cancel":
             self.restart_checkpoint = {}
             self.restart_record_before = 0
+            self.fault_record_before = 0
             self.restart_matched_record = {}
             self._preserve_command_barrier()
             self.start_uncertain = False
