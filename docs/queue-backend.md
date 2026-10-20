@@ -469,3 +469,18 @@ startup availability, repeated restart, per-pass history, ownership bounds, pend
 commands, explicit native confirmation, permissions/map changes, persistence failure,
 and Stop followed by Return to dock. The wrapper's recovery token also goes through
 the real Home Assistant package-merging/script validation regression.
+
+
+## Editing untouched rooms (v0.14.0)
+
+`robot_cleaner_queue.update_queue` is a direct, no-motion service; the existing script wrapper needs no change. Required fields are `vacuum`, `run_id`, `revision` and `rooms`; `setup` supplies optional defaults. The queue sensor publishes edit capability version 1, a monotonically changing `queue_revision`, eligibility/reason, and ordered `protected_room_ids`/`editable_room_ids`. Room objects use the same native-room schema as `start_manual`; the request is the complete replacement for the untouched suffix, with `[]` meaning remove that suffix.
+
+The queue lock serializes editing with starts, controls and advancement. The full completed prefix and every remaining pass/repeat belonging to an already-started room are immutable. A genuinely unstarted next room can be edited during the settled-dock wait. Configure/start reservations protect their current room before a cleaning acknowledgement. Legacy area/whole-home sequences, restart reconciliation and terminal queues cannot be edited. Removing the entire untouched suffix finishes current work normally; removing it between rooms observes final dock care. Paused or attention states remain explicit and require their existing continuation action.
+
+The requester and original execution owner must both retain control permission for the vacuum and native setting entities. Map, segments and settings are revalidated after asynchronous permission checks; changed map identity is rejected. Temporary dock-select unavailability permits removal/reordering only from the frozen settings and validated room mappings. No motion/settings command is sent by the edit itself. Later dispatch retains its normal capability and permission checks.
+
+Edits use a detached candidate and persist before publishing. A synchronous competing-control interruption or shutdown during storage causes rejection and a rollback to the actual current queue. The candidate is written with an `edit_pending` restart guard; a failed rollback cannot leave that candidate executable after restart. Successful acceptance clears the guard in memory, and the next ordinary publish (including any control/tick before robot I/O) saves the cleared guard. A restart in that brief window preserves the amended plan and confirmed history in attention for explicit review. Failed writes do not silently claim success, and failed rollbacks expose storage uncertainty.
+
+The execution journal replaces only untouched pending stages, preserving current/completed proof and timestamps. Up to twelve edit events record before/after order, added IDs and removed-room settings with `state: removed`; removed rooms leave the live progress denominator and are never credited as cleaned. Saved presets and shared room preferences are separate and unchanged.
+
+Regression coverage: `test/backend_editing_test.py` exercises pending-mode protection, reordered dispatch, stale/two-client edits, permission/map changes during awaits, storage failures, external interruptions, shutdown, immediate/settled restarts, empty suffixes and dock/water faults. No physical device or network is used.

@@ -17,9 +17,9 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "custom_components/robot_cleaner_queue/__init__.py"
 
 
-def service_schema():
+def service_schema(name="SERVICE_SCHEMA"):
     tree = ast.parse(SOURCE.read_text())
-    wanted = {"ROOM_SCHEMA", "PLAN_ROOMS", "SERVICE_SCHEMA"}
+    wanted = {"ROOM_SCHEMA", "PLAN_ROOMS", "SERVICE_SCHEMA", "UPDATE_QUEUE_SCHEMA"}
     body = [node for node in tree.body
             if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", "") in wanted]
 
@@ -28,9 +28,9 @@ def service_schema():
             return []
         return value if isinstance(value, list) else [value]
 
-    env = {"vol": vol, "cv": types.SimpleNamespace(ensure_list=ensure_list)}
+    env = {"vol": vol, "cv": types.SimpleNamespace(ensure_list=ensure_list, entity_id=str)}
     exec(compile(ast.Module(body=body, type_ignores=[]), str(SOURCE), "exec"), env)  # noqa: S102
-    return env["SERVICE_SCHEMA"]
+    return env[name]
 
 
 @unittest.skipIf(vol is None, "voluptuous is not installed")
@@ -46,6 +46,18 @@ class ServiceSchemaTests(unittest.TestCase):
             return True
         except vol.Invalid:
             return False
+
+    def test_update_queue_requires_run_revision_and_explicit_room_objects(self):
+        schema = service_schema("UPDATE_QUEUE_SCHEMA")
+        base = {"vacuum": "vacuum.robot", "run_id": "run", "revision": 7, "rooms": []}
+        self.assertEqual(schema(base)["rooms"], [])
+        self.assertEqual(schema({**base, "rooms": [{"id": "0_2", "mode": "mop"}]})["rooms"][0]["id"], "0_2")
+        for key in ("vacuum", "run_id", "revision", "rooms"):
+            with self.assertRaises(vol.Invalid):
+                schema({k: v for k, v in base.items() if k != key})
+        for bad in (["0_2"], [{"id": "0_2", "repeat": 3}], "0_2", None):
+            with self.assertRaises(vol.Invalid):
+                schema({**base, "rooms": bad})
 
     def test_room_plans_validate(self):
         for payload in (

@@ -245,7 +245,7 @@ class HistoryTests(unittest.TestCase):
         queue.previous_runs = [deepcopy(queue.last_run) for _ in range(5)]
         source = qtests.PACKAGE / "sensor.py"
         definition = next(n for n in ast.parse(source.read_text()).body if isinstance(n, ast.ClassDef))
-        env = {"SensorEntity": object, "history": history}
+        env = {"SensorEntity": object, "history": history, "editing": qtests.load("editing")}
         exec(compile(ast.Module(body=[definition], type_ignores=[]), str(source), "exec"), env)
         sensor = env["QueueSensor"](NS(queue=queue, robot_state={}, preferences={}, saved_presets={}))
         attrs = sensor.extra_state_attributes

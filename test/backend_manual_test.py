@@ -363,7 +363,7 @@ def manager_class():
     definition = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Manager")
     from copy import deepcopy
     env = dict(asyncio=asyncio, time=time, logging=logging, deque=deque, uuid4=uuid4, Store=FakeStore,
-               history=load("history"), recovery=load("recovery"), restart=load("restart"), deepcopy=deepcopy,
+               history=load("history"), recovery=load("recovery"), restart=load("restart"), editing=load("editing"), deepcopy=deepcopy,
                Queue=Queue, Snapshot=Snapshot, ACTIVE=load("engine").ACTIVE,
                command_failure_metadata=load("errors").command_failure_metadata,
                ACK_SECONDS=60, CONTROLS=device.CONTROLS, DOCK=device.DOCK, device_entities=device.device_entities, device_command=device.device_command,

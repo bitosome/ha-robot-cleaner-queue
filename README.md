@@ -58,6 +58,7 @@ Installation starts no cleaning. After a restart, an existing active sequence re
 | Action | Purpose |
 | --- | --- |
 | `robot_cleaner_queue.control` | `start_manual`, `pause`, `resume`, `cancel`, `return_to_dock`, `stop`, `toggle`, `toggle_saved`, `continue_sequence`, `resume_now` |
+| `robot_cleaner_queue.update_queue` | Add, remove or reorder untouched rooms in the current sequence, with run/revision guards |
 | `robot_cleaner_queue.device_control` | Allowlisted dock and robot settings (mop washing, child lock, DND, volume, …) |
 | `robot_cleaner_queue.save_preset` | Store one validated plan per vacuum |
 | `robot_cleaner_queue.get_capabilities` | Read-only capabilities, manual options, native control discovery and zones-and-areas report |
@@ -202,3 +203,13 @@ resume automatically.
 
 After **Stop**, **Return to dock** remains available once the robot confirms that
 it is idle and the stop command has completed.
+
+## Edit a running sequence
+
+The card can change the untouched part of an assigned native room sequence. Completed rooms and a room already being configured or cleaned are locked, including its remaining mop pass and repeats. Rooms still waiting can be removed, reordered or added. Applying an edit sends no robot command and leaves the saved reusable cleaning plan unchanged.
+
+The `update_queue` action takes `vacuum`, `run_id`, `revision` (the sensor's `queue_revision`), and an ordered `rooms` list of `{id, mode, ...settings}` objects. This list replaces only the editable tail; do not include locked rooms. An empty list removes that tail and lets the current room finish its normal work and dock care. Stale requests fail instead of overwriting another user's edit or new progress. All household users with the required entity permissions see the same persisted queue.
+
+The sensor publishes `queue_edit_version: 1`, `queue_editable`, `queue_edit_reason`, `protected_room_ids` and `editable_room_ids`. Editing is temporarily unavailable during restart reconciliation and ends once all assigned floor work has finished. A water fault does not prevent editing the untouched tail or dismiss the fault. While dock servicing temporarily hides native settings, unchanged frozen rooms can still be removed or reordered; adding rooms or changing settings waits for native controls to return.
+
+History keeps completed pass evidence and a bounded `edits` journal with removed rooms, their settings, and edit times. Removed passes are never counted as completed. The accepted queue is saved before publication. In the brief interval before the next ordinary persistence cycle, a restart retains the amended plan but requests explicit review; an interrupted storage write cannot automatically launch an uncertain amendment.

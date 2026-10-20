@@ -23,7 +23,7 @@ from .adapter import is_competing_command, routine_matches, snapshot
 from .engine import ACTIVE, ACK_SECONDS, Queue, Snapshot
 from .device import CONTROLS, DOCK, device_entities, device_command
 from .errors import command_failure_metadata
-from . import history, recovery, restart
+from . import history, recovery, restart, editing
 from .permissions import async_require_control
 from .manual import build_plan, build_room_plan, cached_settings, capabilities, current_map, robot_targets, validate_stage
 
@@ -64,11 +64,21 @@ SERVICE_SCHEMA = vol.Schema({
 })
 
 
+UPDATE_QUEUE_SCHEMA = vol.Schema({
+    vol.Required("vacuum"): cv.entity_id,
+    vol.Required("run_id"): str,
+    vol.Required("revision"): vol.All(int, vol.Range(min=0)),
+    vol.Required("rooms"): vol.All(list, [ROOM_SCHEMA]),
+    vol.Optional("setup", default={}): dict,
+})
+
+
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     manager = Manager(hass)
     hass.data[DOMAIN] = manager
     await manager.setup()
     hass.services.async_register(DOMAIN, "control", manager.control, schema=SERVICE_SCHEMA)
+    hass.services.async_register(DOMAIN, "update_queue", manager.update_queue, schema=UPDATE_QUEUE_SCHEMA)
     hass.services.async_register(DOMAIN, "save_preset", manager.save_preset, schema=vol.Schema({
         vol.Required("vacuum"): cv.entity_id,
         vol.Required("source"): vol.In(["rooms", "manual"]),
@@ -742,6 +752,91 @@ class Manager:
             await self.publish()
             if effect:
                 await self.execute(effect, call.context)
+
+    async def update_queue(self, call: ServiceCall) -> None:
+        """Atomically persist a new untouched suffix without sending any robot I/O."""
+        async with self.lock:
+            if self.closing:
+                raise ServiceValidationError("Home Assistant is stopping.")
+            data = call.data
+            original = self.queue
+            try:
+                end = editing.validate_request(original, data["vacuum"], data["run_id"], data["revision"])
+                before = original.dump()
+                caps, controls, _, map_id = self.manual_capabilities(data["vacuum"])
+                entities = [data["vacuum"], *original.control_entities.values(), *controls.values()]
+                # The editor may be another household member, but future commands
+                # retain their original owner and must still be authorized for both.
+                for user_id in {call.context.user_id, original.owner_user_id}:
+                    try:
+                        await async_require_control(self.hass.auth, user_id, entities, POLICY_CONTROL)
+                    except PermissionError as err:
+                        raise Unauthorized(context=call.context, permission=POLICY_CONTROL) from err
+                if self.closing or self.queue is not original or original.dump() != before:
+                    raise ValueError("The sequence changed while checking permissions. Reload it before editing.")
+                # Read cached native data again after authorization awaits. Map or
+                # setting changes must not smuggle an obsolete room/option through.
+                caps, current_controls, _, map_id = self.manual_capabilities(data["vacuum"])
+                unavailable = set(caps.get("unavailable_controls", []))
+                missing = set(original.control_entities) - set(current_controls)
+                if (current_controls != controls or missing - unavailable
+                        or any(original.control_entities.get(key) != value for key, value in current_controls.items())):
+                    raise ValueError("The native cleaning controls changed. Restore them before editing.")
+                targets = robot_targets(self.resolve(data["vacuum"])[2], map_id)
+                for stage in original.stages[original.current_index:end]:
+                    editing.validate_mapping(stage, targets, map_id)
+                    if not unavailable:
+                        validate_stage(stage, caps, targets, map_id)
+                # Even when the last current stage just finished, keep the map
+                # identity frozen; completed evidence must not name another map.
+                if any(stage.get("map_id") != map_id for stage in original.stages):
+                    raise ValueError("The robot map changed. Restore the sequence's map before editing.")
+                requests = data["rooms"]
+                if not isinstance(requests, list):
+                    raise ValueError("Remaining rooms must be an ordered list.")
+                if unavailable:
+                    rooms, stages = editing.frozen_remaining(original, requests, data.get("setup", {}), targets, map_id)
+                else:
+                    rooms, stages = build_room_plan(requests, data.get("setup", {}), caps, targets, map_id) if requests else ([], [])
+                candidate = deepcopy(original)
+                editing.replace_remaining(candidate, rooms, stages, time.time())
+                candidate.edit_pending = True
+                durable = candidate.dump()
+                try:
+                    await self.store.async_save(durable)
+                except Exception as err:
+                    _LOGGER.exception("The remaining room edit could not be saved")
+                    self.last_published = None  # Retry the unchanged state on the next tick.
+                    raise ServiceValidationError("The remaining rooms could not be saved. The previous queue is unchanged.") from err
+                # Competing native commands interrupt synchronously, even while
+                # the lock is held. Never replace that interruption with our copy.
+                if self.closing or self.queue is not original or original.dump() != before:
+                    try:
+                        await self.store.async_save(self.queue.dump())
+                    except Exception:
+                        self.queue.attention("An interrupted queue edit could not be rolled back in storage. Check the sequence before continuing.")
+                        self.last_published = None
+                        _LOGGER.exception("The interrupted room edit could not be rolled back")
+                        history.sync(self.queue, time.time())
+                        for listener in list(self.listeners):
+                            listener()
+                        raise ServiceValidationError("The edit was interrupted and storage could not be restored. The queue is stopped for review; the persisted plan may contain the edit.")
+                    raise ValueError("The sequence changed while saving. The edit was not applied; review its current state.")
+                # The first durable snapshot retains a restart safety marker.
+                # Any subsequent control/tick must publish this cleared marker
+                # before execute can send a command. A failed rollback therefore
+                # cannot leave an automatically executable candidate on disk.
+                candidate.edit_pending = False
+                self.queue = candidate
+                self.last_published = durable
+                self.event("queue-edited", "remaining room order updated without robot commands", logging.INFO)
+                # Cached telemetry is refreshed by the ordinary tick. A failed
+                # read after this durable commit must not turn success into error.
+                self.last_robot_published = dict(self.robot_state)
+                for listener in list(self.listeners):
+                    listener()
+            except ValueError as err:
+                raise ServiceValidationError(str(err)) from err
 
     def effect_valid(self, effect: tuple[str, str]) -> bool:
         kind, target = effect

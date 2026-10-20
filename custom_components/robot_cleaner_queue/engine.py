@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass, field
 from copy import deepcopy
 from typing import Any
 
-from . import history, recovery, restart
+from . import history, recovery, restart, editing
 
 ACTIVE = {"preparing", "starting", "running", "paused", "controlling", "finishing", "recovering"}
 READY_STATUS = {"idle", "charging", "charging_complete"}
@@ -148,8 +148,12 @@ class Queue:
     restart_record_before: float = 0
     checkpoint_observed_at: float = 0
     checkpoint_record_end: float | None = None
+    queue_revision: int = 0
+    queue_edit_signature: str = ""
+    edit_pending: bool = False
 
     def dump(self) -> dict[str, Any]:
+        editing.sync_revision(self)
         return asdict(self)
 
     @classmethod
@@ -157,6 +161,11 @@ class Queue:
         queue = cls(**{k: v for k, v in (data or {}).items() if k in cls.__dataclass_fields__})
         history.restore(queue)
         restart.restore(queue)
+        if queue.edit_pending:
+            # The last process may have stopped between persisting an edited
+            # suffix and observing that no competing interruption superseded it.
+            queue.edit_pending = False
+            queue.attention("The saved queue edit needs review after restart. The amended rooms and confirmed work are retained; continue when ready.")
         # v0.8.1 used the ten-minute setup deadline as a settings-only barrier.
         # No motion command uses that duration; shorten only that legacy case.
         if queue.barrier_window == CONFIGURE_SECONDS:
@@ -609,6 +618,8 @@ class Queue:
                 if not snapshot.ready_for(self.cleaning_mode):
                     raise ValueError("The robot is not ready for the next room.")
                 self.phase = "running"
+                if self.completed == len(self.stages):
+                    self.phase, self.next_pending, self.dock_finish_at = "finishing", False, now
                 self._reset_ready()
                 return None  # Fresh settled readiness is checked by observe before dispatch.
             if not snapshot.healthy_for(self.cleaning_mode) or snapshot.vacuum != "paused" or snapshot.status != "paused" or snapshot.job != "on":

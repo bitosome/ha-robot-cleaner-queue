@@ -24,6 +24,7 @@ python3 -B test/backend_device_test.py
 python3 -B test/backend_history_test.py
 python3 -B test/backend_recovery_test.py
 python3 -B test/backend_restart_test.py
+python3 -B test/backend_editing_test.py
 ```
 
 Source changes alone do not authorize production installation or an actual cleaning run.

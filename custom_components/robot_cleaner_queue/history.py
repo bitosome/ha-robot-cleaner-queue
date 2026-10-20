@@ -13,6 +13,7 @@ VERSION = 1
 MAX_PREVIOUS_RUNS = 5
 MAX_STAGES = 128
 MAX_INTERRUPTION_EVENTS = 12
+MAX_EDIT_EVENTS = 12
 STATES = {"pending", "preparing", "starting", "running", "paused", "attention", "completed", "cancelled", "finishing", "recovering"}
 SETTINGS = {"mode", "suction", "water", "route", "repeat"}
 LIVE_STATES = {"preparing", "starting", "running", "paused", "finishing", "recovering"}
@@ -57,7 +58,7 @@ def from_queue(queue, assigned_at=None, room_names=None):
             stage["state"] = queue.phase
     return {"run_id": queue.run_id or "legacy", "vacuum": queue.vacuum, "state": queue.phase,
             "assigned_at": timestamp(assigned_at), "updated_at": timestamp(assigned_at), "finished_at": None,
-            "rooms": rooms, "stages": stages, "interruptions": []}
+            "rooms": rooms, "stages": stages, "interruptions": [], "edits": []}
 
 
 def normalize(value):
@@ -90,7 +91,8 @@ def normalize(value):
                      if isinstance(event, dict)]
     return {"run_id": value["run_id"], "vacuum": value["vacuum"], "state": value["state"],
             **{key: timestamp(value.get(key)) for key in ("assigned_at", "updated_at", "finished_at")},
-            "rooms": rooms, "stages": stages, "interruptions": interruptions}
+            "rooms": rooms, "stages": stages, "interruptions": interruptions,
+            "edits": _normalize_edits(value.get("edits"))}
 
 
 def restore(queue):
@@ -250,4 +252,47 @@ def retry_stage(queue, now):
     stage.update(started_at=None, finished_at=None, confirmed_at=None, reason="", evidence_source="queue")
     queue.last_run["interruptions"].append({"at": timestamp(now), "reason": "The user retried the unconfirmed pass; confirmed passes were retained."})
     queue.last_run["interruptions"] = queue.last_run["interruptions"][-MAX_INTERRUPTION_EVENTS:]
+    _changed(queue, before, now)
+
+
+def _normalize_edits(value):
+    events = []
+    for raw in (value if isinstance(value, list) else [])[-MAX_EDIT_EVENTS:]:
+        if not isinstance(raw, dict):
+            continue
+        event = {"at": timestamp(raw.get("at"))}
+        for key in ("before_room_ids", "after_room_ids", "added_room_ids"):
+            event[key] = [item[:200] for item in raw.get(key, [])[:32] if isinstance(item, str)] if isinstance(raw.get(key), list) else []
+        event["removed_rooms"] = [{"id": room["id"][:200], "name": str(room.get("name") or room["id"])[:200],
+            "setup": _settings(room.get("setup")), "state": "removed"}
+            for room in (raw.get("removed_rooms") if isinstance(raw.get("removed_rooms"), list) else [])[:32]
+            if isinstance(room, dict) and isinstance(room.get("id"), str)]
+        events.append(event)
+    return events
+
+
+def edit_remaining(queue, end, old_targets, old_rooms, old_run, now):
+    """Retain all started/completed proof; journal removed pending work separately."""
+    ensure(queue)
+    if not _belongs(queue):
+        return
+    before = deepcopy(queue.last_run)
+    fresh = from_queue(queue, room_names={room["id"]: room["name"] for room in queue.setup["rooms"]})
+    queue.last_run["rooms"] = fresh["rooms"]
+    # Existing untouched stages retain any prior pending metadata, with only their
+    # positional indices changed. Protected proof is never regenerated.
+    previous = {(stage["target"], stage["mode"], stage["pass_index"], stage["repeat_index"]): stage
+                for stage in (old_run or {}).get("stages", [])[end:]}
+    suffix = []
+    for stage in fresh["stages"][end:]:
+        prior = previous.get((stage["target"], stage["mode"], stage["pass_index"], stage["repeat_index"]))
+        if prior and prior.get("state") == "pending" and prior.get("settings") == stage["settings"]:
+            stage = {**deepcopy(prior), "index": stage["index"], "room_index": stage["room_index"]}
+        suffix.append(stage)
+    queue.last_run["stages"] = deepcopy((old_run or queue.last_run)["stages"][:end]) + suffix
+    queue.last_run.setdefault("edits", []).append({"at": timestamp(now),
+        "before_room_ids": old_targets, "after_room_ids": list(queue.targets),
+        "added_room_ids": [target for target in queue.targets if target not in old_targets],
+        "removed_rooms": [{**room, "state": "removed"} for room in old_rooms if room["id"] not in queue.targets]})
+    queue.last_run["edits"] = _normalize_edits(queue.last_run["edits"])
     _changed(queue, before, now)

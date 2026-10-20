@@ -1,7 +1,7 @@
 """Frontend-readable state of the single server-owned robot queue."""
 from homeassistant.components.sensor import SensorEntity
 from . import DOMAIN
-from . import history
+from . import history, editing
 
 
 async def async_setup_platform(hass, _config, async_add_entities, discovery_info=None):
@@ -32,6 +32,7 @@ class QueueSensor(SensorEntity):
         queue = self.manager.queue
         return {
             "control_version": 7,
+            **editing.state(queue),
             "execution_version": 5,
             "run_history_version": history.VERSION,
             "history_revision": queue.history_revision,

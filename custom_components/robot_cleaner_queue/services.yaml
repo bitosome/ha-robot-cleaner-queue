@@ -180,3 +180,35 @@ save_preferences:
       required: true
       selector:
         object:
+
+update_queue:
+  name: Edit remaining cleaning rooms
+  description: Replace only the untouched rooms of the current native room sequence. Preserves completed and started rooms, including their remaining passes. Sends no robot commands and does not change the saved plan.
+  fields:
+    vacuum:
+      required: true
+      selector:
+        entity:
+          domain: vacuum
+          integration: roborock
+    run_id:
+      required: true
+      description: Current queue sensor run_id; rejects edits for another run.
+      selector:
+        text: {}
+    revision:
+      required: true
+      description: Current queue sensor queue_revision; rejects concurrent or stale edits.
+      selector:
+        number:
+          min: 0
+          mode: box
+    rooms:
+      required: true
+      description: Ordered remaining room objects with id and per-room settings. An empty list removes all untouched rooms; it never requests whole-home cleaning.
+      selector:
+        object: {}
+    setup:
+      description: Optional default manual settings for these remaining rooms.
+      selector:
+        object: {}
