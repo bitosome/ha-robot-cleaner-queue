@@ -126,6 +126,10 @@ save_preset:
     rooms:
       selector:
         object: {}
+    room_order:
+      description: Full shared tile order, including disabled rooms. Requires revision. An empty rooms list saves a disabled plan.
+      selector:
+        object: {}
     setup:
       selector:
         object: {}

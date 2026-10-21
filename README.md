@@ -217,3 +217,10 @@ The `update_queue` action takes `vacuum`, `run_id`, `revision` (the sensor's `qu
 The sensor publishes `queue_edit_version: 1`, `queue_editable`, `queue_edit_reason`, `protected_room_ids` and `editable_room_ids`. Editing is temporarily unavailable during restart reconciliation and ends once all assigned floor work has finished. A water fault does not prevent editing the untouched tail or dismiss the fault. While dock servicing temporarily hides native settings, unchanged frozen rooms can still be removed or reordered; adding rooms or changing settings waits for native controls to return.
 
 History keeps completed pass evidence and a bounded `edits` journal with removed rooms, their settings, and edit times. Removed passes are never counted as completed. The accepted queue is saved before publication. In the brief interval before the next ordinary persistence cycle, a restart retains the amended plan but requests explicit review; an interrupted storage write cannot automatically launch an uncertain amendment.
+
+
+### Shared card plan
+
+Card v0.16.0 and companion v0.15.0 automatically persist the idle card selection and full tile order (including disabled rooms). `get_capabilities.shared_plan_version: 1` advertises support. `save_preset` accepts `room_order` plus an expected `revision`, validates current-map IDs and selected-room order, and saves through the existing Home Assistant Store before notifying all dashboards. Plans are per vacuum, shared by authorized users, and survive restarts and updates. Old plans load without migration writes; a new edit adds order metadata. Once a plan includes order metadata, older clients cannot overwrite it without that field.
+
+An explicitly empty selection is stored and makes the wall-switch launch refuse cleaning; it never means whole-home cleaning. Updates to a live queue remain distinct from the saved next plan. No new storage key or executing queue changes are required.

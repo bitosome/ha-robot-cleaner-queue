@@ -728,6 +728,34 @@ class ManagerTraceTests(unittest.IsolatedAsyncioTestCase):
             "rooms": rooms if rooms is not None else [{"id": "0_1", "mode": "vacuum", "suction": "max"}],
             "setup": {} if setup is None else setup}))
 
+    async def test_shared_order_empty_selection_and_restart(self):
+        data = {"vacuum":"vacuum.robot", "source":"rooms", "revision":0,
+                "room_order":["0_3","0_1"], "rooms":[{"id":"0_1","mode":"vacuum"}]}
+        await self.manager.save_preset(NS(context=FakeContext("user"),data=data))
+        stored=self.manager.preset_store.saved[-1]
+        self.assertEqual(stored["vacuum.robot"]["room_order"],["0_3","0_1"])
+        fresh=manager_class()(self.hass)
+        async def load(): return stored
+        fresh.preset_store.async_load=load
+        await fresh.load_saved_presets()
+        self.assertEqual(await fresh.read_saved_preset("vacuum.robot","another-user"),stored["vacuum.robot"])
+        await self.manager.save_preset(NS(context=FakeContext("user"),data={**data,"revision":1,"rooms":[]}))
+        self.assertEqual(self.manager.saved_presets["vacuum.robot"]["rooms"],[])
+        with self.assertRaisesRegex(ServiceError,"No rooms are enabled"):
+            await self.manager.control(NS(context=FakeContext("user"),data={"command":"toggle_saved","vacuum":"vacuum.robot"}))
+        self.assertEqual(self.calls,[])
+
+    async def test_shared_order_validation_and_stale_revisions(self):
+        base={"vacuum":"vacuum.robot","source":"rooms","revision":0,
+              "rooms":[{"id":"0_1","mode":"vacuum"}]}
+        for order in [["0_1","0_1"],["0_3"],["9_1","0_1"]]:
+            with self.assertRaises(ServiceError):
+                await self.manager.save_preset(NS(context=FakeContext("user"),data={**base,"room_order":order}))
+        await self.manager.save_preset(NS(context=FakeContext("user"),data={**base,"room_order":["0_3","0_1"]}))
+        with self.assertRaisesRegex(ServiceError,"Another user"):
+            await self.manager.save_preset(NS(context=FakeContext("user"),data={**base,"room_order":["0_1","0_3"]}))
+        self.assertEqual(self.calls,[])
+
     async def test_busy_saved_toggle_finishes_even_if_saved_plan_is_invalid(self):
         self.manager.saved_presets = {"vacuum.robot": {"source":"broken"}}
         self.coordinator.data.status.state_name = "segment_cleaning"

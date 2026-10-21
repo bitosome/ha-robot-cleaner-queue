@@ -85,6 +85,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         vol.Optional("revision"): vol.All(int, vol.Range(min=0)),
         # Accepted from the released card and ignored: routines are no longer a plan.
         vol.Optional("presets", default=[]): vol.All(cv.ensure_list, [cv.entity_id]),
+        vol.Optional("room_order"): vol.All(list, [str], vol.Length(max=128)),
         vol.Optional("rooms", default=[]): PLAN_ROOMS,
         vol.Optional("setup", default={}): dict,
     }))
@@ -303,6 +304,7 @@ class Manager:
             caps["execution_version"] = 5
             caps["current_map"] = current_map(self.resolve(call.data["vacuum"])[2])[0]
             caps["saved_preset"] = await self.read_saved_preset(call.data["vacuum"], call.context.user_id)
+            caps["shared_plan_version"] = 1
             caps["saved_plan_revision"] = (caps["saved_preset"] or {}).get("revision", 0)
             caps["preferences"] = self.preference_profile(call.data["vacuum"])
             caps["device_entities"] = {}
@@ -403,6 +405,11 @@ class Manager:
                         or not isinstance(plan.get("rooms"), list)
                         or not self.valid_stored_settings(plan.get("setup"))):
                     raise ValueError("Invalid saved plan storage")
+                order = plan.get("room_order")
+                if order is not None and (not isinstance(order, list) or len(order) > 128
+                        or any(not isinstance(item, str) for item in order)
+                        or len(set(order)) != len(order)):
+                    raise ValueError("Invalid stored room order")
                 for room in plan["rooms"]:
                     if not isinstance(room, str) and not (isinstance(room, dict)
                             and isinstance(room.get("id"), str)
@@ -438,7 +445,24 @@ class Manager:
                 caps, controls, targets, map_id = self.manual_capabilities(vacuum)
                 await async_require_control(self.hass.auth, call.context.user_id, list(controls.values()), POLICY_CONTROL)
                 requests = list(call.data.get("rooms", []))
-                if requests and all(isinstance(item, dict) for item in requests):
+                order = call.data.get("room_order")
+                if (current or {}).get("room_order") is not None and order is None:
+                    raise ValueError("This shared plan requires the updated card with room order support. Refresh the dashboard.")
+                if order is not None:
+                    if "revision" not in call.data:
+                        raise ValueError("Shared plan changes require a revision. Reload the plan.")
+                    available = robot_targets(self.resolve(vacuum)[2], map_id) if call.data["source"] == "rooms" else targets
+                    selected = [item["id"] if isinstance(item, dict) else item for item in requests]
+                    if (not isinstance(order, list) or len(order) > 128
+                            or any(not isinstance(item, str) or item not in available for item in order)
+                            or len(set(order)) != len(order) or not set(selected).issubset(order)
+                            or [item for item in order if item in selected] != selected):
+                        raise ValueError("Room order must contain each selected room in cleaning order and only rooms on the current map.")
+                    plan["room_order"] = list(order)
+                if not requests and order is not None:
+                    # Empty selection is durable, never shorthand for whole-home cleaning.
+                    plan.update(source=call.data["source"], map_id=map_id)
+                elif requests and all(isinstance(item, dict) for item in requests):
                     rooms_map = robot_targets(self.resolve(vacuum)[2], map_id)
                     frozen, _ = build_room_plan(requests, call.data.get("setup", {}), caps, rooms_map, map_id)
                     plan.update(rooms=[{"id": room["id"], **room["setup"]} for room in frozen], map_id=map_id)
@@ -671,6 +695,8 @@ class Manager:
                                if not isinstance(saved_plan, dict) or key not in saved_plan]
                     if missing:
                         raise ServiceValidationError("The saved plan is incomplete. Save it again from the card.")
+                    if not saved_plan["rooms"]:
+                        raise ServiceValidationError("No rooms are enabled in the shared cleaning plan. Enable rooms in the card first.")
                     data.update(rooms=saved_plan["rooms"], setup=saved_plan["setup"])
             bound = self.queue.phase in ACTIVE or self.queue.phase == "attention" or bool(self.queue.pending_command)
             owned_plan = (self.queue.phase in ACTIVE or bool(self.queue.pending_command)) and self.queue.mode == "manual"
