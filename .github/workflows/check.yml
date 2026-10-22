@@ -16,6 +16,7 @@ jobs:
       - run: python3 -B test/backend_queue_test.py
       - run: python3 -B test/backend_manual_test.py
       - run: python3 -B test/backend_controls_test.py
+      - run: python3 -B test/backend_button_test.py
       - run: python3 -B test/backend_device_test.py
       - run: python3 -B test/backend_schema_test.py
       - run: python3 -B test/backend_errors_test.py

@@ -224,3 +224,8 @@ History keeps completed pass evidence and a bounded `edits` journal with removed
 Card v0.16.0 and companion v0.15.0 automatically persist the idle card selection and full tile order (including disabled rooms). `get_capabilities.shared_plan_version: 1` advertises support. `save_preset` accepts `room_order` plus an expected `revision`, validates current-map IDs and selected-room order, and saves through the existing Home Assistant Store before notifying all dashboards. Plans are per vacuum, shared by authorized users, and survive restarts and updates. Old plans load without migration writes; a new edit adds order metadata. Once a plan includes order metadata, older clients cannot overwrite it without that field.
 
 An explicitly empty selection is stored and makes the wall-switch launch refuse cleaning; it never means whole-home cleaning. Updates to a live queue remain distinct from the saved next plan. No new storage key or executing queue changes are required.
+
+
+### Shared-plan button
+
+Each robot with a saved plan exposes a **[Robot name] cleaning plan** button. Press it through `button.press` from a wall switch, automation, or Companion app: idle starts the shared card plan; an active cleaning job is cancelled and sent to dock through the existing queue controller. Empty plans and unsafe commands are rejected by that controller. No separate script is needed. Entities are discovered after storage loads and when the first plan is saved. Button calls preserve the caller context and vacuum permissions.

@@ -109,6 +109,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                            vol.Required("defaults"): dict,
                            vol.Required("rooms"): dict}))
     await async_load_platform(hass, "sensor", DOMAIN, {}, config)
+    await async_load_platform(hass, "button", DOMAIN, {}, config)
     return True
 
 
