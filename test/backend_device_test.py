@@ -157,7 +157,7 @@ class DeviceTests(unittest.IsolatedAsyncioTestCase):
         before=self.manager.queue.dump()
         with self.assertRaises(m.ServiceError): await self.send("volume",70)
         self.assertEqual(self.manager.queue.dump(),before);self.assertEqual(len(self.calls),1)
-        self.manager.queue.command_at=time.time()-61
+        self.manager.queue.command_at=self.clock-61
         await self.manager.tick()
         self.assertEqual(self.manager.queue.phase,"attention")
         self.assertGreater(self.manager.queue.not_before,0)
