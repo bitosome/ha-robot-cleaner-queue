@@ -73,6 +73,21 @@ class ManualPlanTests(unittest.TestCase):
         self.assertEqual(manual.motor_settings(self.coordinator, {"mode":"mop", "water":"high", "route":"deep"}),
                          [{"fan_power":105, "water_box_mode":203, "mop_mode":301}])
 
+    def test_max_plus_is_only_offered_and_accepted_for_vacuum(self):
+        self.states[self.vacuum.entity_id].attributes["fan_speed_list"].append("max_plus")
+        self.coordinator.properties_api.status.fan_speed_options.append(NS(value="max_plus",display_name="max_plus"))
+        caps, _, targets = manual.capabilities(self.vacuum,self.coordinator,self.entries,self.states,self.areas)
+        self.assertIn("max_plus",caps["suction_by_mode"]["vacuum"])
+        for mode in ["vacuum_mop","vacuum_then_mop","mop"]:
+            self.assertNotIn("max_plus",caps["suction_by_mode"][mode])
+        manual.build_plan(["kitchen"],{"mode":"vacuum","suction":"max_plus"},caps,targets,0)
+        for mode in ["vacuum_mop","vacuum_then_mop"]:
+            with self.assertRaisesRegex(ValueError,r"Max\+ suction is available only"):
+                manual.build_plan(["kitchen"],{"mode":mode,"suction":"max_plus"},caps,targets,0)
+        _, stages=manual.build_plan(["kitchen"],{"mode":"vacuum_mop","suction":"max"},caps,targets,0)
+        stages[0]["settings"]["suction"]="max_plus"
+        with self.assertRaises(ValueError): manual.validate_stage(stages[0],caps,targets,0)
+
     def test_capabilities_only_native_options_and_current_map_areas(self):
         self.assertTrue(self.caps["supported"])
         self.assertEqual([t["id"] for t in self.caps["room_targets"]], ["kitchen", "office"])
@@ -837,27 +852,15 @@ class ManagerTraceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.calls, [])
         self.assertEqual(self.manager.store.saved, [])
 
-    async def test_combined_max_plus_and_water_are_sent_in_one_native_command(self):
-        status = self.coordinator.properties_api.status
+    async def test_invalid_mixed_max_plus_never_sends_settings_or_changes_plan(self):
+        status=self.coordinator.properties_api.status
         self.states["vacuum.robot"].attributes["fan_speed_list"].append("max_plus")
-        status.fan_speed_options.append(NS(value="max_plus", display_name="max_plus"))
-        original = self.hass.services.async_call
-        async def coupled_settings(domain, service, data, **kwargs):
-            await original(domain, service, data, **kwargs)
-            # Reproduce firmware side effects of the old individual writes.
-            if service == "set_fan_speed" and data["fan_speed"] == "max_plus":
-                status.water_mode_name = "off"
-                status.current_cleaning_mode_name = "vacuum"
-            elif service == "select_option" and data["entity_id"] == "select.renamed_water":
-                status.fan_speed_name = "balanced"
-                self.states["vacuum.robot"].attributes["fan_speed"] = "balanced"
-        self.hass.services.async_call = coupled_settings
-        await self.start(setup={"mode":"vacuum_mop", "suction":"max_plus", "water":"high", "route":"standard"})
-        self.assertEqual(self.calls[-1][2]["params"], [{"fan_power":108,"water_box_mode":203,"mop_mode":300}])
-        self.assertEqual(status.fan_speed_name, "max_plus")
-        self.assertEqual(status.water_mode_name, "high")
-        await self.settle()
-        self.assertEqual(self.calls[-1][1], "clean_area")
+        status.fan_speed_options.append(NS(value="max_plus",display_name="max_plus"))
+        before=self.manager.queue.dump()
+        with self.assertRaisesRegex(ServiceError,r"Max\+ suction is available only"):
+            await self.start(setup={"mode":"vacuum_mop","suction":"max_plus","water":"high","route":"standard"})
+        self.assertEqual(self.calls,[])
+        self.assertEqual(self.manager.queue.dump(),before)
 
     async def test_native_rejection_of_combined_settings_never_starts_or_downgrades(self):
         original = self.hass.services.async_call

@@ -271,7 +271,8 @@ def capabilities(vacuum_entry, coordinator, entries, states, area_registry) -> t
     unavailable = unavailable_controls(entries, vacuum_entry, coordinator, states)
     result = {"supported": supported, "unavailable_controls": unavailable,
               "modes": [{"value": v, "label": LABELS[v]} for v in offered],
-              "suction": suction, "water": water, "routes": routes, "routes_by_mode": routes_by_mode,
+              "suction": suction, "suction_by_mode": {mode: suction_options({"suction": suction}, mode) for mode in LABELS},
+              "water": water, "routes": routes, "routes_by_mode": routes_by_mode,
               "repeats": [1, 2], "area_cleaning": area_cleaning, "room_targets": [{k: t[k] for k in ("id", "name", "icon") if k in t} for t in targets.values()], "defaults": defaults}
     report = room_report(vacuum_entry, coordinator, area_registry)
     result["robot_maps"] = report["maps"]
@@ -281,6 +282,13 @@ def capabilities(vacuum_entry, coordinator, entries, states, area_registry) -> t
     if not supported:
         result["error"] = "Manual cleaning requires an available native Roborock robot, supported cleaning-mode controls, and a known current map."
     return result, selected, targets
+
+
+def suction_options(caps: dict, mode: str) -> list[str]:
+    """Max+ is a vacuum-only choice; never use it in a mixed-mode plan."""
+    if mode == "mop":
+        return []
+    return [v for v in caps.get("suction", []) if mode == "vacuum" or v != "max_plus"]
 
 
 def build_plan(rooms: list[str], setup: dict, caps: dict, targets: dict, map_id: int) -> tuple[dict, list[dict]]:
@@ -304,7 +312,7 @@ def build_plan(rooms: list[str], setup: dict, caps: dict, targets: dict, map_id:
         raise ValueError("Choose one or two cleaning runs per area.")
     normalized = {"mode": mode, "repeat": repeat}
     for key, relevant in [("suction", mode != "mop"), ("water", mode != "vacuum"), ("route", mode != "vacuum")]:
-        values = caps["routes_by_mode"][mode] if key == "route" else caps[key]
+        values = caps["routes_by_mode"][mode] if key == "route" else suction_options(caps, mode) if key == "suction" else caps[key]
         if not relevant:
             if key in setup:
                 raise ValueError(f"{key.title()} is not a setting for the selected cleaning mode.")
@@ -317,6 +325,8 @@ def build_plan(rooms: list[str], setup: dict, caps: dict, targets: dict, map_id:
         if key not in setup and value not in values:
             value = "standard" if key == "route" and "standard" in values else values[0]
         if value not in values:
+            if key == "suction" and value == "max_plus":
+                raise ValueError("Max+ suction is available only in Vacuum mode. Choose Quiet, Balanced, Turbo or Max for this mode.")
             raise ValueError(f"Choose a supported {key} option for this cleaning mode.")
         normalized[key] = value
     phases = ["vacuum", "mop"] if mode == "vacuum_then_mop" else [mode]
@@ -408,6 +418,6 @@ def validate_stage(stage: dict, caps: dict, targets: dict, map_id: int | None) -
     if mode not in {m["value"] for m in caps["modes"]}:
         raise ValueError("The planned cleaning mode is no longer available.")
     for key, value in stage["settings"].items():
-        options = [MODES[mode]] if key == "mode" else caps["routes_by_mode"][mode] if key == "route" else caps[key]
+        options = [MODES[mode]] if key == "mode" else caps["routes_by_mode"][mode] if key == "route" else suction_options(caps, mode) if key == "suction" else caps[key]
         if value not in options:
             raise ValueError("A planned manual setting is no longer available.")

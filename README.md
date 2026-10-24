@@ -253,3 +253,16 @@ Shutdown releases each subscription once, respecting Home Assistant's automatic
 removal of one-shot stop listeners. Repeated cleanup remains safe and preserves
 the sequence checkpoint. The storage test suite also checks this against the real
 Home Assistant event bus.
+
+### Suction and water flow
+
+Suction uses the Roborock names **Quiet**, **Balanced**, **Turbo**, **Max** and
+**Max+**. Max+ is available only in **Vacuum** mode, not Vacuum & mop or Vacuum
+then mop; Mop has no suction setting. `get_capabilities` publishes
+`suction_by_mode`, and both plan validation and stage dispatch enforce the
+restriction. Previously saved unsupported combinations are not downgraded.
+
+Water flow supports the explicit native **Low**, **Medium** and **High** settings.
+The app's custom 1–30 slider and its descriptive levels are not controllable by
+this integration. A native `custom_water_flow` state alone does not expose that
+numeric value, so it is excluded from reproducible room plans.
