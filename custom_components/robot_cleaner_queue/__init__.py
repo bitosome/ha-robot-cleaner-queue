@@ -159,8 +159,10 @@ class Manager:
         self.unsubs.extend([
             async_track_time_interval(self.hass, self.tick, timedelta(seconds=5)),
             self.hass.bus.async_listen(EVENT_CALL_SERVICE, self.external_command),
-            self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, self.shutdown),
         ])
+        # HA removes a one-shot listener before invoking it. Its unsubscribe must
+        # not be called again by shutdown's persistent-listener cleanup.
+        self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, self.shutdown)
 
     def control_state(self, controls: dict) -> str:
         """Whether the frozen native controls are intact, changed, or merely unavailable.
@@ -1191,10 +1193,11 @@ class Manager:
     async def shutdown(self, _event) -> None:
         self.closing = True
         async with self.lock:
-            for unsub in self.unsubs:
-                unsub()
+            while self.unsubs:
+                self.unsubs.pop()()
             if self.coordinator_unsub:
-                self.coordinator_unsub()
+                unsub, self.coordinator_unsub = self.coordinator_unsub, None
+                unsub()
             # Preserve execution intent and the last durable native checkpoint.
             # Startup reconciles it without repeating a physical command.
             await self.publish()

@@ -246,3 +246,10 @@ empty queue; restore its backup and restart the integration if this occurs.
 Run `python3 -B test/backend_storage_test.py` in the real Home Assistant test
 environment alongside package validation. This exercises actual atomic writes and
 write failures, with all robot commands mocked.
+
+### Shutdown cleanup (v0.16.3)
+
+Shutdown releases each subscription once, respecting Home Assistant's automatic
+removal of one-shot stop listeners. Repeated cleanup remains safe and preserves
+the sequence checkpoint. The storage test suite also checks this against the real
+Home Assistant event bus.

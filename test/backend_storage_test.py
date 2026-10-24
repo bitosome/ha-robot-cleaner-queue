@@ -4,11 +4,13 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+import sys
 import tempfile
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.storage import Store as NativeStore
@@ -18,6 +20,8 @@ import backend_manual_test as manual
 from backend_queue_test import load
 
 DurableStore = load("storage").DurableStore
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from custom_components.robot_cleaner_queue import Manager
 
 
 class StorageTests(unittest.IsolatedAsyncioTestCase):
@@ -29,6 +33,24 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.hass.async_stop()
         self.temp.cleanup()
+
+    async def test_native_stop_listener_cleanup_is_once_only_and_checkpoints_queue(self):
+        manager = Manager(self.hass)
+        await manager.setup()
+        coordinator_unsub = Mock()
+        manager.coordinator_unsub = coordinator_unsub
+        manager.queue.run_id = "retained-run"
+        with self.assertNoLogs("homeassistant.core", level="ERROR"):
+            # Native listen_once removes itself before invoking the callback.
+            self.hass.bus.async_fire(EVENT_HOMEASSISTANT_STOP)
+            await self.hass.async_block_till_done()
+            # Cleanup is also safe when called again after the stop event.
+            await manager.shutdown(None)
+        self.assertTrue(manager.closing)
+        self.assertEqual(manager.unsubs, [])
+        self.assertIsNone(manager.coordinator_unsub)
+        coordinator_unsub.assert_called_once_with()
+        self.assertEqual((await manager.store.async_load())["run_id"], "retained-run")
 
     async def test_existing_native_store_loads_without_migration_and_writes_private_atomic_json(self):
         original = {"run_id": "saved-run", "rooms": ["0_1", "0_2"]}
