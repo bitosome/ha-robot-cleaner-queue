@@ -2,7 +2,7 @@
 
 Cleaning plans address the **robot's own rooms** — the rooms named in the Roborock app and read from the robot's current map — and each room carries its own mode and settings. Roborock app routines are not used and are never pressed: a routine cannot be introspected, cannot express per-room settings, and drifts silently when it is edited in the app.
 
-For each room the companion writes the chosen mode, suction, water and mop route through the native select entities, confirms the readback, and then starts that room's own segments. It never edits anything in the Roborock app.
+For each room the companion sets the native cleaning mode, then sends the chosen suction, water and mop route together through the native Roborock motor-setting command, confirms the readback, and then starts that room's own segments. It never edits anything in the Roborock app.
 
 The companion discovers the modes and values actually exposed by the selected native Roborock V1 robot. Supported choices can include **Vacuum**, **Vacuum & mop**, **Mop**, and **Vacuum then mop**, with suction, water flow, route, and one or two cleaning runs. Unsupported or unavailable options are omitted. SmartPlan, custom room programs and app-only numeric water controls are not imitated.
 
@@ -62,7 +62,7 @@ The optional script wrapper accepts the same `rooms` and `setup` data; direct se
 
 ## Execution and compatibility
 
-The native high-level mode resets its detailed motor settings. Each stage therefore sets the native mode first, then suction, water and route in that order. The queue stays `preparing` until a successful native coordinator update after configuration began confirms all requested values. Setting-service success alone never starts cleaning. A busy robot, configuration failure, unavailable telemetry or a ten-minute settings confirmation timeout leaves the queue requiring attention.
+The native high-level mode resets its detailed motor settings. Each stage therefore sets the native mode first, then sends suction, water and route together with `vacuum.send_command` / `set_clean_motor_mode`. Numeric values come exclusively from the native integration’s current option mappings; missing mappings stop setup rather than guessing. Separate suction and water writes can reset each other, so they must not be used to construct a room configuration. The queue stays `preparing` until a successful native coordinator update after configuration began confirms all requested values. Setting-service success alone never starts cleaning. The queue sensor exposes `requested_settings` and `robot_settings` so the card can explain mismatches; timeout errors retain the requested and reported values. A busy robot, configuration failure, unavailable telemetry or a ten-minute settings confirmation timeout leaves the queue requiring attention.
 
 Before every later stage, the companion checks capabilities, selected map, original area-to-room mapping, native setting entity identities, and the initiating user's current control permissions. It persists each transition before issuing commands. External Home Assistant vacuum, routine, setting and map controls interrupt the queue, and so does a job the Roborock app starts on its own. App changes cannot always be attributed to their caller; the completion-record and map/readback checks still apply. Restart never resumes an interrupted plan automatically. Settings are left at the most recently applied values; the companion does not silently restore old settings after completion or cancellation.
 

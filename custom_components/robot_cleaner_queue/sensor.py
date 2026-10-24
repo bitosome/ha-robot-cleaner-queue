@@ -54,6 +54,7 @@ class QueueSensor(SensorEntity):
             "completed": queue.completed,
             "error": queue.error,
             "pending_command": queue.pending_command,
+            "requested_settings": dict(queue.stage.get("settings", {})) if queue.stage else {},
             "run_id": queue.run_id,
             "waiting_for_dock": queue.next_pending,
             "command_barrier_until": queue.not_before or None,

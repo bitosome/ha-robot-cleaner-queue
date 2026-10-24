@@ -745,8 +745,10 @@ class Queue:
                 self.decision = "waiting for manual settings readback: %s (observed settings %s)" % (
                     ", ".join("%s=%s" % (k, self.stage["settings"][k]) for k in missing), snapshot.settings)
                 if now - self.command_at >= CONFIGURE_SECONDS:
-                    self.attention("The robot did not confirm the manual settings within %d minutes. No cleaning was started."
-                                   % (CONFIGURE_SECONDS // 60))
+                    self.attention("The robot did not confirm the requested settings: %s. No cleaning was started." %
+                                   "; ".join("%s: requested %s, reported %s" %
+                                             (k, self.stage["settings"][k], snapshot.settings.get(k, "unavailable"))
+                                             for k in missing))
             return None
         if self.pending_command:
             # Confirming against telemetry older than the command would let a state the

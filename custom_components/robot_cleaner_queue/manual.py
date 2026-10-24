@@ -21,6 +21,32 @@ def cached_settings(coordinator: Any) -> dict[str, str]:
     return {key: value for key, prop in properties.items() if isinstance(value := getattr(status, prop, None), str)}
 
 
+def motor_settings(coordinator: Any, settings: dict) -> list[dict[str, int]]:
+    """Encode explicit settings together, using the native integration's mappings.
+
+    Separate suction/water writes can change the effective cleaning mode and
+    reset each other. The native cleaning-mode select uses set_clean_motor_mode;
+    use the same command with the user's values, never guessed numeric codes.
+    """
+    status = getattr(getattr(coordinator, "properties_api", None), "status", None)
+    fields = {"suction": ("fan_speed_mapping", "fan_power"),
+              "water": ("water_mode_mapping", "water_box_mode"),
+              "route": ("mop_route_mapping", "mop_mode")}
+    result = {}
+    for key, (prop, field) in fields.items():
+        if key not in settings:
+            continue
+        mapping = getattr(status, prop, None)
+        codes = [code for code, name in mapping.items()
+                 if name == settings[key] and isinstance(code, int) and not isinstance(code, bool)] if isinstance(mapping, dict) else []
+        if len(codes) != 1:
+            raise ValueError("The native integration cannot encode the requested %s setting." % key)
+        result[field] = codes[0]
+    if not result:
+        raise ValueError("No explicit motor settings were provided.")
+    return [result]
+
+
 def controls(entries, vacuum_entry, coordinator, states) -> dict[str, str]:
     """Resolve exact native select identities, including user-renamed entity IDs."""
     result = {}

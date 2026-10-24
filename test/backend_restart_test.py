@@ -354,7 +354,7 @@ class RestartLifecycleTests(unittest.IsolatedAsyncioTestCase):
             await self.reboot(delay=10)
             self.assertFalse(self.manager.continuation_state(self.manager.current_snapshot("vacuum.robot"))["restart_resume_ready"])
             await self.advance(1)
-            self.assertFalse(any(service == "send_command" for _, service, _ in self.calls))
+            self.assertFalse(any(service == "send_command" and data.get("command") != "set_clean_motor_mode" for _, service, data in self.calls))
             state = self.manager.continuation_state(self.manager.current_snapshot("vacuum.robot"))
             self.assertTrue(state["restart_resume_ready"])
             with self.assertRaises(manual.ServiceError):
@@ -389,7 +389,7 @@ class RestartLifecycleTests(unittest.IsolatedAsyncioTestCase):
             return await original(user)
         self.hass.auth.async_get_user = race
         await self.manager.control(self.call("resume_now", recovery_token=state["restart_resume_token"]))
-        self.assertFalse(any(service == "send_command" for _, service, _ in self.calls))
+        self.assertFalse(any(service == "send_command" and data.get("command") != "set_clean_motor_mode" for _, service, data in self.calls))
         self.assertEqual(self.manager.queue.phase, "attention")
 
     async def test_storage_failure_before_explicit_resume_never_sends_motion(self):
@@ -401,7 +401,7 @@ class RestartLifecycleTests(unittest.IsolatedAsyncioTestCase):
         async def fail(_): raise OSError("disk unavailable")
         self.manager.store.async_save = fail
         await self.manager.control(self.call("resume_now", recovery_token=state["restart_resume_token"]))
-        self.assertFalse(any(service == "send_command" for _, service, _ in self.calls))
+        self.assertFalse(any(service == "send_command" and data.get("command") != "set_clean_motor_mode" for _, service, data in self.calls))
 
     async def test_confirmed_user_stop_still_accepts_return_to_dock(self):
         status = await self.owned()

@@ -25,7 +25,7 @@ from .errors import command_failure_metadata
 from . import history, recovery, restart, editing
 from .permissions import async_require_control
 from .storage import DurableStore as Store
-from .manual import build_plan, build_room_plan, cached_settings, capabilities, current_map, robot_targets, validate_stage
+from .manual import build_plan, build_room_plan, cached_settings, motor_settings, capabilities, current_map, robot_targets, validate_stage
 
 DOMAIN = "robot_cleaner_queue"
 _LOGGER = logging.getLogger(__name__)
@@ -620,6 +620,7 @@ class Manager:
         self.robot_state = {"dock_status": current.status, "dock_drying": current.dock_drying,
                             "robot_observed_at": current.observed_at, "robot_activity": current.vacuum,
                             "robot_connected": current.connected, "robot_job": current.job,
+                            "robot_settings": dict(current.settings),
                             "robot_battery": current.battery, **self.recovery_state(current),
                             **self.continuation_state(current)}
         return current
@@ -957,8 +958,10 @@ class Manager:
                     raise ValueError("The robot is no longer ready to start a manual job.")
                 if kind == "configure":
                     # High-level mode resets lower-level settings: always set it first.
-                    for key in ("mode", "suction", "water", "route"):
-                        if key not in self.queue.stage["settings"] or key in self.configured_keys:
+                    # Validate every code before writing even the high-level mode.
+                    motor_settings(self.resolve(self.queue.vacuum)[2], self.queue.stage["settings"])
+                    for key in ("mode", "settings"):
+                        if (key == "mode" and key not in self.queue.stage["settings"]) or key in self.configured_keys:
                             continue
                         await authorize()
                         if not self.effect_valid(effect):
@@ -986,7 +989,8 @@ class Manager:
                             return
                         if latest_controls != self.queue.control_entities:
                             raise ValueError("Manual control entities changed during setup.")
-                        value = self.queue.stage["settings"][key]
+                        value = (self.queue.stage["settings"][key] if key == "mode" else
+                                 motor_settings(self.resolve(self.queue.vacuum)[2], self.queue.stage["settings"]))
                         self.queue.settings_sent_at = time.time()
                         await self.publish()  # Retain the latest possible write time across restart.
                         if not self.effect_valid(effect):
@@ -1000,8 +1004,8 @@ class Manager:
                             raise ValueError("The robot became busy before applying manual settings.")
                         attempted = True
                         setting = key
-                        if key == "suction":
-                            await self.hass.services.async_call("vacuum", "set_fan_speed", {"entity_id": self.queue.vacuum, "fan_speed": value}, blocking=True, context=context)
+                        if key == "settings":
+                            await self.hass.services.async_call("vacuum", "send_command", {"entity_id": self.queue.vacuum, "command": "set_clean_motor_mode", "params": value}, blocking=True, context=context)
                         else:
                             await self.hass.services.async_call("select", "select_option", {"entity_id": controls[key], "option": value}, blocking=True, context=context)
                         self.configured_keys.add(key)

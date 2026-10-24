@@ -37,6 +37,9 @@ def fixture():
                water_mode_options=list(map(enum, option_sets["water"])), mop_route_options=list(map(enum, option_sets["route"])),
                current_cleaning_mode_name="vac_and_mop", fan_speed_name="max", water_mode_name="custom_water_flow", mop_route_name="standard",
                state_name="charging", in_cleaning=0, error_code=0, dock_error_status=0)
+    trait.fan_speed_mapping = {101: "quiet", 102: "balanced", 104: "max", 108: "max_plus", 105: "off"}
+    trait.water_mode_mapping = {200: "off", 201: "low", 202: "medium", 203: "high"}
+    trait.mop_route_mapping = {300: "standard", 301: "deep", 303: "deep_plus", 304: "fast"}
     segments = []
     async def clean_segments(requested):
         segments.append(list(requested))
@@ -56,6 +59,13 @@ class ManualPlanTests(unittest.TestCase):
 
     def build(self, mode="vacuum_then_mop", rooms=None, **kwargs):
         return manual.build_plan(["kitchen", "office"] if rooms is None else rooms, {"mode": mode, **kwargs}, self.caps, self.targets, 0)
+
+    def test_motor_encoding_requires_exact_native_mapping(self):
+        settings = {"mode":"vac_and_mop", "suction":"max", "water":"high"}
+        self.assertEqual(manual.motor_settings(self.coordinator, settings), [{"fan_power":104,"water_box_mode":203}])
+        self.coordinator.properties_api.status.fan_speed_mapping = {}
+        with self.assertRaisesRegex(ValueError, "cannot encode"):
+            manual.motor_settings(self.coordinator, settings)
 
     def test_capabilities_only_native_options_and_current_map_areas(self):
         self.assertTrue(self.caps["supported"])
@@ -372,7 +382,7 @@ def manager_class():
                POLICY_CONTROL="control", async_require_control=permissions.async_require_control, _LOGGER=logging.getLogger("test"),
                snapshot=adapter.snapshot, routine_matches=adapter.routine_matches, is_competing_command=adapter.is_competing_command,
                build_plan=manual.build_plan, build_room_plan=manual.build_room_plan, robot_targets=manual.robot_targets,
-               cached_settings=manual.cached_settings, capabilities=manual.capabilities,
+               cached_settings=manual.cached_settings, motor_settings=manual.motor_settings, capabilities=manual.capabilities,
                current_map=manual.current_map, validate_stage=manual.validate_stage)
     exec(compile(ast.Module(body=[definition], type_ignores=[]), str(source), "exec", flags=__future__.annotations.compiler_flag), env)
     return env["Manager"]
@@ -405,6 +415,18 @@ class ManagerTraceTests(unittest.IsolatedAsyncioTestCase):
                     status.mop_route_name = "standard"
                 else:
                     setattr(status, {"water": "water_mode_name", "route": "mop_route_name"}[key], data["option"])
+            elif service == "send_command":
+                self.assertEqual(data["command"], "set_clean_motor_mode")
+                payload = data["params"][0]
+                for field, prop, mapping in [("fan_power", "fan_speed_name", status.fan_speed_mapping),
+                                             ("water_box_mode", "water_mode_name", status.water_mode_mapping),
+                                             ("mop_mode", "mop_route_name", status.mop_route_mapping)]:
+                    if field in payload:
+                        setattr(status, prop, mapping[payload[field]])
+                        if field == "fan_power":
+                            self.states["vacuum.robot"].attributes["fan_speed"] = mapping[payload[field]]
+                        else:
+                            self.states["select.renamed_" + ("water" if field == "water_box_mode" else "route")].state = mapping[payload[field]]
             elif service == "set_fan_speed":
                 status.fan_speed_name = data["fan_speed"]
                 self.states["vacuum.robot"].attributes["fan_speed"] = data["fan_speed"]
@@ -480,7 +502,7 @@ class ManagerTraceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.calls), 1)
         self.states["select.renamed_water"].state = "medium"
         await self.manager.tick()
-        self.assertEqual(len(self.calls), 4)
+        self.assertEqual(len(self.calls), 2)
         self.assertEqual(sum(data.get("entity_id") == "select.renamed_mode" for _, _, data in self.calls), 1)
         await self.settle()
         self.assertEqual(self.calls[-1][1], "clean_area")
@@ -580,7 +602,7 @@ class ManagerTraceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.manager.preferences_store.saved, [])
 
     async def test_command_failure_never_leaks_payload_into_diagnostics(self):
-        self.fail_service = "set_fan_speed"
+        self.fail_service = "send_command"
         await self.start()
         result = await self.manager.get_diagnostics(NS(data={"vacuum":"vacuum.robot"},context=NS(user_id=None,id="diag")))
         self.assertNotIn("Sensitive", str(result))
@@ -809,9 +831,50 @@ class ManagerTraceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.calls, [])
         self.assertEqual(self.manager.store.saved, [])
 
+    async def test_combined_max_plus_and_water_are_sent_in_one_native_command(self):
+        status = self.coordinator.properties_api.status
+        self.states["vacuum.robot"].attributes["fan_speed_list"].append("max_plus")
+        status.fan_speed_options.append(NS(value="max_plus", display_name="max_plus"))
+        original = self.hass.services.async_call
+        async def coupled_settings(domain, service, data, **kwargs):
+            await original(domain, service, data, **kwargs)
+            # Reproduce firmware side effects of the old individual writes.
+            if service == "set_fan_speed" and data["fan_speed"] == "max_plus":
+                status.water_mode_name = "off"
+                status.current_cleaning_mode_name = "vacuum"
+            elif service == "select_option" and data["entity_id"] == "select.renamed_water":
+                status.fan_speed_name = "balanced"
+                self.states["vacuum.robot"].attributes["fan_speed"] = "balanced"
+        self.hass.services.async_call = coupled_settings
+        await self.start(setup={"mode":"vacuum_mop", "suction":"max_plus", "water":"high", "route":"standard"})
+        self.assertEqual(self.calls[-1][2]["params"], [{"fan_power":108,"water_box_mode":203,"mop_mode":300}])
+        self.assertEqual(status.fan_speed_name, "max_plus")
+        self.assertEqual(status.water_mode_name, "high")
+        await self.settle()
+        self.assertEqual(self.calls[-1][1], "clean_area")
+
+    async def test_native_rejection_of_combined_settings_never_starts_or_downgrades(self):
+        original = self.hass.services.async_call
+        async def reject(domain, service, data, **kwargs):
+            await original(domain, service, data, **kwargs)
+            if service == "send_command":
+                self.coordinator.properties_api.status.fan_speed_name = "balanced"
+                self.states["vacuum.robot"].attributes["fan_speed"] = "balanced"
+        self.hass.services.async_call = reject
+        await self.start()
+        await self.advance(2)
+        self.assertEqual(self.manager.queue.phase, "preparing")
+        self.clock += 601
+        self.coordinator._last_update_success_time = datetime.fromtimestamp(self.clock, timezone.utc)
+        await self.manager.tick()
+        self.assertEqual(self.manager.queue.phase, "attention")
+        self.assertIn("suction: requested max, reported balanced", self.manager.queue.error)
+        self.assertEqual(len(self.calls), 2, "Never retry settings or start after rejected readback")
+        self.assertEqual(self.manager.queue.stage["settings"]["suction"], "max")
+
     async def test_settings_order_readback_and_native_area_payload(self):
         await self.start()
-        self.assertEqual([(d,s) for d,s,_ in self.calls], [("select", "select_option"), ("vacuum", "set_fan_speed"), ("select", "select_option"), ("select", "select_option")])
+        self.assertEqual([(d,s) for d,s,_ in self.calls], [("select", "select_option"), ("vacuum", "send_command")])
         self.assertEqual(self.calls[0][2]["option"], "vac_and_mop")
         self.assertEqual(self.manager.queue.phase, "preparing")
         await self.settle()
@@ -827,7 +890,7 @@ class ManagerTraceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.manager.store.saved[-1]["owner_user_id"], "user")
 
     async def test_service_failure_external_interrupt_or_revocation_stops_mid_configuration(self):
-        for attr, value in [("fail_service", "set_fan_speed"), ("interrupt_after", 1), ("revoke_after", 1)]:
+        for attr, value in [("fail_service", "send_command"), ("interrupt_after", 1), ("revoke_after", 1)]:
             await self.asyncSetUp()
             setattr(self, attr, value)
             await self.start()
@@ -954,11 +1017,11 @@ class ManagerTraceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.calls, [])
 
     async def test_setting_error_keeps_safe_setting_and_cause_metadata(self):
-        self.fail_service = "set_fan_speed"
+        self.fail_service = "send_command"
         await self.start()
         queue = self.manager.queue
         self.assertEqual(queue.command_failure["operation"], "configure")
-        self.assertEqual(queue.command_failure["setting"], "suction")
+        self.assertEqual(queue.command_failure["setting"], "settings")
         self.assertFalse(queue.start_uncertain)
         self.assertEqual(queue.phase, "attention")
         self.assertEqual(Queue.restore(queue.dump()).command_failure, queue.command_failure)
