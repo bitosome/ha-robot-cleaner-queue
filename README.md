@@ -231,7 +231,7 @@ An explicitly empty selection is stored and makes the wall-switch launch refuse 
 Each robot with a saved plan exposes a **[Robot name] cleaning plan** button. Press it through `button.press` from a wall switch, automation, or Companion app: idle starts the shared card plan; an active cleaning job is cancelled and sent to dock through the existing queue controller. Empty plans and unsafe commands are rejected by that controller. No separate script is needed. Entities are discovered after storage loads and when the first plan is saved. Button calls preserve the caller context and vacuum permissions.
 
 
-### Durable storage acknowledgement (v0.16.1)
+### Durable storage acknowledgement (v0.16.2)
 
 Queue reservations, saved plans and room preferences keep their existing `.storage`
 keys and version-1 envelope; no migration or replacement of household settings is

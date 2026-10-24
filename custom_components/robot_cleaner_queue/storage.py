@@ -30,7 +30,7 @@ class DurableStore:
     async def async_load(self) -> dict | None:
         async with self._lock:
             try:
-                envelope = await self.hass.async_add_executor_job(load_json, self.path, None)
+                envelope = await self.hass.async_add_executor_job(self._load)
                 if envelope is not None and (
                     not isinstance(envelope, dict)
                     or type(envelope.get("version")) is not int
@@ -45,6 +45,12 @@ class DurableStore:
                 raise
             self._read_failed = False
             return envelope["data"] if envelope is not None else None
+
+    def _load(self):
+        envelope = load_json(self.path, None)
+        if envelope is None and self.path.exists():
+            raise HomeAssistantError("Invalid robot queue storage. Restore a backup; the file has not been changed.")
+        return envelope
 
     def _write(self, envelope: dict) -> None:
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)

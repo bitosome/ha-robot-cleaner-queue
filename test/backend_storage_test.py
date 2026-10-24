@@ -56,7 +56,7 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unreadable_or_incompatible_storage_cannot_be_replaced_by_empty_queue(self):
         self.storage.path.parent.mkdir()
-        for invalid in ["broken JSON", json.dumps({"version": 2, "key": self.storage.key, "data": {}}),
+        for invalid in ["null", "broken JSON", json.dumps({"version": 2, "key": self.storage.key, "data": {}}),
                         json.dumps({"version": 1, "key": "another-store", "data": {}})]:
             self.storage.path.write_text(invalid)
             with self.assertRaises(HomeAssistantError):
