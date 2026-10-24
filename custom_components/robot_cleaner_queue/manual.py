@@ -32,13 +32,23 @@ def motor_settings(coordinator: Any, settings: dict) -> list[dict[str, int]]:
     fields = {"suction": ("fan_speed_mapping", "fan_power"),
               "water": ("water_mode_mapping", "water_box_mode"),
               "route": ("mop_route_mapping", "mop_mode")}
+    # The combined command expects a complete mode tuple. Inactive motors are
+    # explicit too: a vacuum pass must keep water off, a mop pass suction off.
+    values = dict(settings)
+    mode = values.get("mode")
+    if mode == "vacuum":
+        values["water"] = "off"
+        if getattr(status, "mop_route_mapping", None):
+            values["route"] = "standard"
+    elif mode == "mop":
+        values["suction"] = "off"
     result = {}
     for key, (prop, field) in fields.items():
-        if key not in settings:
+        if key not in values:
             continue
         mapping = getattr(status, prop, None)
         codes = [code for code, name in mapping.items()
-                 if name == settings[key] and isinstance(code, int) and not isinstance(code, bool)] if isinstance(mapping, dict) else []
+                 if name == values[key] and isinstance(code, int) and not isinstance(code, bool)] if isinstance(mapping, dict) else []
         if len(codes) != 1:
             raise ValueError("The native integration cannot encode the requested %s setting." % key)
         result[field] = codes[0]

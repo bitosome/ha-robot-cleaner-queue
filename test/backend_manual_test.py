@@ -67,6 +67,12 @@ class ManualPlanTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cannot encode"):
             manual.motor_settings(self.coordinator, settings)
 
+    def test_combined_payload_keeps_inactive_motors_off(self):
+        self.assertEqual(manual.motor_settings(self.coordinator, {"mode":"vacuum", "suction":"max_plus"}),
+                         [{"fan_power":108, "water_box_mode":200, "mop_mode":300}])
+        self.assertEqual(manual.motor_settings(self.coordinator, {"mode":"mop", "water":"high", "route":"deep"}),
+                         [{"fan_power":105, "water_box_mode":203, "mop_mode":301}])
+
     def test_capabilities_only_native_options_and_current_map_areas(self):
         self.assertTrue(self.caps["supported"])
         self.assertEqual([t["id"] for t in self.caps["room_targets"]], ["kitchen", "office"])
@@ -1015,6 +1021,24 @@ class ManagerTraceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(queue.phase, "idle")
         self.assertEqual(self.manager.robot_state["dock_status"], "washing_the_mop")
         self.assertEqual(self.calls, [])
+
+    async def test_parameter_rejection_reports_requested_settings_and_preserves_plan(self):
+        original = self.hass.services.async_call
+        async def reject(domain, service, data, **kwargs):
+            if service == "send_command":
+                error = type("RoborockException", (Exception,), {"__module__":"roborock.exceptions"})
+                raise error({"code":-10005, "message":"SECRET raw payload"})
+            await original(domain, service, data, **kwargs)
+        self.hass.services.async_call = reject
+        await self.start()
+        queue = self.manager.queue
+        self.assertEqual(queue.phase, "attention")
+        self.assertEqual(queue.command_failure["category"], "rejected")
+        self.assertIn("parameter error -10005", queue.error)
+        self.assertIn("suction=max", queue.error)
+        self.assertNotIn("SECRET", queue.error)
+        self.assertEqual(queue.stage["settings"]["suction"], "max")
+        self.assertFalse(any(service in {"start", "clean_area"} for _, service, _ in self.calls))
 
     async def test_setting_error_keeps_safe_setting_and_cause_metadata(self):
         self.fail_service = "send_command"

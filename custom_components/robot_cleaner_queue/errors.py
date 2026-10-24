@@ -122,6 +122,8 @@ def command_failure_metadata(error: BaseException, operation: str) -> dict:
         # A malicious or very large group cannot grow the work list unboundedly.
         pending = pending[:MAX_EXCEPTION_NODES]
 
+    if -10005 in result["codes"]:
+        categories.add("rejected")  # Native Roborock parameter validation error.
     result["category"] = next((category for category in ("timeout", "connection", "rejected")
                                if category in categories), "unknown")
     return result

@@ -1078,10 +1078,15 @@ class Manager:
                     self.queue.confirmed()
                 if kind == "manual" and not attempted:
                     self.queue.confirmed()
-                self.queue.attention("The %s command %s (%s). Check the robot; no automatic retry was sent." % (
-                    "room start" if kind == "manual" else "settings" if kind == "configure" else "robot",
-                    "failed or could not be confirmed" if attempted else "was not sent",
-                    failure["category"]))
+                if kind == "configure" and -10005 in failure["codes"]:
+                    requested = ", ".join("%s=%s" % item for item in self.queue.stage.get("settings", {}).items())
+                    self.queue.attention("The robot rejected the requested settings (parameter error -10005): "
+                                         + requested + ". No cleaning was started. Your sequence is kept.")
+                else:
+                    self.queue.attention("The %s command %s (%s). Check the robot; no automatic retry was sent." % (
+                        "room start" if kind == "manual" else "settings" if kind == "configure" else "robot",
+                        "failed or could not be confirmed" if attempted else "was not sent",
+                        failure["category"]))
             await self.publish()
         finally:
             if kind == "manual" and not attempted:
