@@ -49,3 +49,4 @@ jobs:
           python-version: '3.14'
       - run: pip install -r test/requirements-homeassistant.txt
       - run: python3 -B test/backend_package_test.py
+      - run: python3 -B test/backend_storage_test.py

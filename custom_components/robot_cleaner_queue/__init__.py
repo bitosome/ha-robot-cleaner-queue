@@ -17,7 +17,6 @@ from homeassistant.exceptions import ServiceValidationError, Unauthorized
 from homeassistant.helpers import area_registry as ar, config_validation as cv, entity_registry as er
 from homeassistant.helpers.discovery import async_load_platform
 from homeassistant.helpers.event import async_track_time_interval
-from homeassistant.helpers.storage import Store
 
 from .adapter import is_competing_command, routine_matches, snapshot
 from .engine import ACTIVE, ACK_SECONDS, Queue, Snapshot
@@ -25,6 +24,7 @@ from .device import CONTROLS, DOCK, device_entities, device_command
 from .errors import command_failure_metadata
 from . import history, recovery, restart, editing
 from .permissions import async_require_control
+from .storage import DurableStore as Store
 from .manual import build_plan, build_room_plan, cached_settings, capabilities, current_map, robot_targets, validate_stage
 
 DOMAIN = "robot_cleaner_queue"
@@ -349,6 +349,24 @@ class Manager:
             raise ServiceValidationError("Room settings could not be read. Restore preference storage before saving.")
         return self.preferences.get(vacuum, {"revision": 0, "defaults": {}, "rooms": {}})
 
+    async def persist_shared(self, store, attribute, updated):
+        """Finish disk and memory publication together before releasing our lock."""
+        async def commit():
+            await store.async_save(updated)
+            setattr(self, attribute, updated)
+            for listener in list(self.listeners):
+                listener()
+        task = asyncio.create_task(commit())
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+        task.result()
+        if cancelled:
+            raise asyncio.CancelledError
+
     async def save_preferences(self, call):
         """Shared durable preferences, separate from the frozen wall-switch plan."""
         async with self.lock:
@@ -376,10 +394,7 @@ class Manager:
                     rooms[key], _ = build_plan([], setup, caps, {}, map_id)
                 profile = {"revision": current["revision"] + 1, "defaults": defaults, "rooms": rooms}
                 updated = {**self.preferences, vacuum: profile}
-                await self.preferences_store.async_save(updated)
-                self.preferences = updated
-                for listener in list(self.listeners):
-                    listener()
+                await self.persist_shared(self.preferences_store, "preferences", updated)
             except PermissionError as err:
                 raise Unauthorized(context=call.context, permission=POLICY_CONTROL) from err
             except ValueError as err:
@@ -471,10 +486,7 @@ class Manager:
                     setup, _ = build_plan(requests, call.data.get("setup", {}), caps, targets, map_id)
                     plan.update(source="manual", rooms=requests, setup=setup, map_id=map_id)
                 updated = {**self.saved_presets, vacuum: plan}
-                await self.preset_store.async_save(updated)
-                self.saved_presets = updated  # Report success only after durable storage.
-                for listener in list(self.listeners):
-                    listener()
+                await self.persist_shared(self.preset_store, "saved_presets", updated)
             except PermissionError as err:
                 raise Unauthorized(context=call.context, permission=POLICY_CONTROL) from err
             except ValueError as err:

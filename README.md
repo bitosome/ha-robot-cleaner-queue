@@ -221,7 +221,7 @@ History keeps completed pass evidence and a bounded `edits` journal with removed
 
 ### Shared card plan
 
-Card v0.16.0 and companion v0.15.0 automatically persist the idle card selection and full tile order (including disabled rooms). `get_capabilities.shared_plan_version: 1` advertises support. `save_preset` accepts `room_order` plus an expected `revision`, validates current-map IDs and selected-room order, and saves through the existing Home Assistant Store before notifying all dashboards. Plans are per vacuum, shared by authorized users, and survive restarts and updates. Old plans load without migration writes; a new edit adds order metadata. Once a plan includes order metadata, older clients cannot overwrite it without that field.
+Card v0.16.0 and companion v0.15.0 automatically persist the idle card selection and full tile order (including disabled rooms). `get_capabilities.shared_plan_version: 1` advertises support. `save_preset` accepts `room_order` plus an expected `revision`, validates current-map IDs and selected-room order, and saves atomically to the existing Home Assistant storage file before notifying all dashboards. Plans are per vacuum, shared by authorized users, and survive restarts and updates. Old plans load without migration writes; a new edit adds order metadata. Once a plan includes order metadata, older clients cannot overwrite it without that field.
 
 An explicitly empty selection is stored and makes the wall-switch launch refuse cleaning; it never means whole-home cleaning. Updates to a live queue remain distinct from the saved next plan. No new storage key or executing queue changes are required.
 
@@ -229,3 +229,20 @@ An explicitly empty selection is stored and makes the wall-switch launch refuse 
 ### Shared-plan button
 
 Each robot with a saved plan exposes a **[Robot name] cleaning plan** button. Press it through `button.press` from a wall switch, automation, or Companion app: idle starts the shared card plan; an active cleaning job is cancelled and sent to dock through the existing queue controller. Empty plans and unsafe commands are rejected by that controller. No separate script is needed. Entities are discovered after storage loads and when the first plan is saved. Button calls preserve the caller context and vacuum permissions.
+
+
+### Durable storage acknowledgement (v0.16.1)
+
+Queue reservations, saved plans and room preferences keep their existing `.storage`
+keys and version-1 envelope; no migration or replacement of household settings is
+needed. Writes now use Home Assistant's atomic JSON helper directly so a disk error
+reaches the controller. A failed reservation stops the sequence for review before
+any robot command, and a failed plan save does not publish a new shared revision.
+Previously, the native `Store.async_save` could log a write failure and return as if
+it had succeeded. Cancelled saves finish their disk/memory commit before releasing
+the mutation lock. Unreadable storage is preserved rather than overwritten with an
+empty queue; restore its backup and restart the integration if this occurs.
+
+Run `python3 -B test/backend_storage_test.py` in the real Home Assistant test
+environment alongside package validation. This exercises actual atomic writes and
+write failures, with all robot commands mocked.
