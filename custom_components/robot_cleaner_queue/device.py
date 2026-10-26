@@ -29,7 +29,7 @@ TELEMETRY = {
 DOCK = {"dust_emptying", "mop_washing", "mop_drying"}
 
 
-def device_entities(vacuum_entry, coordinator, entries, states):
+def device_entities(vacuum_entry, coordinator, entries, states, *, include_unavailable=False):
     result = {}
     slug = coordinator.duid_slug
     for entry in entries:
@@ -37,7 +37,7 @@ def device_entities(vacuum_entry, coordinator, entries, states):
                 or getattr(entry, "disabled_by", None)):
             continue
         state = states.get(entry.entity_id)
-        if state is None or state.state in {"unavailable", "unknown"}:
+        if not include_unavailable and (state is None or state.state in {"unavailable", "unknown"}):
             continue
         for key, (prefix, domain) in {**CONTROLS, **MAINTENANCE, **TELEMETRY}.items():
             if entry.domain == domain and entry.unique_id == f"{prefix}_{slug}":

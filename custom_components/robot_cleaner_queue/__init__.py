@@ -22,7 +22,7 @@ from .adapter import is_competing_command, routine_matches, snapshot
 from .engine import ACTIVE, ACK_SECONDS, Queue, Snapshot
 from .device import CONTROLS, DOCK, device_entities, device_command
 from .errors import command_failure_metadata
-from . import history, recovery, restart, editing
+from . import history, recovery, restart, editing, dock
 from .permissions import async_require_control
 from .storage import DurableStore as Store
 from .manual import build_plan, build_room_plan, cached_settings, motor_settings, capabilities, current_map, robot_targets, validate_stage
@@ -42,9 +42,10 @@ ROOM_SCHEMA = vol.Schema({
 })
 PLAN_ROOMS = vol.All(cv.ensure_list, [vol.Any(str, ROOM_SCHEMA)])
 SERVICE_SCHEMA = vol.Schema({
-    vol.Required("command"): vol.In(["start_manual", "pause", "resume", "cancel", "return_to_dock", "stop", "toggle", "toggle_saved", "continue_sequence", "resume_now"]),
+    vol.Required("command"): vol.In(["start_manual", "pause", "resume", "cancel", "return_to_dock", "stop", "toggle", "toggle_saved", "continue_sequence", "resume_now", "resume_dock_cleanup"]),
     vol.Optional("vacuum", default=""): str,
     vol.Optional("run_id"): str,
+    vol.Optional("cleanup_revision"): vol.All(int, vol.Range(min=0)),
     vol.Optional("current_index"): vol.All(int, vol.Range(min=0)),
     vol.Optional("water_refilled", default=False): bool,
     vol.Optional("recovery_token"): str,
@@ -304,6 +305,7 @@ class Manager:
             caps, controls, _, _ = self.manual_capabilities(call.data["vacuum"])
             await async_require_control(self.hass.auth, call.context.user_id, list(controls.values()), POLICY_CONTROL)
             caps["control_version"] = 7
+            caps["dock_cleanup_version"] = dock.VERSION
             caps["execution_version"] = 5
             caps["current_map"] = current_map(self.resolve(call.data["vacuum"])[2])[0]
             caps["saved_preset"] = await self.read_saved_preset(call.data["vacuum"], call.context.user_id)
@@ -311,13 +313,14 @@ class Manager:
             caps["saved_plan_revision"] = (caps["saved_preset"] or {}).get("revision", 0)
             caps["preferences"] = self.preference_profile(call.data["vacuum"])
             caps["device_entities"] = {}
-            for key, entity_id in self.device_entities(call.data["vacuum"]).items():
+            for key, entity_id in self.device_entities(call.data["vacuum"], include_unavailable=True).items():
                 try:
                     await async_require_control(self.hass.auth, call.context.user_id, [entity_id],
                                                 "read" if key not in CONTROLS else POLICY_CONTROL)
                     caps["device_entities"][key] = entity_id
                 except PermissionError:
                     pass
+            caps["dock_controls"] = self.dock_controls(call.data["vacuum"], self.current_snapshot(call.data["vacuum"]), caps["device_entities"])
             return caps
         except PermissionError as err:
             raise Unauthorized(context=call.context, permission=POLICY_CONTROL) from err
@@ -494,20 +497,70 @@ class Manager:
             except ValueError as err:
                 raise ServiceValidationError(str(err)) from err
 
-    def device_entities(self, vacuum: str) -> dict:
+    def device_entities(self, vacuum: str, *, include_unavailable=False) -> dict:
         registry, entry, coordinator = self.resolve(vacuum)
-        return device_entities(entry, coordinator, registry.entities.values(), self.hass.states)
+        return device_entities(entry, coordinator, registry.entities.values(), self.hass.states,
+                               include_unavailable=include_unavailable)
 
-    def validate_device(self, vacuum, key, value):
-        current = self.current_snapshot(vacuum)
+    def dock_controls(self, vacuum, current, entities=None):
+        entities = entities if entities is not None else self.device_entities(vacuum, include_unavailable=True)
+        controls = {}
+        for key in sorted(DOCK):
+            entity_id = entities.get(key)
+            native = self.hass.states.get(entity_id) if entity_id else None
+            value = native.state if native is not None else "unavailable"
+            available = value in {"on", "off"} and current.connected
+            fresh = current.observed_at > 0 and 0 <= time.time() - current.observed_at <= 90
+            can_stop = available and fresh and value == "on" and (
+                not self.queue.pending_command or self.queue.pending_command == "dock_care")
+            reason = ""
+            try:
+                if not available:
+                    raise ValueError("Native dock control is unavailable.")
+                self.validate_device(vacuum, key, "on", current=current)
+                can_start = value == "off"
+            except ValueError as err:
+                can_start, reason = False, str(err)
+            reason_code = ""
+            if not can_start:
+                if not available:
+                    reason_code = "unavailable"
+                elif not fresh:
+                    reason_code = "stale"
+                elif key == "mop_washing" and current.dock_error == "water_empty":
+                    reason_code, reason = "water_empty", "Refill the clean-water tank before washing mops."
+                elif current.dock_error not in {"ok", "none", "water_empty"}:
+                    reason_code, reason = "dock_fault", "Resolve the dock fault before starting care."
+                elif dock.required(self.queue) and self.queue.dock_cleanup.get("armed"):
+                    reason_code = "dock_cleanup"
+                elif self.queue.phase in ACTIVE or self.queue.pending_command:
+                    reason_code = "busy"
+                elif current.vacuum != "docked":
+                    reason_code = "not_docked"
+            controls[key] = {"supported": bool(entity_id), "available": available,
+                "entity_id": entity_id, "state": value, "can_start": can_start,
+                "can_stop": can_stop, "reason": reason, "reason_code": reason_code}
+        return controls
+
+    def validate_device(self, vacuum, key, value, *, current=None):
+        current = current if current is not None else self.current_snapshot(vacuum)
         self.queue.validate_fresh_observation(current, time.time())
+        if key in DOCK and value == "off" and current.dock_controls.get(key) == "on":
+            if self.queue.pending_command not in {"", "dock_care"}:
+                raise ValueError("Wait for the current robot command before stopping dock care.")
+            return current
         self.queue._validate_command_barrier(current, time.time())
         if self.queue.phase in ACTIVE or self.queue.pending_command:
             raise ValueError("Wait for the active sequence or command before changing robot settings.")
+        if dock.required(self.queue) and key in DOCK | {"selected_map"}:
+            raise ValueError("Required dock care is incomplete. Resume dock care before changing this control.")
         if self.queue.phase == "attention":
             if self.queue.vacuum and self.queue.vacuum != vacuum:
                 raise ValueError("Clear the stopped sequence for the other robot first.")
-            self.queue.validate_recovery(current, time.time())
+            if not dock.required(self.queue):
+                self.queue.validate_recovery(current, time.time())
+            elif not current.ready_for("vacuum"):
+                raise ValueError("Wait for the robot to be ready before changing settings.")
         if not current.connected or current.vacuum in {"unknown", "unavailable"}:
             raise ValueError("The robot is unavailable.")
         if key == "selected_map" and not current.ready_for("vacuum"):
@@ -541,12 +594,22 @@ class Manager:
                 state = self.hass.states.get(entity_id)
                 if self.device_value_matches(state.state, expected, domain):
                     return
+                if key in DOCK and value == "off" and dock.required(self.queue):
+                    # An explicit stop interrupts the obligation; it cannot turn an
+                    # aborted wash into successful cleanup or erase its history.
+                    self.queue.attention("Dock care stop requested by the user. Required care is retained; continue it when ready.")
+                    await self.publish()
+                    context = Context(user_id=call.context.user_id, parent_id=call.context.id)
+                    self.contexts.add(context.id)
+                    await self.hass.services.async_call(domain, service, data, blocking=True, context=context)
+                    return
                 history.sync(self.queue, time.time())
-                last_run, previous_runs, history_revision = deepcopy(self.queue.last_run), deepcopy(self.queue.previous_runs), self.queue.history_revision
-                self.queue = Queue(mode="device", phase="controlling", vacuum=vacuum, run_id=uuid4().hex,
-                    setup={"control": key, "value": expected, "domain": domain}, control_entities={"device": entity_id},
-                    pending_command="device", command_at=time.time(), owner_user_id=call.context.user_id,
-                    last_run=last_run, previous_runs=previous_runs, history_revision=history_revision)
+                self.queue.device_request = {"control": key, "value": expected, "domain": domain,
+                    "entity_id": entity_id, "previous_phase": self.queue.phase}
+                self.queue.vacuum = vacuum
+                self.queue.run_id = self.queue.run_id or uuid4().hex
+                self.queue.phase, self.queue.pending_command, self.queue.command_at = "controlling", "device", time.time()
+                self.queue.owner_user_id = call.context.user_id
                 reservation = self.queue.run_id
                 await self.publish()
                 # Persisted reservation blocks starts while native telemetry catches up.
@@ -589,11 +652,13 @@ class Manager:
 
     def observe_device(self):
         queue = self.queue
-        state = self.hass.states.get(queue.control_entities.get("device", ""))
+        request = queue.device_request or {**queue.setup, "entity_id": queue.control_entities.get("device", ""), "previous_phase": "idle"}
+        state = self.hass.states.get(request.get("entity_id", ""))
         updated = getattr(state, "last_updated", None)
         if (state and updated and updated.timestamp() >= queue.command_at and
-                self.device_value_matches(state.state, queue.setup.get("value"), queue.setup.get("domain"))):
-            queue.phase = "idle"
+                self.device_value_matches(state.state, request.get("value"), request.get("domain"))):
+            queue.phase = request.get("previous_phase", "idle")
+            queue.device_request = {}
             queue.confirmed()
         elif time.time() - queue.command_at >= ACK_SECONDS:
             queue.attention("The device did not confirm this setting within 60 seconds. No retry was sent.")
@@ -617,11 +682,15 @@ class Manager:
         state = self.hass.states.get(vacuum)
         current = snapshot(coordinator, state.state if state else "unavailable")
         current.settings = self.observed_settings(vacuum, state, coordinator)
+        entities = self.device_entities(vacuum, include_unavailable=True)
+        current.dock_controls = {key: self.hass.states.get(entity_id).state if self.hass.states.get(entity_id) else "unavailable"
+                                 for key, entity_id in entities.items() if key in DOCK}
         self.robot_state = {"dock_status": current.status, "dock_drying": current.dock_drying,
                             "robot_observed_at": current.observed_at, "robot_activity": current.vacuum,
                             "robot_connected": current.connected, "robot_job": current.job,
                             "robot_settings": dict(current.settings),
-                            "robot_battery": current.battery, **self.recovery_state(current),
+                            "robot_battery": current.battery, "dock_controls": self.dock_controls(vacuum, current, entities),
+                            **self.recovery_state(current),
                             **self.continuation_state(current)}
         return current
 
@@ -717,6 +786,8 @@ class Manager:
             bound = self.queue.phase in ACTIVE or self.queue.phase == "attention" or bool(self.queue.pending_command)
             owned_plan = (self.queue.phase in ACTIVE or bool(self.queue.pending_command)) and self.queue.mode == "manual"
             standalone = command in {"pause", "resume", "return_to_dock", "stop"} and not owned_plan
+            if command == "return_to_dock" and (self.queue.mode == "finish" or dock.required(self.queue)):
+                command, standalone = "finish", False
             if standalone and not data.get("vacuum"):
                 raise ServiceValidationError("Specify a vacuum when controlling a job outside an active queue.")
             if command != "start_manual" and bound and self.queue.vacuum and vacuum != self.queue.vacuum:
@@ -731,11 +802,14 @@ class Manager:
                 raise Unauthorized(context=call.context, permission=POLICY_CONTROL) from err
             try:
                 if command == "cancel":
-                    effect = self.queue.command(command, Snapshot(), time.time())
+                    effect = self.queue.command(command, self.current_snapshot(vacuum) if vacuum and self.queue.phase in ACTIVE else Snapshot(), time.time())
                 else:
                     current = self.current_snapshot(vacuum)
                     if command == "finish":
                         effect = self.queue.finish(vacuum, current, time.time(), uuid4().hex)
+                        self.queue.owner_user_id = call.context.user_id
+                    elif command == "resume_dock_cleanup":
+                        effect = dock.resume(self.queue, current, time.time(), data.get("run_id"), data.get("cleanup_revision"))
                         self.queue.owner_user_id = call.context.user_id
                     elif command == "start_manual":
                         caps, controls, targets, map_id = self.manual_capabilities(vacuum)
@@ -889,6 +963,9 @@ class Manager:
         if kind == "manual":
             return (self.queue.phase == "starting" and self.queue.pending_command == "start"
                     and self.queue.mode == "manual" and target == str(self.queue.current_index))
+        if kind == "dock":
+            return (self.queue.pending_command == "dock_care" and self.queue.dock_cleanup.get("current_action") == target
+                    and self.queue.dock_cleanup.get("actions", {}).get(target, {}).get("state") == "commanded")
         return kind == "vacuum" and bool(self.queue.pending_command)
 
     async def clear_unsent_start(self, token) -> None:
@@ -1033,6 +1110,23 @@ class Manager:
                     attempted = True
                     self.start_dispatch_token = start_token
                     await self.hass.services.async_call("vacuum", "clean_area" if area else "start", data, blocking=True, context=context)
+            elif kind == "dock":
+                entity_id = self.device_entities(self.queue.vacuum).get(target)
+                if not entity_id or target not in dock.ACTIONS:
+                    raise ValueError("Required native dock control is unavailable.")
+                await async_require_control(self.hass.auth, user_id, [self.queue.vacuum, entity_id], POLICY_CONTROL)
+                if not self.effect_valid(effect):
+                    return
+                current = self.current_snapshot(self.queue.vacuum)
+                self.queue.validate_fresh_observation(current, time.time())
+                self.queue._validate_command_barrier(current, time.time())
+                if (current.vacuum != "docked" or not current.ready_for("mop" if target == "mop_washing" else "vacuum")
+                        or current.dock_controls.get(target) != "off"):
+                    raise ValueError("The dock became busy or unavailable before care dispatch.")
+                if self.device_entities(self.queue.vacuum).get(target) != entity_id:
+                    raise ValueError("The native dock control changed before dispatch.")
+                attempted = True
+                await self.hass.services.async_call("switch", "turn_on", {"entity_id": entity_id}, blocking=True, context=context)
             else:
                 current = self.queue.execution_snapshot(self.current_snapshot(self.queue.vacuum))
                 self.queue.validate_fresh_observation(current, time.time())
@@ -1141,13 +1235,14 @@ class Manager:
                 self.robot_state.update(self.continuation_state(current))
                 await self.publish()
                 return
-            if self.queue.mode == "device":
+            if self.queue.mode == "device" or self.queue.device_request:
                 if self.queue.pending_command:
                     self.observe_device()
                 await self.publish()
                 return
             history.observe_faults(self.queue, current, time.time())
-            if self.queue.phase not in ACTIVE and not self.queue.pending_command:
+            if (self.queue.phase not in ACTIVE and not self.queue.pending_command
+                    and not (self.queue.phase == "cancelled" and dock.required(self.queue))):
                 recovery.reconcile_fault_completion(self.queue, current, time.time())
                 recovery.observe_job(self.queue, current, time.time())
                 self.robot_state.update(self.continuation_state(current))

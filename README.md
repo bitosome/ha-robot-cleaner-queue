@@ -61,7 +61,7 @@ Installation starts no cleaning. After a restart, an existing active sequence re
 
 | Action | Purpose |
 | --- | --- |
-| `robot_cleaner_queue.control` | `start_manual`, `pause`, `resume`, `cancel`, `return_to_dock`, `stop`, `toggle`, `toggle_saved`, `continue_sequence`, `resume_now` |
+| `robot_cleaner_queue.control` | `start_manual`, `pause`, `resume`, `cancel`, `return_to_dock`, `stop`, `toggle`, `toggle_saved`, `continue_sequence`, `resume_now`, `resume_dock_cleanup` |
 | `robot_cleaner_queue.update_queue` | Add, remove or reorder untouched rooms in the current sequence, with run/revision guards |
 | `robot_cleaner_queue.device_control` | Allowlisted dock and robot settings (mop washing, child lock, DND, volume, …) |
 | `robot_cleaner_queue.save_preset` | Store one validated plan per vacuum |
@@ -124,6 +124,7 @@ python3 -B test/backend_queue_test.py
 python3 -B test/backend_manual_test.py
 python3 -B test/backend_controls_test.py
 python3 -B test/backend_device_test.py
+python3 -B test/backend_dock_test.py
 python3 -B test/backend_history_test.py
 python3 -B test/backend_recovery_test.py
 python3 -B test/backend_restart_test.py
@@ -266,3 +267,37 @@ Water flow supports the explicit native **Low**, **Medium** and **High** setting
 The app's custom 1–30 slider and its descriptive levels are not controllable by
 this integration. A native `custom_water_flow` state alone does not expose that
 numeric value, so it is excluded from reproducible room plans.
+
+
+### Dock controls and confirmed final care (v0.17.0)
+
+The card exposes the native **Wash mops**, **Empty bin** and **Dry mops** controls,
+including Stop while a dock operation is active. Availability and action-specific
+fault checks come from the backend. Temporarily unavailable native controls stay
+visible. Disabled native entities are not enabled automatically.
+
+Actual observed floor work creates persistent care obligations: vacuuming requires
+bin emptying; mopping requires mop washing. Merely selecting a room or applying its
+settings does not. After the last successful pass, or when an unfinished run is
+cancelled and sent to dock, the controller first observes the dock's own care. It
+requests only missing care, one action at a time (bin emptying before mop washing),
+and preserves the room assignment and completion history. A native service response
+alone is not proof that care ran. Completion requires an observed native care state
+followed by fresh, settled dock readiness, with no relevant fault. Passive drying
+remains visible but does not delay the next cycle.
+
+**Stop/Clear alone does not send the robot home.** It retains the obligations and
+keeps Return to dock available. The next plan cannot start until required care is
+confirmed. A water-empty dock may still empty the bin; washing waits for the water
+fault to be resolved. Unsupported/unavailable controls, interrupted care or a missed
+start remain visible as incomplete, never silently successful.
+
+The checkpoint survives restarts. An already-running care action must be observed
+active again after the restart before its end can be confirmed. An operation that
+may have ended while Home Assistant was offline is unconfirmed, and no command is
+blindly repeated. **Resume dock care** is an explicit retry guarded by the run id
+and checkpoint revision. If return was interrupted, it can safely request returning
+to the dock again after the old command uncertainty has expired. It retries only
+unconfirmed care, preserves confirmed
+results and cannot resume cancelled floor work. Its evidence confirms dock cycles,
+not a physical inspection that the robot or mop is clean.

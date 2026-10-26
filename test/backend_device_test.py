@@ -197,7 +197,7 @@ class DeviceTests(unittest.IsolatedAsyncioTestCase):
         await self.send("volume",60)
         self.assertEqual(self.calls,[("number","set_value",{"entity_id":"number.robot_volume","value":60.0})])
         await self.manager.tick()
-        self.assertEqual(self.manager.queue.phase,"idle")
+        self.assertEqual(self.manager.queue.phase,"attention")  # Existing plan state survives a volume change.
 
     async def test_attention_device_recovery_never_bypasses_uncertainty_or_stale_telemetry(self):
         for barrier,age in [(self.clock+30,0),(0,91)]:

@@ -32,6 +32,23 @@ def cleaning(record=None):
 def record(begin=100, end=200, complete=1, error=0, finish_reason=52):
     return dict(begin=begin, end=end, complete=complete, error=error, finish_reason=finish_reason)
 
+
+def complete_native_dock(queue, now, finished_record=None):
+    """Emit actual native care-start and fresh ready observations, no service mock."""
+    for key, status in [("dust_emptying", "emptying_the_bin"), ("mop_washing", "washing_the_mop")]:
+        if not queue.dock_cleanup.get("required", {}).get(key):
+            continue
+        current = ready(finished_record, observed_at=now)
+        current.status = status
+        current.dock_controls = {"dust_emptying": "off", "mop_washing": "off"}
+        queue.observe(current, now)
+        for offset in (5, 21):
+            current = ready(finished_record, observed_at=now + offset)
+            current.dock_controls = {"dust_emptying": "off", "mop_washing": "off"}
+            queue.observe(current, now + offset)
+        now += 22
+    return now
+
 class QueueTests(unittest.TestCase):
     """Room plans: each room is configured, started, then verified before the next."""
 
@@ -96,7 +113,7 @@ class QueueTests(unittest.TestCase):
         q.observe(cleaning(self.done()), 270)
         q.observe(ready(record(270, 300)), 305)
         self.assertEqual((q.phase, q.completed, q.current_index), ("finishing", 2, 2))
-        self.assertIsNone(self.settled_ready(q, 310, record(270, 300)))
+        complete_native_dock(q, 310, record(270, 300))
         self.assertEqual(q.phase, "completed")
         self.assertIsNone(q.observe(ready(record(270, 300)), 400))
 
@@ -234,7 +251,7 @@ class QueueTests(unittest.TestCase):
         self.assertEqual((q.phase, q.pending_command), ("running", ""))
         q.observe(ready(record(245, 950)), 955)
         self.assertEqual((q.phase, q.completed), ("finishing", 2))
-        self.assertIsNone(self.settled_ready(q, 960, record(245, 950)))
+        complete_native_dock(q, 960, record(245, 950))
         self.assertEqual(q.phase, "completed")
 
     def test_busy_robot_or_unfinished_docked_job_reject_start(self):
@@ -293,8 +310,8 @@ class QueueTests(unittest.TestCase):
     def test_return_cancels_before_action_and_needs_ack(self):
         q = self.acknowledged()
         self.assertEqual(q.command("return_to_dock", cleaning(), 150), ("vacuum", "return_to_base"))
-        self.assertEqual(q.phase, "cancelled")
-        q.observe(Snapshot("returning", "returning_home", "on", "none", "ok", True), 155)
+        self.assertEqual(q.phase, "controlling")
+        q.observe(Snapshot("returning", "returning_home", "on", "none", "ok", True, observed_at=155), 155)
         self.assertEqual(q.pending_command, "")
         self.assertIsNone(q.observe(ready(record()), 220))
 
@@ -302,7 +319,7 @@ class QueueTests(unittest.TestCase):
         q = self.acknowledged()
         s = Snapshot("cleaning", "washing_the_mop", "on", "none", "ok", True)
         self.assertIsNone(q.command("return_to_dock", s, 150))
-        self.assertEqual(q.phase, "attention")
+        self.assertEqual(q.phase, "controlling")
 
     def test_restart_never_sends_anything(self):
         for q in [self.start(), self.acknowledged()]:
@@ -315,7 +332,7 @@ class QueueTests(unittest.TestCase):
         for command in ["cancel", "return_to_dock"]:
             q = self.start()
             q.command(command, ready(), 101)
-            self.assertEqual(q.phase, "cancelled")
+            self.assertEqual(q.phase, "cancelled" if command == "cancel" else "controlling")
             self.assertEqual(q.not_before, 160)          # settings-only update window
             for timestamp in [102, 701]:
                 with self.assertRaises(ValueError):
@@ -330,6 +347,7 @@ class QueueTests(unittest.TestCase):
                 q.start_manual("vacuum.robot", ["0_1"], {}, stages, {}, fresh_but_busy, 1010, "new")
             fresh_ready = ready(record(10, 20))
             fresh_ready.observed_at = 1005
+            q.observe(fresh_ready, 1005)
             self.assertEqual(q.start_manual("vacuum.robot", ["0_1"], {}, stages, {}, fresh_ready, 1010, "new"),
                              ("configure", "0"))
 

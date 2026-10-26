@@ -13,7 +13,7 @@ import unittest
 from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).parent))
-from backend_queue_test import load, Queue, Snapshot, ready, cleaning, record, adapter, permissions
+from backend_queue_test import load, Queue, Snapshot, ready, cleaning, record, adapter, permissions, complete_native_dock
 manual = load("manual")
 device = load("device")
 NS = types.SimpleNamespace
@@ -335,9 +335,7 @@ class ManualEngineTests(unittest.TestCase):
         done = ready(record(246, 300)); done.observed_at = 310
         queue.observe(done, 310)
         self.assertEqual((queue.phase, queue.completed), ("finishing", 2))
-        self.assertIsNone(queue.observe(done, 310))
-        done.observed_at = 326
-        queue.observe(done, 326)
+        complete_native_dock(queue, 311, record(246, 300))
         self.assertEqual(queue.phase, "completed")
 
     def test_prepare_timeout_busy_robot_cancel_restart_no_cleaning(self):
@@ -394,7 +392,7 @@ def manager_class():
     definition = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Manager")
     from copy import deepcopy
     env = dict(asyncio=asyncio, time=time, logging=logging, deque=deque, uuid4=uuid4, Store=FakeStore,
-               history=load("history"), recovery=load("recovery"), restart=load("restart"), editing=load("editing"), deepcopy=deepcopy,
+               dock=load("dock"), history=load("history"), recovery=load("recovery"), restart=load("restart"), editing=load("editing"), deepcopy=deepcopy,
                Queue=Queue, Snapshot=Snapshot, ACTIVE=load("engine").ACTIVE,
                command_failure_metadata=load("errors").command_failure_metadata,
                ACK_SECONDS=60, CONTROLS=device.CONTROLS, DOCK=device.DOCK, device_entities=device.device_entities, device_command=device.device_command,

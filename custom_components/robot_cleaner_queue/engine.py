@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass, field
 from copy import deepcopy
 from typing import Any
 
-from . import history, recovery, restart, editing
+from . import history, recovery, restart, editing, dock
 
 ACTIVE = {"preparing", "starting", "running", "paused", "controlling", "finishing", "recovering"}
 READY_STATUS = {"idle", "charging", "charging_complete"}
@@ -65,6 +65,7 @@ class Snapshot:
     battery: int | float | None = None
     clean_time: int | float | None = None
     error_detail: str = ""
+    dock_controls: dict[str, str] = field(default_factory=dict)
 
     @property
     def robot_healthy(self) -> bool:
@@ -154,6 +155,8 @@ class Queue:
     edit_pending: bool = False
     # Completion proof only; never permission to resume native motion.
     fault_record_before: float = 0
+    dock_cleanup: dict[str, Any] = field(default_factory=dict)
+    device_request: dict[str, Any] = field(default_factory=dict)
 
     def dump(self) -> dict[str, Any]:
         editing.sync_revision(self)
@@ -164,6 +167,7 @@ class Queue:
         queue = cls(**{k: v for k, v in (data or {}).items() if k in cls.__dataclass_fields__})
         history.restore(queue)
         recovery.restore_fault_window(queue)
+        dock.restore(queue)
         restart.restore(queue)
         if queue.edit_pending:
             # The last process may have stopped between persisting an edited
@@ -179,6 +183,8 @@ class Queue:
         return queue
 
     def attention(self, message: str, *, recoverable_fault: bool = False) -> None:
+        dock.interrupted(self, message)
+        self.device_request = {}
         self.fault_record_before = recovery.fault_window(self) if recoverable_fault else 0
         self.restart_checkpoint = {}
         self.restart_resume_guard = ""
@@ -241,7 +247,7 @@ class Queue:
         return "The robot did not acknowledge the command within 60 seconds. No retry was sent."
 
     def _preserve_command_barrier(self) -> None:
-        if self.pending_command in {"start", "configure", "pause", "resume", "resume_now", "return_to_dock", "stop", "device"}:
+        if self.pending_command in {"start", "configure", "pause", "resume", "resume_now", "return_to_dock", "stop", "device", "dock_care"}:
             # A cloud command may have been accepted before telemetry catches up.
             # Clearing the UI must not permit another start on that stale state, so the
             # barrier lasts as long as that command may still be acknowledged.
@@ -257,6 +263,8 @@ class Queue:
         observation after any uncertain command window, with no unfinished robot job.
         Callers must validate the requested action before replacing or clearing history.
         """
+        if dock.required(self):
+            raise ValueError("Required dock care is incomplete. Finish it before starting another action.")
         if self.phase in ACTIVE or self.pending_command:
             raise ValueError("A queue or command is still active. Finish it before starting another action.")
         self._validate_command_barrier(snapshot, now)
@@ -277,6 +285,8 @@ class Queue:
             raise ValueError("Wait for a fresh robot update after the previous command before starting a new action.")
 
     def _validate_start(self, snapshot: Snapshot, now: float, mode: str = "vacuum") -> None:
+        if dock.required(self):
+            raise ValueError("Required dock care is incomplete. Finish it before starting another sequence.")
         if self.phase == "attention":
             # The user explicitly requested a new plan. Safe stopped history must not
             # require a separate clear action, and its stages are never resumed.
@@ -297,12 +307,15 @@ class Queue:
 
     def should_finish(self, snapshot: Snapshot) -> bool:
         """Whether a wall-switch toggle should end the current job instead of starting one."""
-        return (self.phase in ACTIVE or bool(self.pending_command) or
+        return (dock.required(self) or self.phase in ACTIVE or bool(self.pending_command) or
                 snapshot.job == "on" or snapshot.vacuum in {"cleaning", "paused", "returning"} or
                 snapshot.status in START_STATUS - {"charger_disconnected"})
 
     def finish(self, vacuum: str, snapshot: Snapshot, now: float, run_id: str):
-        """Cancel all stages, then let native docking perform post-clean care."""
+        """Cancel floor work, preserving its evidence and required final dock care."""
+        dock.observe_usage(self, snapshot, now)
+        if dock.required(self) and self.dock_cleanup.get("state") == "attention":
+            raise ValueError("Dock care needs review. Use Continue dock care after checking its interruption.")
         if self.mode == "finish" and self.phase == "controlling":
             return None  # Repeated holds cannot restart cleaning or duplicate docking.
         # A pending start/pause/stop keeps its own barrier, which defers the home
@@ -316,35 +329,41 @@ class Queue:
         self.restart_matched_record = {}
         self.restart_resume_guard = ""
         history.cancel_before_detach(self, now)
+        dock.arm(self, now, "cancelled")
         self._preserve_command_barrier()
         self.water_refilled_index = -1
         self.resume_owned_job = False
         self.continuation_context = ""
         self.mode, self.phase = "finish", "controlling"
-        self.vacuum, self.run_id = vacuum, run_id
-        self.targets, self.stages = [], []
-        self.setup, self.control_entities = {}, {}
-        self.current_index = self.completed = 0
+        self.vacuum = vacuum
+        if not self.run_id:
+            self.run_id = run_id
+        self.setup = {**self.setup, "finish_commands": {}}
         self.next_pending = self.seen_job = False
         self.pending_command, self.error = "", ""
         self.start_uncertain = False
         self._reset_ready()
-        self.started_at = now
+        self.dock_finish_at = now
         return self._observe_finish(snapshot, now)
 
     def _observe_finish(self, snapshot: Snapshot, now: float):
         if self.phase != "controlling":
             return None
+        if dock.required(self) and not self.dock_cleanup.get("armed"):
+            dock.arm(self, now, "cancelled")
         if not snapshot.robot_healthy:
             self.attention("Cleaning sequence cancelled. The robot is unavailable or has a robot fault; check it before docking.")
             return None
-        if now - self.started_at >= 1800:
+        if now - self.dock_finish_at >= 1800:
             self.attention("Cleaning sequence cancelled, but docking did not finish within 30 minutes. Check the robot; no retry was sent.")
             return None
         if self.not_before and (now < self.not_before or snapshot.observed_at < self.not_before):
             return None  # An accepted start may still arrive; never race it with home.
-        if snapshot.observed_at < self.started_at:
+        if snapshot.observed_at < self.dock_finish_at and now > self.dock_finish_at:
             return None
+        if self.pending_command == "dock_care":
+            return dock.observe(self, snapshot, now, dispatch=True)
+        dock.observe(self, snapshot, now)
         if self.pending_command:
             confirmed = snapshot.observed_at >= self.command_at and (
                 self.pending_command == "stop" and snapshot.job == "off" or
@@ -356,8 +375,12 @@ class Queue:
             return None
         servicing = snapshot.status in DOCK_CARE_STATUS
         if servicing or snapshot.vacuum == "returning":
+            if dock.required(self):
+                return dock.observe(self, snapshot, now, dispatch=True)
             return None  # Do not interrupt dock care or issue duplicate home commands.
         if snapshot.vacuum == "docked" and snapshot.job == "off":
+            if dock.required(self):
+                return dock.observe(self, snapshot, now, dispatch=True)
             self.phase = "cancelled"
             return None
         if snapshot.vacuum == "docked" and snapshot.job == "on":
@@ -366,10 +389,10 @@ class Queue:
             command, service = "return_to_dock", "return_to_base"
         else:
             return None
-        if self.setup.get(command):
+        if self.setup.get("finish_commands", {}).get(command):
             self.attention("The robot resumed or stopped after the finish command. The sequence is cancelled; check the robot before retrying.")
             return None
-        self.setup[command] = True
+        self.setup.setdefault("finish_commands", {})[command] = True
         self.pending_command, self.command_at = command, now
         return "vacuum", service
 
@@ -471,6 +494,8 @@ class Queue:
         self._validate_start(snapshot, now, plan_mode)
         history.sync(self, now)
         self.mode = "manual"
+        self.dock_cleanup = {}
+        self.device_request = {}
         self.restart_checkpoint = {}
         self.restart_record_before = 0
         self.fault_record_before = 0
@@ -508,7 +533,7 @@ class Queue:
 
     @property
     def stage(self) -> dict:
-        return self.stages[self.current_index] if self.mode == "manual" and 0 <= self.current_index < len(self.stages) else {}
+        return self.stages[self.current_index] if self.mode in {"manual", "finish"} and 0 <= self.current_index < len(self.stages) else {}
 
     def _dispatch(self, snapshot: Snapshot, now: float) -> tuple[str, str]:
         """Every plan applies its stage settings first and then starts that room."""
@@ -571,6 +596,9 @@ class Queue:
             self.pending_command, self.command_at = "stop", now
             return "vacuum", "stop"
         if command == "cancel":
+            dock.observe_usage(self, snapshot, now)
+            if dock.required(self) and self.dock_cleanup.get("armed"):
+                raise ValueError("Dock care is still required. Resolve or continue it before clearing this sequence.")
             self.restart_checkpoint = {}
             self.restart_record_before = 0
             self.fault_record_before = 0
@@ -588,25 +616,7 @@ class Queue:
             self.decision = "sequence cleared"
             return None  # Cancelling a queue never claims to stop the robot.
         if command == "return_to_dock":
-            had_pending_command = bool(self.pending_command)
-            self.command("cancel", snapshot, now)
-            if snapshot.vacuum in {"docked", "returning"}:
-                return None
-            # Cancelling future stages must not permit a second cloud command
-            # while the earlier start/pause/resume/home result is uncertain.
-            try:
-                self._validate_command_barrier(snapshot, now)
-                if had_pending_command:
-                    raise ValueError("A previous command was still awaiting acknowledgement.")
-            except ValueError:
-                self.attention("Queue cleared. A previous command is still uncertain; wait for a fresh robot update after its acknowledgement window before returning to dock.")
-                return None
-            if not snapshot.robot_healthy or not (snapshot.status in CLEANING_STATUS | {"paused", "idle"}):
-                self.attention("Queue cleared. Return to dock is unavailable while the robot is servicing or its state is uncertain.")
-                return None
-            self.pending_command = "return_to_dock"
-            self.command_at = now
-            return "vacuum", "return_to_base"
+            return self.finish(self.vacuum, snapshot, now, self.run_id)
         if command == "pause":
             if self.phase not in {"starting", "running"} or self.pending_command:
                 raise ValueError("The queue is not ready to pause.")
@@ -641,8 +651,15 @@ class Queue:
             return "vacuum", "start"
         raise ValueError("Unknown queue command.")
 
-    def _observe_dock_completion(self, snapshot: Snapshot, now: float) -> None:
-        """Observe native return/care after the last floor pass; never send motion."""
+    def _observe_dock_completion(self, snapshot: Snapshot, now: float):
+        """Observe native care, then request only care not already proven."""
+        if dock.required(self):
+            if not self.dock_cleanup.get("armed"):
+                dock.arm(self, now, "completed")
+            return dock.observe(self, snapshot, now, dispatch=True)
+        if not snapshot.healthy_for(self.cleaning_mode):
+            self.attention("The robot or dock has a fault before final docking. Review it before continuing.")
+            return
         if now - self.dock_finish_at >= DOCK_FINISH_SECONDS:
             self.attention("Floor cleaning finished, but return and dock care were not confirmed within 30 minutes. Check the robot; no command was sent.")
             return
@@ -665,8 +682,14 @@ class Queue:
         return recovery.effective_snapshot(self, snapshot)
 
     def observe(self, snapshot: Snapshot, now: float) -> tuple[str, str] | None:
+        dock.observe_usage(self, snapshot, now)
         if self.phase not in ACTIVE and not self.pending_command:
-            return None  # Historical evidence cannot adopt a later native job.
+            if self.phase == "cancelled" and dock.required(self) and snapshot.vacuum in {"returning", "docked"}:
+                dock.arm(self, now, "cancelled")
+                self.mode, self.phase = "finish", "controlling"
+            else:
+                return None  # Historical evidence cannot adopt a later native job.
+        dock.observe(self, snapshot, now)
         if self.restart_checkpoint:
             effect = restart.reconcile(self, snapshot, now)
             history.sync(self, now)
@@ -710,14 +733,13 @@ class Queue:
             return None
         if self.phase not in ACTIVE:
             return None
+        if self.phase == "finishing":
+            return self._observe_dock_completion(snapshot, now)
         if not snapshot.healthy_for(self.cleaning_mode):
             self.attention("The robot or dock has a fault, or telemetry is unavailable. The sequence is retained for review.",
                            recoverable_fault=snapshot.connected and snapshot.job in {"on", "off"})
             self.decision = "stopped: robot, dock or telemetry unhealthy (vacuum=%s status=%s job=%s error=%s dock=%s connected=%s)" % (
                 snapshot.vacuum, snapshot.status, snapshot.job, snapshot.error, snapshot.dock_error, snapshot.connected)
-            return None
-        if self.phase == "finishing":
-            self._observe_dock_completion(snapshot, now)
             return None
         if self.pending_command == "configure":
             if snapshot.servicing_for(self.cleaning_mode):
@@ -833,6 +855,7 @@ class Queue:
         if complete != 1 or error != 0 or (reason is not None and reason not in SUCCESS_REASONS):
             self.attention("The cleaning job was interrupted, failed, or did not report successful completion. No next room was started.")
             return None
+        dock.used(self, self.stage.get("mode"), end)
         history.complete_stage(self, record, now)
         self.completed += 1
         self.current_index += 1

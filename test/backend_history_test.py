@@ -76,9 +76,13 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(queue.last_run["stages"][0], result)
         self.assertEqual(queue.last_run["stages"][1]["state"], "pending")
         self.assertEqual(queue.last_run["interruptions"][-1]["at"], 210)
+        with self.assertRaisesRegex(ValueError, "dock care"):
+            start(queue, 400, "remaining", [stage("0_2", "mop")])
+        queue.finish(queue.vacuum, qtests.ready(observed_at=220), 220, "unused")
+        qtests.complete_native_dock(queue, 230)
         start(queue, 400, "remaining", [stage("0_2", "mop")])
         archived = queue.previous_runs[0]
-        self.assertEqual((archived["run_id"], archived["state"], len(archived["rooms"])), ("run1", "attention", 2))
+        self.assertEqual((archived["run_id"], archived["state"], len(archived["rooms"])), ("run1", "cancelled", 2))
         self.assertEqual(archived["stages"][0], result)
         self.assertEqual(queue.last_run["run_id"], "remaining")
         restored = Queue.restore(queue.dump())
@@ -229,6 +233,8 @@ class HistoryTests(unittest.TestCase):
     def test_unchanged_tick_and_publish_sync_do_not_duplicate_events_or_shift_times(self):
         queue = first_complete()
         queue.command("cancel", qtests.ready(), 210)
+        queue.observe(qtests.ready(observed_at=230), 230)
+        queue.observe(qtests.ready(observed_at=246), 246)
         before = queue.dump()
         for now in (300, 500, 600):
             self.assertIsNone(queue.observe(qtests.ready(observed_at=now), now))
@@ -245,7 +251,7 @@ class HistoryTests(unittest.TestCase):
         queue.previous_runs = [deepcopy(queue.last_run) for _ in range(5)]
         source = qtests.PACKAGE / "sensor.py"
         definition = next(n for n in ast.parse(source.read_text()).body if isinstance(n, ast.ClassDef))
-        env = {"SensorEntity": object, "history": history, "editing": qtests.load("editing")}
+        env = {"SensorEntity": object, "history": history, "dock": qtests.load("dock"), "editing": qtests.load("editing")}
         exec(compile(ast.Module(body=[definition], type_ignores=[]), str(source), "exec"), env)
         sensor = env["QueueSensor"](NS(queue=queue, robot_state={}, preferences={}, saved_presets={}))
         attrs = sensor.extra_state_attributes
@@ -321,7 +327,9 @@ class HistoryDeviceTests(unittest.IsolatedAsyncioTestCase):
         self.manager.queue = queue
         before = deepcopy(queue.last_run)
         await dtests.DeviceTests.send(self, "child_lock", "on")
-        self.assertEqual(self.manager.queue.mode, "device")
+        self.assertEqual(self.manager.queue.mode, "manual")
+        self.assertEqual(self.manager.queue.stages, queue.stages)
+        self.assertEqual(self.manager.queue.device_request["control"], "child_lock")
         self.assertEqual(self.manager.queue.last_run, before)
         self.assertEqual(self.manager.store.saved[-1]["last_run"], before)
 

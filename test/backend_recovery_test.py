@@ -315,7 +315,9 @@ class ContinuationManagerTests(unittest.IsolatedAsyncioTestCase):
         self.clock+=16
         self.coordinator._last_update_success_time=datetime.fromtimestamp(self.clock,timezone.utc)
         await self.manager.tick()
-        self.assertEqual(q.phase,"completed")
+        self.assertEqual(q.phase,"attention")
+        self.assertIn("native control is unavailable",q.error)
+        self.assertEqual(q.completed,2)
         self.assertEqual(self.calls,[])
 
     async def test_charging_resume_dispatches_explicit_native_resume_once_and_persists_original_progress(self):

@@ -217,7 +217,7 @@ alter the wall-switch plan. Area plans retain `source: manual`; native room plan
 overwritten by a subsequent save.
 
 
-### Readiness, finishing and uncertain starts (v0.10.0)
+### Readiness, finishing and uncertain starts (v0.10.0; final-care rules superseded by v0.17.0)
 
 After each floor pass, the next stage waits for healthy, job-off readiness to hold
 for at least 15 seconds and be confirmed by a newer native observation. Settings
@@ -231,7 +231,7 @@ stages complete. Native return, mop washing and dust emptying remain visible;
 `completed` requires fresh settled docking/job-off readiness. This observes dock
 care rather than forcing it or claiming that every possible dock action ran.
 Drying remains visible independently after completion. A 30-minute failure to
-confirm final docking requires attention. Restart never resumes a sequence.
+confirm final docking requires attention. This original v0.10.0 behavior is historical; the restart recovery and v0.17.0 dock-care contracts below supersede it.
 
 `get_capabilities.execution_version: 2` and the queue sensor's matching attribute
 identify this contract. Sensor attributes include `floor_cleaning_complete`,
@@ -484,3 +484,45 @@ Edits use a detached candidate and persist before publishing. A synchronous comp
 The execution journal replaces only untouched pending stages, preserving current/completed proof and timestamps. Up to twelve edit events record before/after order, added IDs and removed-room settings with `state: removed`; removed rooms leave the live progress denominator and are never credited as cleaned. Saved presets and shared room preferences are separate and unchanged.
 
 Regression coverage: `test/backend_editing_test.py` exercises pending-mode protection, reordered dispatch, stale/two-client edits, permission/map changes during awaits, storage failures, external interruptions, shutdown, immediate/settled restarts, empty suffixes and dock/water faults. No physical device or network is used.
+
+
+## Dock-care checkpoint (v0.17.0)
+
+`get_capabilities.dock_cleanup_version` and the queue sensor publish version `1`.
+`device_entities` retains enabled native controls that are temporarily unavailable.
+`dock_controls` (capabilities and live sensor) maps `dust_emptying`, `mop_washing`,
+`mop_drying` to `{supported, available, entity_id, state, can_start, can_stop, reason}`.
+These flags describe the current snapshot; every service revalidates permissions,
+fresh native telemetry and entity identity immediately before dispatch.
+
+The sensor and retained run history include `dock_cleanup`: `version`, original
+`run_id`, monotonic `revision`, `armed`, `state`, `required`, `actions`, `reason`, and
+`retry_allowed`. States are `pending`, `returning`, `waiting`, `running`, `attention`,
+`completed`. Each required action records `pending` / `commanded` / `running` /
+`completed` plus `used_at`, `command_at`, `started_at`, `completed_at` observations.
+`armed: false` during floor work records obligations without replacing the normal
+cleaning controls. Stop/Clear leaves them unarmed until returning/docking; Finish
+and natural final completion arm them. They survive normal storage updates, failed
+service calls and restarts, and cannot be erased by starting a new plan.
+
+`control` command `resume_dock_cleanup` requires `vacuum`, current `run_id`, and
+`cleanup_revision`. A stale retry is rejected. An interrupted return can explicitly
+request docking again under the existing fresh-state and uncertainty guards; it never
+resumes cancelled floor work. No retry happens automatically after
+an unobserved action. The existing `device_control` service still accepts
+`{vacuum, control, value: on|off}` for native dock switches. Explicit Stop remains
+available while a queue-owned action is active; it retains incomplete obligations
+and records that stopping was requested, without pretending it completed cleaning.
+
+Final care is based on actual owned floor observations or matched successful native
+records, not all planned modes. Native care that started after the latest relevant
+floor use is adopted. Later work invalidates only its own obligation. A delayed
+floor record cannot erase already observed later care. Raw native activity proves
+start; stale switch values and service acceptance cannot. Completion requires a
+fresh settled idle/docked transition with no relevant fault. Interrupted native
+care is not credited later, including care that ends across a Home Assistant gap.
+
+Pending dispatch reservations are persisted before service calls and never replayed
+on restart. A fresh active care observation can rejoin monitoring. If completion
+cannot be established, the original run stays in attention with its room history and
+an explicit retry. Shared-plan switch and card docking use the same lifecycle.

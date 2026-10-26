@@ -18,6 +18,7 @@ control:
           - toggle_saved
           - continue_sequence
           - resume_now
+          - resume_dock_cleanup
     vacuum:
       selector:
         entity:
@@ -27,6 +28,12 @@ control:
       description: Required for continue_sequence and resume_now; current sensor run_id.
       selector:
         text: {}
+    cleanup_revision:
+      description: Required for resume_dock_cleanup; current dock_cleanup.revision prevents stale retries.
+      selector:
+        number:
+          min: 0
+          mode: box
     current_index:
       description: Required for continuation; current sensor pass index guards stale controls.
       selector:

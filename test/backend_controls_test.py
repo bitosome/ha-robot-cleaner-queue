@@ -168,10 +168,10 @@ class StandaloneEngineTests(unittest.TestCase):
         paused = state("paused", "paused", observed_at=110)
         for now in [120, 165]:
             self.assertIsNone(queue.command("return_to_dock", paused, now))
-            self.assertEqual((queue.phase, queue.pending_command, queue.next_pending), ("attention", "", False))
+            self.assertEqual((queue.phase, queue.pending_command, queue.next_pending), ("controlling", "", False))
             self.assertEqual(queue.not_before, 160)
         paused.observed_at = 166
-        self.assertEqual(queue.command("return_to_dock", paused, 166), ("vacuum", "return_to_base"))
+        self.assertEqual(queue.observe(paused, 166), ("vacuum", "return_to_base"))
 
     def test_owned_pending_commands_cannot_be_replaced_with_dock(self):
         for pending in ["start", "pause", "resume", "return_to_dock"]:
@@ -179,9 +179,10 @@ class StandaloneEngineTests(unittest.TestCase):
                           pending_command=pending, command_at=100, next_pending=True)
             self.assertIsNone(queue.command("return_to_dock", state(observed_at=110), 110))
             barrier = 1000 if pending in {"start", "resume"} else 160
-            self.assertEqual((queue.phase, queue.pending_command, queue.not_before, queue.next_pending), ("attention", "", barrier, False))
+            self.assertEqual((queue.phase, queue.pending_command, queue.not_before, queue.next_pending), ("controlling", "", barrier, False))
             self.assertIsNone(queue.command("return_to_dock", state(observed_at=111), 111))
-            self.assertIsNone(queue.observe(state(observed_at=170), 170))
+            effect = queue.observe(state(observed_at=170), 170)
+            self.assertEqual(effect, None if barrier > 170 else ("vacuum", "return_to_base"))
 
     def test_owned_resume_requires_unfinished_job_but_preserves_queued_next_stage(self):
         queue = Queue(phase="paused", vacuum="vacuum.robot", mode="manual", targets=["0_1", "0_2"], stages=TWO_STAGES, started_at=100)
@@ -355,7 +356,7 @@ class FinishEngineTests(unittest.TestCase):
         current = state(); current.dock_error = "water_empty"
         self.assertTrue(q.should_finish(current))
         self.assertEqual(q.finish("vacuum.robot", current, 100, "finish"), ("vacuum", "return_to_base"))
-        self.assertEqual((q.stages, q.next_pending), ([], False))
+        self.assertEqual((q.stages, q.next_pending), (TWO_STAGES, False))
         self.assertIsNone(q.finish("vacuum.robot", current, 101, "repeat"))
         q.observe(state("returning", "returning_home", observed_at=102), 102)
         q.observe(state("docked", "washing_the_mop", "off", 103), 103)
@@ -389,7 +390,7 @@ class FinishEngineTests(unittest.TestCase):
             current = state("returning" if i == 0 else "docked", status, "off", 100+i)
             if i == 0: self.assertIsNone(q.finish("vacuum.robot", current, 100, "finish"))
             else: self.assertIsNone(q.observe(current, 100+i))
-        self.assertEqual(q.setup, {})
+        self.assertEqual(q.setup.get("finish_commands"), {})
 
     def test_restart_timeout_fault_and_unexpected_resume_never_retry(self):
         q = Queue(); q.finish("vacuum.robot", state(), 100, "finish")
@@ -459,8 +460,10 @@ class StandaloneManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.manager.queue.phase, "cancelled")
 
     async def test_toggle_permission_revocation_prevents_deferred_docking(self):
+        self.manager.queue.not_before = time.time() + 30
         await self.control("toggle")
         self.allowed.clear()
+        self.manager.queue.not_before = 0
         self.current.observed_at = time.time()
         await self.manager.tick()
         self.assertEqual(self.calls, [])
@@ -617,8 +620,8 @@ class StandaloneManagerTests(unittest.IsolatedAsyncioTestCase):
         await self.control("return_to_dock")
         self.assertEqual(len(self.calls), 1)
         self.assertEqual(self.calls[0][1], "return_to_base")
-        self.assertEqual(self.manager.queue.phase, "attention")
-        self.assertGreater(self.manager.queue.not_before, time.time())
+        self.assertEqual(self.manager.queue.phase, "controlling")
+        self.assertEqual(self.manager.queue.pending_command, "return_to_dock")
         self.assertEqual(self.manager.store.saved[-1], self.manager.queue.dump())
 
 

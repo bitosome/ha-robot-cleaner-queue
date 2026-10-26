@@ -24,6 +24,12 @@ def remember(queue, snapshot):
 
 def restore(queue):
     from .engine import ACTIVE
+    from . import dock
+    if dock.required(queue) and queue.dock_cleanup.get("armed") and not queue.dock_cleanup.get("invalid"):
+        # Persisted care commands are observed, never re-issued after restart.
+        # Their original acknowledgement deadlines remain in the checkpoint.
+        queue._reset_ready()
+        return
     queue.water_refilled_index = -1
     queue.resume_owned_job = False
     queue.restart_resume_guard = ""

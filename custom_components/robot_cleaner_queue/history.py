@@ -93,6 +93,7 @@ def normalize(value):
     return {"run_id": value["run_id"], "vacuum": value["vacuum"], "state": value["state"],
             **{key: timestamp(value.get(key)) for key in ("assigned_at", "updated_at", "finished_at")},
             "rooms": rooms, "stages": stages, "interruptions": interruptions,
+            "dock_cleanup": deepcopy(value.get("dock_cleanup")) if isinstance(value.get("dock_cleanup"), dict) else {},
             "edits": _normalize_edits(value.get("edits")),
             "faults": normalize_faults(value.get("faults"))}
 
@@ -177,7 +178,7 @@ def ensure(queue):
 
 
 def _belongs(queue):
-    return queue.mode == "manual" and queue.last_run and queue.last_run["run_id"] == (queue.run_id or "legacy")
+    return queue.mode in {"manual", "finish"} and queue.last_run and queue.last_run["run_id"] == (queue.run_id or "legacy")
 
 
 def _changed(queue, before, now):
@@ -201,6 +202,8 @@ def sync(queue, now=None):
     run = queue.last_run
     before = deepcopy(run)
     run["state"] = queue.phase if queue.phase in STATES else run["state"]
+    if queue.dock_cleanup:
+        run["dock_cleanup"] = deepcopy(queue.dock_cleanup)
     if queue.phase in {"cancelled", "completed"} and run["finished_at"] is None and before["state"] != queue.phase:
         run["finished_at"] = timestamp(now)
     if 0 <= queue.current_index < len(run["stages"]):
@@ -252,6 +255,8 @@ def complete_stage(queue, record, now):
     ensure(queue)
     if not _belongs(queue) or not 0 <= queue.current_index < len(queue.last_run["stages"]):
         return
+    from . import dock
+    dock.used(queue, queue.stage.get("mode"), record.get("end"))
     before = deepcopy(queue.last_run)
     queue.last_run["stages"][queue.current_index].update(
         state="completed", started_at=timestamp(record.get("begin")), finished_at=timestamp(record.get("end")),
@@ -274,6 +279,7 @@ def summary(run):
     if not run:
         return None
     return {key: run.get(key) for key in ("run_id", "vacuum", "state", "assigned_at", "updated_at", "finished_at")} | {
+        "dock_cleanup": deepcopy(run.get("dock_cleanup", {})),
         "stage_count": len(run["stages"]), "completed_count": sum(stage["state"] == "completed" for stage in run["stages"]),
         "room_count": len(run["rooms"])}
 

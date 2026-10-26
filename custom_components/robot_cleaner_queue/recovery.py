@@ -226,6 +226,8 @@ def validate_native_resume(queue, snapshot):
 
 def continuation_action(queue, snapshot, now, *, water_refilled=False):
     """Read-only validation; the card gets exactly the action the service permits."""
+    if queue.dock_cleanup.get("armed") and queue.dock_cleanup.get("state") == "attention":
+        raise ValueError("Required dock care needs review. Use Resume dock care instead of resuming floor cleaning.")
     _validate_common(queue, snapshot, now)
     if queue.phase != "attention":
         raise ValueError("The sequence is not waiting for recovery.")
