@@ -58,7 +58,7 @@ data:
 
 `rooms: []` means whole home. Mode values are `vacuum`, `vacuum_mop`, `mop` or `vacuum_then_mop`, only when returned by capabilities. Omit suction for mop-only; omit water and route for vacuum-only. The backend rejects unsupported values, irrelevant settings, duplicate/overlapping areas, areas on another map, and more than 32 areas. At most 128 stages can be generated.
 
-The optional script wrapper accepts the same `rooms` and `setup` data; direct service calls return validation failures to the card. The ordinary `pause`, `resume`, `cancel`, and `return_to_dock` commands apply to every plan. Cancellation clears future work and does not claim to stop an active robot operation.
+Direct integration service calls accept `rooms` and `setup` and return validation failures to the card; no script wrapper is needed. The ordinary `pause`, `resume`, `cancel`, and `return_to_dock` commands apply to every plan. Cancellation clears future work and does not claim to stop an active robot operation.
 
 ## Execution and compatibility
 

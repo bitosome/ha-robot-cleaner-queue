@@ -1,8 +1,7 @@
-"""Validate the shipped wrapper after actual Home Assistant package merging.
+"""Validate the integration-only package using real Home Assistant package merging.
 
-Run with Home Assistant installed, not the backend's mock-module harness. The only
-stub is integration discovery: the real script component/config module determines
-merge behavior. No robot services are registered or called.
+No services are invoked. The shipped package must not add a second control path
+through scripts, automations or input helpers.
 """
 from __future__ import annotations
 
@@ -17,19 +16,14 @@ from unittest.mock import AsyncMock, patch
 from homeassistant import const
 from homeassistant.config import merge_packages_config
 from homeassistant.core import HomeAssistant
-import homeassistant.components.script as script_component
-from homeassistant.components.script.config import SCRIPT_ENTITY_SCHEMA
-from homeassistant.components.script import config as script_config
-from homeassistant.helpers.template import Template
 from homeassistant.util.yaml import load_yaml
 
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from custom_components import robot_cleaner_queue as component
 
 PACKAGE = (Path(sys.argv.pop(1)).resolve() if len(sys.argv) > 1 and not sys.argv[1].startswith("-")
-           else Path(__file__).resolve().parents[1] / "packages" / "robot_cleaner_queue.yaml")
-EXPECTED_SELECTORS = {
-    "command": "select", "vacuum": "entity", "run_id": "text", "current_index": "number",
-    "water_refilled": "boolean", "recovery_token": "text", "rooms": "object", "setup": "object",
-}
+           else ROOT / "packages" / "robot_cleaner_queue.yaml")
 
 
 class PackageTests(unittest.IsolatedAsyncioTestCase):
@@ -42,67 +36,31 @@ class PackageTests(unittest.IsolatedAsyncioTestCase):
         await self.hass.async_stop()
         self.temp.cleanup()
 
-    async def merged_wrapper(self, package):
-        # Exercise HA's real package entry point, including recursive merging.
-        # The script subtree is the entire shipped wrapper, without filtering or
-        # normalizing selectors before merging. Other domains cannot affect it.
+    async def merged_package(self, initial):
         integration = SimpleNamespace(
-            async_get_component=AsyncMock(return_value=script_component),
-            async_get_platform=AsyncMock(return_value=script_config),
+            async_get_component=AsyncMock(return_value=component),
+            async_get_platform=AsyncMock(side_effect=ImportError),
         )
         errors = []
         with patch("homeassistant.config.async_get_integration_with_requirements", AsyncMock(return_value=integration)):
             merged = await merge_packages_config(
-                self.hass, {}, {"robot_queue": {"script": copy.deepcopy(package["script"])}},
+                self.hass, copy.deepcopy(initial), {"robot_queue": copy.deepcopy(self.package)},
                 lambda *args: errors.append(args[-1]),
             )
         self.assertEqual(errors, [])
-        return merged["script"]["robot_cleaner_queue_control"]
+        component.CONFIG_SCHEMA(merged)
+        return merged
 
-    async def test_empty_mapping_selectors_reproduce_the_package_failure(self):
-        # A raw YAML/schema-only check accepts {}, but merging deletes the key.
-        for field, selector in [("run_id", "text"), ("water_refilled", "boolean")]:
-            with self.subTest(field=field):
-                broken = copy.deepcopy(self.package)
-                broken["script"]["robot_cleaner_queue_control"]["fields"][field]["selector"] = {selector: {}}
-                SCRIPT_ENTITY_SCHEMA(copy.deepcopy(broken["script"]["robot_cleaner_queue_control"]))
-                wrapper = await self.merged_wrapper(broken)
-                self.assertEqual(wrapper["fields"][field]["selector"], {})
-                with self.assertRaisesRegex(Exception, "Only one type can be specified"):
-                    SCRIPT_ENTITY_SCHEMA(wrapper)
+    async def test_package_only_enables_integration(self):
+        self.assertEqual(self.package, {"robot_cleaner_queue": {}})
+        self.assertEqual(await self.merged_package({}), {"robot_cleaner_queue": {}})
 
-    async def test_shipped_package_preserves_all_selectors_and_validates(self):
-        wrapper = await self.merged_wrapper(self.package)
-        self.assertEqual(set(wrapper["fields"]), set(EXPECTED_SELECTORS))
-        for field, selector in EXPECTED_SELECTORS.items():
-            self.assertEqual(set(wrapper["fields"][field]["selector"]), {selector})
-        validated = SCRIPT_ENTITY_SCHEMA(wrapper)
-        self.assertEqual(validated["mode"], "parallel")
-        self.assertEqual(validated["max"], 10)
-        self.assertEqual(len(validated["sequence"]), 1)
-        self.assertEqual(validated["fields"]["current_index"]["selector"]["number"]["min"], 0)
-        options = validated["fields"]["command"]["selector"]["select"]["options"]
-        self.assertIn("continue_sequence", options)
-        self.assertIn("resume_now", options)
-
-    async def test_continuation_templates_preserve_run_pass_and_acknowledgement(self):
-        validated = SCRIPT_ENTITY_SCHEMA(await self.merged_wrapper(self.package))
-        branch = validated["sequence"][0]["choose"][1]
-        data = branch["sequence"][0]["data"]
-        for command in ("continue_sequence", "resume_now"):
-            for acknowledgement in (None, False, True):
-                with self.subTest(command=command, acknowledgement=acknowledgement):
-                    variables = {"command": command, "vacuum": "vacuum.robot", "run_id": "retained-run", "current_index": 3, "recovery_token": "native-job-fingerprint"}
-                    if acknowledgement is not None:
-                        variables["water_refilled"] = acknowledgement
-                    condition = branch["conditions"][0]["value_template"]
-                    self.assertIsInstance(condition, Template)
-                    self.assertTrue(condition.async_render(variables))
-                    self.assertTrue(all(isinstance(value, Template) for value in data.values()))
-                    rendered = {key: value.async_render(variables) for key, value in data.items()}
-                    self.assertEqual(rendered, {**variables, "water_refilled": bool(acknowledgement)})
-                    self.assertIs(type(rendered["current_index"]), int)
-                    self.assertIs(type(rendered["water_refilled"]), bool)
+    async def test_merge_preserves_unrelated_configuration_without_wrappers(self):
+        original = {"script": {"unrelated": {"sequence": []}}, "input_boolean": {"unrelated": {}}}
+        merged = await self.merged_package(original)
+        self.assertEqual(merged, {**original, "robot_cleaner_queue": {}})
+        self.assertNotIn("robot_cleaner_queue_control", merged["script"])
+        self.assertNotIn("automation", merged)
 
 
 if __name__ == "__main__":

@@ -32,8 +32,7 @@ Source changes alone do not authorize production installation or an actual clean
 
 Validate package changes with actual Home Assistant package merging and script validation:
 `python3 -B test/backend_package_test.py` and `python3 -B test/backend_storage_test.py` (Python 3.14; dependencies in
-`test/requirements-homeassistant.txt`). A successful `ha core check` alone does not
-prove individual script entities loaded; verify the wrapper entity and its fields after reload.
+`test/requirements-homeassistant.txt`). The shipped package only enables the integration; do not add script wrappers, compatibility automations or input helpers. Verify the queue sensor, service and shared-plan button after reload.
 
 ## Publishing
 

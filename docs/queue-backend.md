@@ -23,7 +23,7 @@ Add `https://github.com/bitosome/ha-robot-cleaner-queue` as a **Custom repositor
 
    Merge with existing configuration; do not replace another `homeassistant:` or `packages:` section.
 3. Check HA configuration, then restart Home Assistant. Installation starts no cleaning; an existing active sequence reconciles its checkpoint after restart before continuing.
-4. Confirm `sensor.robot_cleaner_queue`, `script.robot_cleaner_queue_control` and the `robot_cleaner_queue.control` action exist. Configure the card's `queue_entity`.
+4. Confirm `sensor.robot_cleaner_queue` and the `robot_cleaner_queue.control` action exist. Saving a shared plan also exposes a native cleaning-plan button for that vacuum; no scripts, automations or input helpers are required. Configure the card's `queue_entity`.
 
 The card is a separate HACS repository and does not install these Python files; add this repository as an integration as above. No Roborock credentials, tokens, new cloud client, extra polling, or native integration modification is required.
 
@@ -48,7 +48,7 @@ data:
       route: deep
 ```
 
-The optional `script.robot_cleaner_queue_control` wrapper accepts the same fields. Calling it through `script.turn_on` does not propagate validation exceptions to its caller; direct `robot_cleaner_queue.control` is preferred. The service waits for the initial HA command dispatch, then returns. A successful service return does not mean the robot started: `pending_command` remains until physical telemetry acknowledges it.
+Call `robot_cleaner_queue.control` directly. The shipped package contains only `robot_cleaner_queue: {}`; it no longer creates the obsolete script wrapper. Existing installations can remove that wrapper after migrating its callers to direct services or the integration’s cleaning-plan button. The service waits for the initial HA command dispatch, then returns. A successful service return does not mean the robot started: `pending_command` remains until physical telemetry acknowledges it.
 
 Other commands:
 
@@ -162,7 +162,7 @@ A plan is `{"source": "rooms", "rooms": [...], "setup": {...}, "map_id": <flag>}
 
 ### Inline room-plan release (0.8.0)
 
-The service metadata and bundled wrapper now match the room schema: no `start` routine command or routine selectors. `save_preset` accepts `rooms` and `manual` sources; old app-routine plans are rejected before execution. Rejected starts preserve the existing queue's address mode. Per-room stage indices remain room indices even when a room has multiple passes.
+The service metadata matches the room schema: no `start` routine command or routine selectors. `save_preset` accepts `rooms` and `manual` sources; old app-routine plans are rejected before execution. Rejected starts preserve the existing queue's address mode. Per-room stage indices remain room indices even when a room has multiple passes.
 
 Configuration resumes only explicitly deferred, unsent setting writes. Successfully sent keys are not repeated; errors remain terminal and no uncertain start is retried. Native exception messages are omitted from diagnostic events. `get_diagnostics` refuses a different robot's bound queue.
 
@@ -366,8 +366,7 @@ public action to import/replay journal entries as cleaning commands.
 ## Explicit retained-sequence continuation — v0.12.0
 
 `recovery.py` owns read-only eligibility and the explicit transitions. It is separate
-from `history.py`: history never authorizes execution. The service and optional
-script wrapper accept these commands with `vacuum`, the sensor's `run_id`, and its
+from `history.py`: history never authorizes execution. The direct service accepts these commands with `vacuum`, the sensor's `run_id`, and its
 zero-based `current_index`. Stale run/pass values are rejected before mutation.
 
 - `continue_sequence` is available only for an interrupted retained manual plan.
@@ -467,13 +466,13 @@ confirmation. A successful resume still cannot credit an unrelated completion.
 methods with offline native-shaped fixtures, covering graceful and crash restoration,
 startup availability, repeated restart, per-pass history, ownership bounds, pending
 commands, explicit native confirmation, permissions/map changes, persistence failure,
-and Stop followed by Return to dock. The wrapper's recovery token also goes through
-the real Home Assistant package-merging/script validation regression.
+and Stop followed by Return to dock. The integration-only package also has a real
+Home Assistant package-merging regression.
 
 
 ## Editing untouched rooms (v0.14.0)
 
-`robot_cleaner_queue.update_queue` is a direct, no-motion service; the existing script wrapper needs no change. Required fields are `vacuum`, `run_id`, `revision` and `rooms`; `setup` supplies optional defaults. The queue sensor publishes edit capability version 1, a monotonically changing `queue_revision`, eligibility/reason, and ordered `protected_room_ids`/`editable_room_ids`. Room objects use the same native-room schema as `start_manual`; the request is the complete replacement for the untouched suffix, with `[]` meaning remove that suffix.
+`robot_cleaner_queue.update_queue` is a direct, no-motion service; no script wrapper is needed. Required fields are `vacuum`, `run_id`, `revision` and `rooms`; `setup` supplies optional defaults. The queue sensor publishes edit capability version 1, a monotonically changing `queue_revision`, eligibility/reason, and ordered `protected_room_ids`/`editable_room_ids`. Room objects use the same native-room schema as `start_manual`; the request is the complete replacement for the untouched suffix, with `[]` meaning remove that suffix.
 
 The queue lock serializes editing with starts, controls and advancement. The full completed prefix and every remaining pass/repeat belonging to an already-started room are immutable. A genuinely unstarted next room can be edited during the settled-dock wait. Configure/start reservations protect their current room before a cleaning acknowledgement. Legacy area/whole-home sequences, restart reconciliation and terminal queues cannot be edited. Removing the entire untouched suffix finishes current work normally; removing it between rooms observes final dock care. Paused or attention states remain explicit and require their existing continuation action.
 

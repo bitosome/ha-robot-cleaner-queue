@@ -35,7 +35,7 @@ v0.14.1 stores bounded robot/dock/connection fault events with onset, resolution
    Merge with any existing `homeassistant:`/`packages:` section rather than replacing it.
 3. Check the configuration, then restart Home Assistant.
 
-Installation starts no cleaning. After a restart, an existing active sequence reconciles its saved progress before continuing. Afterwards, `sensor.robot_cleaner_queue`, `script.robot_cleaner_queue_control` and the `robot_cleaner_queue.control` action exist.
+Installation starts no cleaning. After a restart, an existing active sequence reconciles its saved progress before continuing. Afterwards, `sensor.robot_cleaner_queue` and the `robot_cleaner_queue.control` action exist. Saving a shared plan also exposes a native cleaning-plan button for that vacuum; no scripts, automations or input helpers are required.
 
 ## Requirements
 
@@ -139,10 +139,10 @@ python3 -m pip install -r test/requirements-homeassistant.txt
 python3 -B test/backend_package_test.py
 ```
 
-It validates the wrapper after Home Assistant merges packages, including selector
-types and continuation fields. Release CI requires this check. Package-only script
-fixes can be applied by replacing the wrapper and reloading scripts; no robot action
-or Home Assistant restart is needed.
+It validates the integration-only package after Home Assistant merges packages and
+checks that no robot scripts, automations or input helpers are introduced. Release
+CI requires this check. Removing an obsolete wrapper requires auditing its callers
+and reloading scripts; changes to the integration itself require a restart.
 
 
 ## License
