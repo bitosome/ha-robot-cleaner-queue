@@ -292,6 +292,12 @@ confirmed. A water-empty dock may still empty the bin; washing waits for the wat
 fault to be resolved. Unsupported/unavailable controls, interrupted care or a missed
 start remain visible as incomplete, never silently successful.
 
+If the robot returns or is already docked after Clear, the final-care observation
+gets its own 30-minute allowance from that transition. It never reuses an unset or
+old floor-work timer, and later state updates do not extend the allowance. An
+already-recorded interruption still requires explicit review; upgrading does not
+retry old dock-care commands or change confirmed room results.
+
 The checkpoint survives restarts. An already-running care action must be observed
 active again after the restart before its end can be confirmed. An operation that
 may have ended while Home Assistant was offline is unconfirmed, and no command is

@@ -686,7 +686,11 @@ class Queue:
         if self.phase not in ACTIVE and not self.pending_command:
             if self.phase == "cancelled" and dock.required(self) and snapshot.vacuum in {"returning", "docked"}:
                 dock.arm(self, now, "cancelled")
-                self.mode, self.phase = "finish", "controlling"
+                # This is a new final-care attempt after the native robot returned,
+                # not the unfinished floor pass's timer. Manual cancellation can
+                # leave dock_finish_at unset (or from an older attempt); using it
+                # would report a 30-minute timeout on the very next observation.
+                self.mode, self.phase, self.dock_finish_at = "finish", "controlling", now
             else:
                 return None  # Historical evidence cannot adopt a later native job.
         dock.observe(self, snapshot, now)

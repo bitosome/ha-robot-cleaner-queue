@@ -11,6 +11,7 @@ from backend_queue_test import Queue, Snapshot, load
 import backend_device_test as device_tests
 
 dock = load("dock")
+history = load("history")
 
 
 def snap(at, status="charging", *, job="off", fault="ok", controls=None):
@@ -62,6 +63,67 @@ class DockTests(unittest.TestCase):
         self.assertEqual(q.mode,"finish")
         self.assertEqual(q.run_id,"run")
         self.assertEqual(q.stages,stages)
+
+    def test_native_return_after_cancel_starts_fresh_clock_and_keeps_completed_rooms(self):
+        # Epoch-like times catch an unset timer which small 100-second fixtures
+        # incorrectly treat as still inside the 30-minute docking allowance.
+        now=1_800_000_000
+        for status in ("charging", "returning_home"):
+            for previous_finish_at in (0, now-7200):
+                with self.subTest(status=status, previous_finish_at=previous_finish_at):
+                    q=plan()
+                    q.stages=[{**deepcopy(q.stages[0]),"target":f"0_{i+1}","room_index":i}
+                              for i in range(4)]
+                    q.targets=[stage["target"] for stage in q.stages]
+                    q.last_run=None
+                    for index in range(3):
+                        q.current_index=index
+                        history.complete_stage(q,{"begin":now-4000+index*500,
+                                                  "end":now-3600+index*500},now-3590+index*500)
+                    q.current_index=q.completed=3
+                    q.last_run["stages"][3]["state"]="paused"
+                    q.attention("Native job changed while paused.")
+                    proof=deepcopy(q.last_run["stages"][:3])
+                    q.dock_finish_at=previous_finish_at
+                    q.command("cancel",snap(now),now)
+                    self.assertIsNone(q.observe(snap(now+2,status),now+2))
+                    self.assertEqual((q.mode,q.phase,q.dock_finish_at),("finish","controlling",now+2))
+                    self.assertEqual(q.dock_cleanup["begun_at"],now+2)
+                    self.assertEqual(q.error,"")
+                    self.assertEqual((q.current_index,q.completed),(3,3))
+                    self.assertEqual(q.last_run["stages"][:3],proof)
+                    self.assertEqual(q.last_run["stages"][3]["state"],"cancelled")
+                    # No duplicate return command; normal settled docking can
+                    # proceed to the already-required, as-yet unconfirmed care.
+                    if status=="returning_home":
+                        self.assertIsNone(q.observe(snap(now+3),now+3))
+                    self.assertEqual(q.observe(snap(now+19),now+19),("dock","dust_emptying"))
+                    self.assertEqual(q.last_run["stages"][:3],proof)
+
+    def test_cancelled_native_return_allowance_does_not_extend_on_each_update_or_restart(self):
+        now=1_800_000_000
+        q=plan("vacuum");q.command("cancel",snap(now),now)
+        self.assertIsNone(q.observe(snap(now+2,"returning_home"),now+2))
+        q=Queue.restore(q.dump())
+        self.assertIsNone(q.observe(snap(now+1700,"returning_home"),now+1700))
+        self.assertEqual(q.phase,"controlling")
+        self.assertEqual(q.dock_finish_at,now+2)
+        self.assertIsNone(q.observe(snap(now+1802,"returning_home"),now+1802))
+        self.assertEqual(q.phase,"attention")
+        self.assertIn("within 30 minutes",q.error)
+        self.assertTrue(q.dock_cleanup["retry_allowed"])
+
+    def test_old_cancelled_dock_timeout_is_not_automatically_retried(self):
+        now=1_800_000_000
+        q=plan("mop");q.command("cancel",snap(now),now)
+        q.mode,q.phase="finish","controlling"
+        dock.arm(q,now,"cancelled")
+        q.dock_finish_at=0  # Saved checkpoint made by an older integration.
+        q.observe(snap(now+2),now+2)
+        self.assertEqual(q.phase,"attention")
+        q=Queue.restore(q.dump());before=q.dump()
+        self.assertIsNone(q.observe(snap(now+60),now+60))
+        self.assertEqual(q.dump(),before)
 
     def test_missing_care_is_dispatched_once_and_ack_is_not_completion(self):
         q=finished("vacuum")
