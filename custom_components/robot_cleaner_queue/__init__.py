@@ -42,7 +42,7 @@ ROOM_SCHEMA = vol.Schema({
 })
 PLAN_ROOMS = vol.All(cv.ensure_list, [vol.Any(str, ROOM_SCHEMA)])
 SERVICE_SCHEMA = vol.Schema({
-    vol.Required("command"): vol.In(["start_manual", "pause", "resume", "cancel", "return_to_dock", "stop", "toggle", "toggle_saved", "continue_sequence", "resume_now", "resume_dock_cleanup"]),
+    vol.Required("command"): vol.In(["start_manual", "pause", "resume", "cancel", "return_to_dock", "stop", "toggle", "toggle_saved", "continue_sequence", "resume_now", "resume_dock_cleanup", "skip_dock_cleanup"]),
     vol.Optional("vacuum", default=""): str,
     vol.Optional("run_id"): str,
     vol.Optional("cleanup_revision"): vol.All(int, vol.Range(min=0)),
@@ -306,6 +306,7 @@ class Manager:
             await async_require_control(self.hass.auth, call.context.user_id, list(controls.values()), POLICY_CONTROL)
             caps["control_version"] = 7
             caps["dock_cleanup_version"] = dock.VERSION
+            caps["dock_cleanup_skip"] = True
             caps["execution_version"] = 5
             caps["current_map"] = current_map(self.resolve(call.data["vacuum"])[2])[0]
             caps["saved_preset"] = await self.read_saved_preset(call.data["vacuum"], call.context.user_id)
@@ -811,6 +812,9 @@ class Manager:
                     elif command == "resume_dock_cleanup":
                         effect = dock.resume(self.queue, current, time.time(), data.get("run_id"), data.get("cleanup_revision"))
                         self.queue.owner_user_id = call.context.user_id
+                    elif command == "skip_dock_cleanup":
+                        effect = dock.skip(self.queue, current, time.time(), data.get("run_id"), data.get("cleanup_revision"))
+                        history.sync(self.queue, time.time())
                     elif command == "start_manual":
                         caps, controls, targets, map_id = self.manual_capabilities(vacuum)
                         if saved_plan is not None and saved_plan.get("map_id") != map_id:

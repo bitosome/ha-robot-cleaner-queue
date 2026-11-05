@@ -61,7 +61,7 @@ Installation starts no cleaning. After a restart, an existing active sequence re
 
 | Action | Purpose |
 | --- | --- |
-| `robot_cleaner_queue.control` | `start_manual`, `pause`, `resume`, `cancel`, `return_to_dock`, `stop`, `toggle`, `toggle_saved`, `continue_sequence`, `resume_now`, `resume_dock_cleanup` |
+| `robot_cleaner_queue.control` | `start_manual`, `pause`, `resume`, `cancel`, `return_to_dock`, `stop`, `toggle`, `toggle_saved`, `continue_sequence`, `resume_now`, `resume_dock_cleanup`, `skip_dock_cleanup` |
 | `robot_cleaner_queue.update_queue` | Add, remove or reorder untouched rooms in the current sequence, with run/revision guards |
 | `robot_cleaner_queue.device_control` | Allowlisted dock and robot settings (mop washing, child lock, DND, volume, …) |
 | `robot_cleaner_queue.save_preset` | Store one validated plan per vacuum |

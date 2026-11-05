@@ -178,6 +178,55 @@ class DockTests(unittest.TestCase):
         self.assertIn("offline",q.error)
         self.assertNotEqual(q.dock_cleanup["actions"]["mop_washing"]["state"],"completed")
 
+    def test_offline_care_can_be_skipped_without_crediting_it(self):
+        q=finished("vacuum_mop");q.observe(snap(130,"emptying_the_bin"),130)
+        q=Queue.restore(q.dump())
+        q.observe(snap(150),150);q.observe(snap(166),166)
+        self.assertEqual(q.phase,"attention")
+        rev=q.dock_cleanup["revision"]
+        with self.assertRaisesRegex(ValueError,"changed"):dock.skip(q,snap(170),170,"run",rev-1)
+        with self.assertRaisesRegex(ValueError,"changed"):dock.skip(q,snap(170),170,"other",rev)
+        self.assertIsNone(dock.skip(q,snap(170),170,"run",rev))
+        self.assertFalse(dock.required(q))
+        self.assertEqual(q.phase,"cancelled")
+        self.assertEqual(q.error,"")
+        cp=q.dock_cleanup
+        self.assertEqual(cp["state"],"skipped")
+        self.assertFalse(cp["armed"])
+        self.assertGreater(cp["revision"],rev)
+        self.assertTrue(all(action["state"]!="completed" for action in cp["actions"].values()))
+        self.assertEqual(q.observe(snap(200),200),None)
+        restored=Queue.restore(q.dump())
+        self.assertEqual(restored.dock_cleanup["state"],"skipped")
+        self.assertEqual(restored.phase,"cancelled")
+        with self.assertRaisesRegex(ValueError,"no dock care"):dock.skip(restored,snap(200),200,"run",restored.dock_cleanup["revision"])
+        restored.start_manual(restored.vacuum,["0_2"],{},[{"mode":"vacuum","target":"0_2"}],{},snap(210),210,"new")
+        self.assertEqual(restored.dock_cleanup,{})
+
+    def test_unarmed_care_after_stop_can_be_skipped(self):
+        q=plan("mop")
+        q.command("cancel",snap(120,"segment_cleaning",job="on"),120)
+        self.assertTrue(dock.required(q))
+        dock.skip(q,snap(121),121,"run",q.dock_cleanup["revision"])
+        self.assertEqual(q.phase,"cancelled")
+        self.assertIsNone(q.observe(snap(130,"returning_home"),130))
+        self.assertEqual(q.phase,"cancelled")
+        self.assertEqual(q.dock_cleanup["state"],"skipped")
+
+    def test_completed_floor_outcome_is_kept_when_care_is_skipped(self):
+        q=plan("mop");q.completed=q.current_index=1;q.phase="finishing";q.dock_finish_at=120
+        q.observe(snap(130),130)
+        self.assertEqual(q.phase,"finishing")
+        dock.skip(q,snap(131),131,"run",q.dock_cleanup["revision"])
+        self.assertEqual(q.phase,"completed")
+
+    def test_skip_waits_for_an_unconfirmed_dock_command(self):
+        q=finished("vacuum");q.observe(snap(130),130)
+        self.assertEqual(q.observe(snap(146),146),("dock","dust_emptying"))
+        before=q.dump()
+        with self.assertRaisesRegex(ValueError,"previous command"):dock.skip(q,snap(147),147,"run",q.dock_cleanup["revision"])
+        self.assertEqual(q.dump(),before)
+
     def test_restart_active_care_can_be_reobserved_then_completed(self):
         q=finished("mop");q.observe(snap(130,"washing_the_mop"),130)
         q=Queue.restore(q.dump());native_care(q,"mop_washing",150)
@@ -380,6 +429,24 @@ class ManagerDockTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.calls),calls)
         await self.advance()
         self.assertEqual(len(self.calls),calls+1)
+
+    async def test_skip_through_control_sends_nothing_and_records_history(self):
+        await self.advance(1);await self.advance();await self.advance(61)
+        cp=self.manager.queue.dock_cleanup
+        self.assertEqual(cp["state"],"attention")
+        calls=len(self.calls)
+        data={"vacuum":"vacuum.robot","command":"skip_dock_cleanup","run_id":"run","cleanup_revision":cp["revision"]-1}
+        with self.assertRaisesRegex(m.ServiceError,"changed"):
+            await self.manager.control(NS(context=m.FakeContext("user"),data=data))
+        data["cleanup_revision"]=cp["revision"]
+        await self.manager.control(NS(context=m.FakeContext("user"),data=data))
+        self.assertEqual(len(self.calls),calls)
+        self.assertFalse(dock.required(self.manager.queue))
+        self.assertEqual(self.manager.queue.phase,"cancelled")
+        self.assertEqual(self.manager.queue.last_run["dock_cleanup"]["state"],"skipped")
+        self.assertEqual(self.manager.store.saved[-1],self.manager.queue.dump())
+        await self.advance();await self.advance()
+        self.assertEqual(len(self.calls),calls)
 
     async def test_native_state_race_before_dispatch_never_starts_care(self):
         await self.advance(1)

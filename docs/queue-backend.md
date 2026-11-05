@@ -497,7 +497,7 @@ fresh native telemetry and entity identity immediately before dispatch.
 The sensor and retained run history include `dock_cleanup`: `version`, original
 `run_id`, monotonic `revision`, `armed`, `state`, `required`, `actions`, `reason`, and
 `retry_allowed`. States are `pending`, `returning`, `waiting`, `running`, `attention`,
-`completed`. Each required action records `pending` / `commanded` / `running` /
+`completed`, `skipped`. Each required action records `pending` / `commanded` / `running` /
 `completed` plus `used_at`, `command_at`, `started_at`, `completed_at` observations.
 `armed: false` during floor work records obligations without replacing the normal
 cleaning controls. Stop/Clear leaves them unarmed until returning/docking; Finish
@@ -507,7 +507,11 @@ service calls and restarts, and cannot be erased by starting a new plan.
 `control` command `resume_dock_cleanup` requires `vacuum`, current `run_id`, and
 `cleanup_revision`. A stale retry is rejected. An interrupted return can explicitly
 request docking again under the existing fresh-state and uncertainty guards; it never
-resumes cancelled floor work. No retry happens automatically after
+resumes cancelled floor work. `skip_dock_cleanup` takes the same `run_id` and
+`cleanup_revision` and lets the owner waive owed care: it sends nothing, leaves the
+actions unconfirmed, sets the checkpoint to `skipped` (no longer required), keeps the
+floor outcome, and allows a new plan. It is refused only while a command awaits
+confirmation. No retry happens automatically after
 an unobserved action. The existing `device_control` service still accepts
 `{vacuum, control, value: on|off}` for native dock switches. Explicit Stop remains
 available while a queue-owned action is active; it retains incomplete obligations

@@ -19,17 +19,18 @@ control:
           - continue_sequence
           - resume_now
           - resume_dock_cleanup
+          - skip_dock_cleanup
     vacuum:
       selector:
         entity:
           domain: vacuum
           integration: roborock
     run_id:
-      description: Required for continue_sequence and resume_now; current sensor run_id.
+      description: Required for continue_sequence, resume_now, resume_dock_cleanup and skip_dock_cleanup; current sensor run_id.
       selector:
         text: {}
     cleanup_revision:
-      description: Required for resume_dock_cleanup; current dock_cleanup.revision prevents stale retries.
+      description: Required for resume_dock_cleanup and skip_dock_cleanup; current dock_cleanup.revision prevents stale retries.
       selector:
         number:
           min: 0

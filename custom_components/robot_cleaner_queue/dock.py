@@ -21,9 +21,12 @@ def timestamp(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and isfinite(value) and value >= 0
 
 
+SETTLED = {"completed", "skipped"}
+
+
 def required(queue):
     cp = queue.dock_cleanup
-    return bool(cp and cp.get("state") != "completed" and any(cp.get("required", {}).values()))
+    return bool(cp and cp.get("state") not in SETTLED and any(cp.get("required", {}).values()))
 
 
 def state(queue):
@@ -113,7 +116,7 @@ def restore(queue):
              and all(timestamp(cp.get(key, 0)) for key in ("begun_at", "ready_since", "ready_observed_at"))
              and isinstance(cp.get("armed"), bool)
              and cp.get("outcome") in {"completed", "cancelled"}
-             and cp.get("state") in {"pending", "returning", "waiting", "running", "attention", "completed"}
+             and cp.get("state") in {"pending", "returning", "waiting", "running", "attention", "completed", "skipped"}
              and all(isinstance(cp["required"].get(key), bool) for key in ACTIONS))
     if valid:
         for key in ACTIONS:
@@ -329,3 +332,32 @@ def resume(queue, snapshot, now, run_id, revision):
     if returning or recharge:
         return queue._observe_finish(snapshot, now)
     return observe(queue, snapshot, now, dispatch=True)
+
+
+def skip(queue, snapshot, now, run_id, revision):
+    """The owner may waive owed care. Nothing is commanded and nothing is credited.
+
+    Skipping only releases the queue: it never stops a native dock cycle, and the
+    actions keep their unconfirmed states so history never claims care happened.
+    """
+    if not required(queue):
+        raise ValueError("There is no dock care to skip.")
+    cp = queue.dock_cleanup
+    if run_id != cp["run_id"] or type(revision) is not int or revision != cp["revision"]:
+        raise ValueError("Dock care changed. Refresh its current status before skipping.")
+    if queue.pending_command:
+        raise ValueError("Wait for the robot to confirm the previous command before skipping dock care.")
+    # No robot I/O is sent, so an uncertainty barrier from earlier commands stays in
+    # place for the next start instead of blocking this release.
+    before = deepcopy(cp)
+    cp.update(state="skipped", reason="Dock care was skipped. The bin and mops were not confirmed clean.",
+              retry_allowed=False, armed=False, current_action="", skipped_at=now,
+              ready_since=0, ready_observed_at=0)
+    cp.pop("invalid", None)
+    if queue.phase in {"attention", "controlling", "finishing"}:
+        # The floor outcome stays as it was; only the care obligation is released.
+        queue.phase = cp.get("outcome") if cp.get("outcome") in {"completed", "cancelled"} else "cancelled"
+    queue.error = ""
+    queue.decision = "required dock care skipped by the user"
+    _touch(queue, before)
+    return None
